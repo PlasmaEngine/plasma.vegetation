@@ -1,0 +1,263 @@
+[PLATFORMS]
+ALL
+
+[PERMUTATIONS]
+
+[COMPUTESHADER]
+
+#define GRASS_GENERATE_CONSTANTS
+#include <Shaders/Common/Common.h>
+#include <Shaders/Vegetation/Grass/GrassGpuData.h>
+#include <Shaders/Vegetation/Grass/GrassCommon.h>
+
+// Writes the static data and the rest pose of one strand range of a source; see plGrassGenerateConstants.
+// Coverage: one thread per strand of a painted tile. The upload holds the tile's 256 texels and the prefix sum of the
+// per-texel strand counts (GrassStrandCountForTexelQ8), so a thread finds its texel with a binary search.
+// Roots: the upload holds finished plGrassStrandStatic records. Kill: the range is marked dead.
+
+RWStructuredBuffer<plGrassStrandStatic> GrassStaticOut BIND_GROUP(BG_DRAW_CALL);
+RWByteAddressBuffer GrassStateOut BIND_GROUP(BG_DRAW_CALL);
+StructuredBuffer<plGrassSourceGpu> GrassSources BIND_GROUP(BG_DRAW_CALL);
+StructuredBuffer<plGrassPageGpu> GrassPages BIND_GROUP(BG_DRAW_CALL);
+StructuredBuffer<plGrassAtlasGpu> GrassAtlas BIND_GROUP(BG_DRAW_CALL);
+ByteAddressBuffer GrassUpload BIND_GROUP(BG_DRAW_CALL);
+
+#define GEN(x) GET_PUSH_CONSTANT(plGrassGenerateConstants, x)
+
+uint LoadUpload(uint index)
+{
+  return index < GEN(GenUploadCount) ? GrassUpload.Load(index * 4) : 0u;
+}
+
+struct CoverageTexel
+{
+  uint Density;
+  float Length;
+  float Height;
+  float3 Normal;
+  uint Flags;
+};
+
+CoverageTexel LoadTexel(uint texel)
+{
+  uint u0 = LoadUpload(GEN(GenUploadOffset) + texel * 2);
+  uint u1 = LoadUpload(GEN(GenUploadOffset) + texel * 2 + 1);
+
+  CoverageTexel t;
+  t.Density = u0 & 0xFFu;
+  t.Length = float((u0 >> 8) & 0xFFu) / 255.0;
+  t.Height = GEN(GenBaseHeight) + float(int(u0) >> 16) * 0.001;
+
+  float2 e = float2(float(u1 & 0xFFu), float((u1 >> 8) & 0xFFu)) / 255.0 * 2.0 - 1.0;
+  float3 n = float3(e, 1.0 - abs(e.x) - abs(e.y));
+  if (n.z < 0.0)
+  {
+    n.xy = (1.0 - abs(n.yx)) * float2(n.x >= 0.0 ? 1.0 : -1.0, n.y >= 0.0 ? 1.0 : -1.0);
+  }
+  float nLength = length(n);
+  t.Normal = nLength > 0.00001 ? n / nLength : float3(0, 0, 1);
+  t.Flags = (u1 >> 16) & 0xFFu;
+  return t;
+}
+
+float ValueNoise(float2 p, uint seed)
+{
+  float2 cell = floor(p);
+  float2 f = p - cell;
+  f = f * f * (3.0 - 2.0 * f);
+  int2 c = int2(cell);
+  float h00 = GrassHashToFloat(GrassPcgHash(seed ^ GrassPcgHash(uint(c.x) ^ GrassPcgHash(uint(c.y)))));
+  float h10 = GrassHashToFloat(GrassPcgHash(seed ^ GrassPcgHash(uint(c.x + 1) ^ GrassPcgHash(uint(c.y)))));
+  float h01 = GrassHashToFloat(GrassPcgHash(seed ^ GrassPcgHash(uint(c.x) ^ GrassPcgHash(uint(c.y + 1)))));
+  float h11 = GrassHashToFloat(GrassPcgHash(seed ^ GrassPcgHash(uint(c.x + 1) ^ GrassPcgHash(uint(c.y + 1)))));
+  return lerp(lerp(h00, h10, f.x), lerp(h01, h11, f.x), f.y);
+}
+
+void WriteRestPose(uint globalStrand, plGrassStrandStatic s, plGrassSourceGpu source)
+{
+  uint pageCount, pageStride;
+  GrassPages.GetDimensions(pageCount, pageStride);
+
+  uint pageIndex = globalStrand >> GRASS_PAGE_SHIFT;
+  if (pageIndex >= pageCount)
+    return;
+
+  plGrassPageGpu page = GrassPages[pageIndex];
+  if (page.SourceIndex != GEN(GenSourceIndex))
+    return;
+
+  uint segments = clamp(source.Counts.x, 1u, (uint)GRASS_MAX_SEGMENTS);
+  float3 axisLocal = GrassOctDecode(s.Axis);
+  float3 axis = GrassTransformAxis(source.ObjectToWorld, axisLocal);
+  float worldLength = GrassWorldLength(source.ObjectToWorld, axisLocal, GrassEffectiveLength(s, source));
+
+  for (uint j = 0; j < segments; ++j)
+  {
+    uint address = GrassStateAddress(page, globalStrand & (GRASS_PAGE_SIZE - 1), segments, j, GEN(GenStateSegments));
+    if (address == 0xFFFFFFFFu)
+      return;
+
+    float3 offset = axis * (worldLength * float(j + 1) / float(segments));
+    GrassStateOut.Store3(address, GrassPackState(offset, offset));
+    GrassStateOut.Store2(address + GRASS_STATE_FRAME_OFFSET, GrassPackFramePose(offset));
+  }
+}
+
+plGrassStrandStatic GrowFromCoverage(uint chunkStrand, plGrassSourceGpu source, out bool out_bAlive)
+{
+  plGrassStrandStatic s = (plGrassStrandStatic)0;
+  out_bAlive = false;
+
+  // Largest texel whose prefix offset is <= chunkStrand; empty texels share their successor's offset.
+  const uint offsetBase = GEN(GenUploadOffset) + GRASS_TILE_TEXEL_UINTS;
+  uint lo = 0;
+  uint hi = GRASS_TILE_TEXEL_COUNT;
+  while (lo < hi)
+  {
+    uint mid = (lo + hi + 1) / 2;
+    if (LoadUpload(offsetBase + mid) <= chunkStrand)
+      lo = mid;
+    else
+      hi = mid - 1;
+  }
+
+  if (lo >= GRASS_TILE_TEXEL_COUNT)
+    return s;
+
+  const uint texelIndex = lo;
+  const uint sampledIndex = chunkStrand - LoadUpload(offsetBase + texelIndex);
+  CoverageTexel texel = LoadTexel(texelIndex);
+  if (texel.Density == 0)
+    return s;
+
+  const uint texelHash = GrassHash(GEN(GenTileX), GEN(GenTileY), texelIndex, GEN(GenTypeSeed));
+  const uint stride = max(GEN(GenSampleStride), 1u);
+  const uint within = sampledIndex * stride + (texelHash & (stride - 1u));
+  const uint strandHash = GrassPcgHash(texelHash ^ GrassPcgHash(within + 1u));
+  const uint h1 = GrassPcgHash(strandHash ^ 0x68E31DA4u);
+  const uint h2 = GrassPcgHash(strandHash ^ 0xB5297A4Du);
+  const uint h3 = GrassPcgHash(strandHash ^ 0x1B56C4E9u);
+  const uint h4 = GrassPcgHash(strandHash ^ 0x3C6EF372u);
+
+  const float fx = float(texelIndex & 15u) + GrassHashToFloat(h1);
+  const float fy = float(texelIndex >> 4) + GrassHashToFloat(h2);
+
+  // Bilinear height and normal over the painted, continuous neighbours; discontinuous texels keep their own sample.
+  float height = texel.Height;
+  float3 normal = texel.Normal;
+  if ((texel.Flags & GRASS_TEXEL_FLAG_DISCONTINUOUS) == 0)
+  {
+    float u = fx - 0.5;
+    float v = fy - 0.5;
+    int x0 = (int)floor(u);
+    int y0 = (int)floor(v);
+    float wx = u - float(x0);
+    float wy = v - float(y0);
+
+    float weightSum = 0.0;
+    float heightSum = 0.0;
+    float3 normalSum = float3(0, 0, 0);
+    for (int dy = 0; dy < 2; ++dy)
+    {
+      for (int dx = 0; dx < 2; ++dx)
+      {
+        int sx = clamp(x0 + dx, 0, GRASS_TILE_TEXELS - 1);
+        int sy = clamp(y0 + dy, 0, GRASS_TILE_TEXELS - 1);
+        CoverageTexel n = LoadTexel(uint(sy) * GRASS_TILE_TEXELS + uint(sx));
+        if (n.Density == 0 || (n.Flags & GRASS_TEXEL_FLAG_DISCONTINUOUS) != 0)
+          continue;
+
+        float w = (dx == 0 ? 1.0 - wx : wx) * (dy == 0 ? 1.0 - wy : wy);
+        weightSum += w;
+        heightSum += n.Height * w;
+        normalSum += n.Normal * w;
+      }
+    }
+
+    if (weightSum > 0.0001)
+    {
+      height = heightSum / weightSum;
+      float normalLength = length(normalSum);
+      normal = normalLength > 0.0001 ? normalSum / normalLength : texel.Normal;
+    }
+  }
+
+  const float texelSize = GEN(GenTexelSize);
+  const float3 root = float3((float(GEN(GenTileX) * GRASS_TILE_TEXELS) + fx) * texelSize, (float(GEN(GenTileY) * GRASS_TILE_TEXELS) + fy) * texelSize, height);
+
+  uint atlasIndex = 0;
+  float atlasSize = 1.0;
+  uint atlasEntries, atlasStride;
+  GrassAtlas.GetDimensions(atlasEntries, atlasStride);
+  if (source.Counts.w > 0)
+  {
+    // Smooth spatial variation gives nearby roots related atlas choices.
+    float noise = ValueNoise(root.xy * max(source.Touch.w, 0.0001), source.Layout.w);
+    atlasIndex = (uint(saturate(noise) * 1000.0)) % source.Counts.w;
+    if (source.Counts.z + atlasIndex < atlasEntries)
+      atlasSize = clamp(GrassAtlas[source.Counts.z + atlasIndex].Size, 0.0, 10.0);
+  }
+
+  const float strandLength = source.Shape.x * texel.Length * lerp(1.0, GrassHashToFloat(h3), source.Shape.w) * atlasSize;
+  if (!(strandLength > 0.0001))
+    return s;
+
+  s.Root = root;
+  s.Axis = GrassOctEncode(normal);
+  s.LengthAngle = (f32tof16(strandLength) & 0xFFFFu) | (uint(GrassHashToFloat(h4) * 65535.0) << 16);
+  s.AtlasFlags = (atlasIndex & 0xFFu) | (GRASS_STRAND_FLAG_ALIVE << 8);
+  s.AtlasFlags |= GrassClumpSeed(root.x, root.y, source.Clump.x, source.Layout.w) << 16u;
+  s.Seed = strandHash;
+  s.Reserved = reversebits(within ^ texelHash);
+  out_bAlive = true;
+  return s;
+}
+
+[numthreads(GRASS_THREAD_GROUP_SIZE, 1, 1)]
+void main(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+  const uint t = dispatchThreadId.x;
+  if (t >= GEN(GenCount))
+    return;
+
+  const uint globalStrand = GEN(GenGlobalFirst) + t;
+  if (globalStrand >= GEN(GenPoolStrands))
+    return;
+
+  if (GEN(GenMode) == GRASS_GENERATE_KILL || GEN(GenSourceIndex) >= GEN(GenSourceCount))
+  {
+    GrassStaticOut[globalStrand] = (plGrassStrandStatic)0;
+    return;
+  }
+
+  const plGrassSourceGpu source = GrassSources[GEN(GenSourceIndex)];
+  const uint chunkStrand = GEN(GenChunkFirst) + t;
+
+  plGrassStrandStatic s = (plGrassStrandStatic)0;
+  bool bAlive = false;
+
+  if (GEN(GenMode) == GRASS_GENERATE_COVERAGE)
+  {
+    s = GrowFromCoverage(chunkStrand, source, bAlive);
+  }
+  else
+  {
+    const uint base = GEN(GenUploadOffset) + chunkStrand * 8;
+    s.Root = asfloat(uint3(LoadUpload(base), LoadUpload(base + 1), LoadUpload(base + 2)));
+    s.Axis = LoadUpload(base + 3);
+    s.LengthAngle = LoadUpload(base + 4);
+    s.AtlasFlags = LoadUpload(base + 5);
+    s.Seed = LoadUpload(base + 6);
+    s.Reserved = LoadUpload(base + 7);
+    bAlive = GrassStrandIsAlive(s) && GrassStrandLength(s) > 0.0001;
+    if (!bAlive)
+      s = (plGrassStrandStatic)0;
+  }
+
+  GrassStaticOut[globalStrand] = s;
+
+  if (bAlive)
+  {
+    WriteRestPose(globalStrand, s, source);
+  }
+}

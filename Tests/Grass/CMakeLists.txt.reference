@@ -1,0 +1,7 @@
+ez_cmake_init()
+ez_requires(EZ_BUILD_UNITTESTS)
+ez_requires_renderer()
+ez_create_target(APPLICATION GrassTest)
+target_link_libraries(GrassTest PUBLIC TestFramework VegetationPlugin GameEngine JoltPlugin)
+ez_add_renderers(GrassTest)
+ez_ci_add_test(GrassTest NEEDS_HW_ACCESS)

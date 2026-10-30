@@ -1,0 +1,96 @@
+[PLATFORMS]
+ALL
+
+[PERMUTATIONS]
+CAMERA_MODE
+
+[RENDERSTATE]
+DepthTest = false
+DepthWrite = false
+// Shade exit faces of the actual contact volume, including when the camera is inside it.
+CullMode = CullMode_Front
+BlendingEnabled0 = true
+BlendOp0 = BlendOp_Min
+SourceBlend0 = Blend_One
+DestBlend0 = Blend_One
+WriteMask0 = 1
+
+[SHADER]
+#include <Shaders/Common/Common.h>
+#include <Shaders/Common/GlobalConstants.h>
+#include <Shaders/Vegetation/Grass/GrassContactAOConstants.h>
+#define CONTACT(x) GET_PUSH_CONSTANT(plGrassContactAOConstants, x)
+
+struct VS_OUT
+{
+  float4 Position : SV_Position;
+  nointerpolation float3 Root : TEXCOORD0;
+  nointerpolation float3 Axis : TEXCOORD1;
+  nointerpolation float Strength : TEXCOORD2;
+#if CAMERA_MODE == CAMERA_MODE_STEREO
+  uint RenderTargetArrayIndex : SV_RenderTargetArrayIndex;
+#endif
+};
+
+[VERTEXSHADER]
+#include <Shaders/Vegetation/Grass/GrassGpuData.h>
+#include <Shaders/Vegetation/Grass/GrassCommon.h>
+StructuredBuffer<plGrassStrandStatic> GrassStatic BIND_GROUP(BG_DRAW_CALL);
+StructuredBuffer<plGrassPageGpu> GrassPages BIND_GROUP(BG_DRAW_CALL);
+StructuredBuffer<plGrassSourceGpu> GrassSources BIND_GROUP(BG_DRAW_CALL);
+
+VS_OUT main(uint vertexId : SV_VertexID, uint instanceId : SV_InstanceID)
+{
+  VS_OUT output = (VS_OUT)0;
+  output.Position = float4(-2, -2, 0, 1);
+#if CAMERA_MODE == CAMERA_MODE_STEREO
+  s_ActiveCameraEyeIndex = instanceId & 1;
+  output.RenderTargetArrayIndex = s_ActiveCameraEyeIndex;
+  instanceId >>= 1;
+#endif
+  plGrassPageGpu page = GrassPages[CONTACT(ContactPage)];
+  uint strandIndex = instanceId;
+  if (strandIndex >= page.StrandCount)
+    return output;
+  plGrassStrandStatic strand = GrassStatic[CONTACT(ContactPage) * GRASS_PAGE_SIZE + strandIndex];
+  if (((strand.AtlasFlags >> 8) & GRASS_STRAND_FLAG_ALIVE) == 0)
+    return output;
+  plGrassSourceGpu source = GrassSources[page.SourceIndex];
+  output.Root = GrassTransformPosition(source.ObjectToWorld, strand.Root);
+  output.Axis = GrassTransformAxis(source.ObjectToWorld, GrassOctDecode(strand.Axis));
+  float distanceLimit = min(CONTACT(ContactDistance), source.Distances.x);
+  output.Strength = CONTACT(ContactStrength) * (1.0 - smoothstep(distanceLimit * 0.8, distanceLimit, distance(output.Root, GetCameraPosition())));
+  if (output.Strength <= 0.0)
+    return output;
+  const float3 side = normalize(cross(abs(output.Axis.z) < 0.99 ? float3(0, 0, 1) : float3(0, 1, 0), output.Axis));
+  const float3 forward = cross(output.Axis, side);
+  const float3 corner = float3(vertexId & 1, (vertexId >> 1) & 1, (vertexId >> 2) & 1) * 2.0 - 1.0;
+  const float3 position = output.Root + (side * corner.x + forward * corner.y) * CONTACT(ContactRadius) +
+    output.Axis * corner.z * CONTACT(ContactHeight);
+  output.Position = mul(GetWorldToScreenMatrix(), float4(position, 1));
+  return output;
+}
+
+[PIXELSHADER]
+Texture2DArray ContactDepth BIND_GROUP(BG_DRAW_CALL);
+
+float4 main(VS_OUT input) : SV_Target
+{
+#if CAMERA_MODE == CAMERA_MODE_STEREO
+  s_ActiveCameraEyeIndex = input.RenderTargetArrayIndex;
+#endif
+  float depth = ContactDepth.Load(int4(int2(input.Position.xy), s_ActiveCameraEyeIndex, 0)).r;
+  if (depth >= 1.0)
+    return float4(1, 0, 0, 1);
+  float3 worldPosition = ScreenCoordToWorldSpace(input.Position.xy * ViewportSize.zw, depth);
+  float3 offset = worldPosition - input.Root;
+  float planeDistance = dot(offset, input.Axis);
+  float radialDistance = length(offset - input.Axis * planeDistance);
+  float3 normal = cross(ddx(worldPosition), ddy(worldPosition));
+  float alignment = abs(dot(normal, input.Axis)) / max(length(normal), 0.000001);
+  float footprint = 1.0 - smoothstep(0.25, 1.0, radialDistance / CONTACT(ContactRadius));
+  float contact = 1.0 - smoothstep(0.25, 1.0, abs(planeDistance) / CONTACT(ContactHeight));
+  // Reject unrelated surfaces and blade faces; this is contact on the supporting surface, not a dark overlay.
+  float strength = input.Strength * footprint * contact * smoothstep(0.5, 0.8, alignment);
+  return float4(1.0 - strength, 0, 0, 1);
+}

@@ -1,0 +1,245 @@
+[PLATFORMS]
+ALL
+
+[PERMUTATIONS]
+
+[COMPUTESHADER]
+
+#define GRASS_CULL_CONSTANTS
+#include <Shaders/Common/Common.h>
+#include <Shaders/Vegetation/Grass/GrassGpuData.h>
+#include <Shaders/Vegetation/Grass/GrassCommon.h>
+
+// Per view: one thread per strand of the pages the view's CPU prefilter kept (GrassViewPages). Tests the strand's
+// rest-pose bounding sphere against the view distance, the shadow distance (shadow views, measured from the main
+// camera), the frustum and, for main views, the previous frame's Hi-Z pyramid. Procedural blades use progressive
+// density ranks; legacy cards retain hashed distance thinning. Survivors append to their source's LOD bucket and
+// grow that bucket's indexed indirect instance count (including both eyes for stereo).
+//
+// A thread group covers GRASS_CULL_THREAD_GROUP_SIZE consecutive strands of one page, so all of them share a source.
+// The group counts its survivors per LOD in shared memory and claims each LOD's bucket range with one global atomic,
+// instead of one per strand: with a few sources every surviving strand of the view would otherwise serialise on the
+// same three argument records.
+
+StructuredBuffer<plGrassStrandStatic> GrassStatic BIND_GROUP(BG_DRAW_CALL);
+StructuredBuffer<plGrassSourceGpu> GrassSources BIND_GROUP(BG_DRAW_CALL);
+StructuredBuffer<plGrassPageGpu> GrassPages BIND_GROUP(BG_DRAW_CALL);
+StructuredBuffer<uint> GrassViewPages BIND_GROUP(BG_DRAW_CALL);
+
+RWByteAddressBuffer GrassArgs BIND_GROUP(BG_DRAW_CALL);
+RWStructuredBuffer<uint> GrassVisible BIND_GROUP(BG_DRAW_CALL);
+
+Texture2D<float> HiZTexture BIND_GROUP(BG_DRAW_CALL);
+StructuredBuffer<uint> HiZValidity BIND_GROUP(BG_DRAW_CALL);
+
+groupshared uint s_LodCount[GRASS_LOD_COUNT];
+groupshared uint s_LodBase[GRASS_LOD_COUNT];
+
+bool IsSphereInFrustum(float3 center, float radius)
+{
+  float4 planes[6] = {CullFrustumPlane0, CullFrustumPlane1, CullFrustumPlane2, CullFrustumPlane3, CullFrustumPlane4, CullFrustumPlane5};
+
+  const uint planeCount = min(CullPlaneCount, 6u);
+  for (uint i = 0; i < planeCount; ++i)
+  {
+    if (dot(planes[i].xyz, center) + planes[i].w < -radius)
+      return false;
+  }
+
+  return true;
+}
+
+// Conservative occlusion test against the previous frame's pyramid, same as the mesh GPU cull: true only when the
+// sphere is proven hidden.
+bool IsSphereOccluded(float3 center, float radius)
+{
+  float2 ndcMin = float2(1e30f, 1e30f);
+  float2 ndcMax = float2(-1e30f, -1e30f);
+  float minDepth = 1e30f;
+  float maxDepth = -1e30f;
+
+  [unroll]
+  for (uint corner = 0; corner < 8; ++corner)
+  {
+    float3 offset = float3((corner & 1) != 0 ? radius : -radius, (corner & 2) != 0 ? radius : -radius, (corner & 4) != 0 ? radius : -radius);
+    float4 clipPos = mul(CullHiZViewProjection, float4(center + offset, 1.0f));
+
+    if (clipPos.w <= 0.0001f)
+      return false;
+
+    float3 ndc = clipPos.xyz / clipPos.w;
+    ndcMin = min(ndcMin, ndc.xy);
+    ndcMax = max(ndcMax, ndc.xy);
+    minDepth = min(minDepth, ndc.z);
+    maxDepth = max(maxDepth, ndc.z);
+  }
+
+  if (ndcMin.x < -1.0f || ndcMax.x > 1.0f || ndcMin.y < -1.0f || ndcMax.y > 1.0f || minDepth < 0.0f || maxDepth > 1.0f)
+    return false;
+
+  float2 uvMin = saturate(float2(ndcMin.x, -ndcMax.y) * 0.5f + 0.5f);
+  float2 uvMax = saturate(float2(ndcMax.x, -ndcMin.y) * 0.5f + 0.5f);
+
+  float2 rectTexels = (uvMax - uvMin) * float2(CullHiZSize);
+  float maxExtent = max(max(rectTexels.x, rectTexels.y), 1.0f);
+  uint mip = min(uint(ceil(log2(maxExtent))), max(CullHiZMipCount, 1u) - 1);
+
+  uint2 mipSize = max(CullHiZSize >> mip, uint2(1, 1));
+  int2 coordMin = clamp(int2(uvMin * float2(mipSize)), int2(0, 0), int2(mipSize) - 1);
+  int2 coordMax = clamp(int2(uvMax * float2(mipSize)), int2(0, 0), int2(mipSize) - 1);
+
+  float maxOccluderDepth = HiZTexture.Load(int3(coordMin.x, coordMin.y, int(mip)));
+  maxOccluderDepth = max(maxOccluderDepth, HiZTexture.Load(int3(coordMax.x, coordMin.y, int(mip))));
+  maxOccluderDepth = max(maxOccluderDepth, HiZTexture.Load(int3(coordMin.x, coordMax.y, int(mip))));
+  maxOccluderDepth = max(maxOccluderDepth, HiZTexture.Load(int3(coordMax.x, coordMax.y, int(mip))));
+
+  return minDepth > maxOccluderDepth;
+}
+
+// Indices one strand of the source draws at a LOD. Blades end in one triangle rather than a degenerate tip quad.
+uint VerticesPerStrand(plGrassSourceGpu source, uint lod)
+{
+  const uint segments = GrassSegmentsForLod(clamp(source.Counts.x, 1u, (uint)GRASS_MAX_SEGMENTS), lod);
+  const uint billboards = GrassBillboardsForLod(clamp(source.Counts.y, 1u, (uint)GRASS_MAX_BILLBOARDS), lod);
+  return segments * billboards * 6u - (GrassIsBlade(source) ? 3u : 0u);
+}
+
+// Whether the strand draws in this view, and at which LOD.
+bool CullStrand(plGrassStrandStatic s, plGrassPageGpu page, plGrassSourceGpu source, out uint out_lod)
+{
+  out_lod = 0;
+
+  if (!GrassStrandIsAlive(s))
+    return false;
+
+  const float3 axisLocal = GrassOctDecode(s.Axis);
+  const float3 axis = GrassTransformAxis(source.ObjectToWorld, axisLocal);
+  const float3 root = GrassTransformPosition(source.ObjectToWorld, s.Root);
+  const float strandLength = GrassEffectiveLength(s, source);
+  const float worldLength = GrassWorldLength(source.ObjectToWorld, axisLocal, strandLength);
+
+  // Covers every constrained pose, the card width at an atlas aspect up to 4 and the camera bend.
+  const float3 center = root + axis * (worldLength * 0.5);
+  const float radius = GrassIsBlade(source) ? worldLength * 2.5 + strandLength * source.Shape.y * source.Blade.x * source.Touch.z * 3.0 + source.Detail.w :
+    worldLength * 1.3 + strandLength * source.Shape.y * source.Shape.z * source.Touch.z * 2.0;
+
+  const bool bShadow = (CullFlags & GRASS_CULL_FLAG_SHADOW) != 0;
+  const float3 lodReference = bShadow ? CullMainCameraPosition : CullCameraPosition;
+  const float distance = length(root - lodReference);
+
+  if (distance > source.Distances.x)
+    return false;
+
+  if (bShadow && distance > source.Distances.w)
+    return false;
+  // Ground cover is a surface appearance proxy; it must not cast floating blade shadows.
+  if (bShadow && GrassGroundCoverBlend(source, distance) >= 1.0)
+    return false;
+
+  if (!IsSphereInFrustum(center, radius))
+    return false;
+
+  if ((CullFlags & GRASS_CULL_FLAG_OCCLUSION) != 0 && HiZValidity[0] != 0)
+  {
+    if (IsSphereOccluded(center, radius))
+      return false;
+  }
+
+  const float lodStart = max(1.0, source.Distances.z);
+  const float thinStart = lodStart * 3.0;
+  if (GrassIsBlade(source))
+  {
+    if (GrassBladeVisibility(s, source, distance) <= 0.0)
+      return false;
+  }
+  else if (distance > thinStart)
+  {
+    const float keep = lerp(1.0, 0.25, saturate((distance - thinStart) / max(source.Distances.x - thinStart, 0.001)));
+    if (GrassHashToFloat(GrassPcgHash(s.Seed ^ 0x27D4EB2Fu)) > keep)
+      return false;
+  }
+
+  // Pool budget thinning of the page, independent of the distance thinning above.
+  const uint pageDensity = (page.Flags >> GRASS_PAGE_DENSITY_SHIFT) & 0xFFu;
+  if (pageDensity < 255u && GrassHashToFloat(GrassPcgHash(s.Seed ^ 0x165667B1u)) * 255.0 >= float(pageDensity))
+    return false;
+
+  out_lod = distance < lodStart ? 0u : (distance < thinStart ? 1u : 2u);
+  return true;
+}
+
+[numthreads(GRASS_CULL_THREAD_GROUP_SIZE, 1, 1)]
+void main(uint3 groupId : SV_GroupID, uint3 groupThreadId : SV_GroupThreadID)
+{
+  // Group-uniform exits, taken before the first barrier.
+  if (groupId.y >= CullResidentPageCount)
+    return;
+
+  const uint pageIndex = GrassViewPages[groupId.y];
+  if (pageIndex >= CullPageCount)
+    return;
+
+  const plGrassPageGpu page = GrassPages[pageIndex];
+  if (page.SourceIndex >= CullSourceCount)
+    return;
+
+  const uint tid = groupThreadId.x;
+  if (tid < GRASS_LOD_COUNT)
+    s_LodCount[tid] = 0;
+  GroupMemoryBarrierWithGroupSync();
+
+  const plGrassSourceGpu source = GrassSources[page.SourceIndex];
+  const uint strandInPage = groupId.x * GRASS_CULL_THREAD_GROUP_SIZE + tid;
+  const uint globalStrand = pageIndex * GRASS_PAGE_SIZE + strandInPage;
+
+  uint lod = 0;
+  bool keep = strandInPage < page.StrandCount && strandInPage < GRASS_PAGE_SIZE && globalStrand < CullPoolStrands;
+  if (keep)
+    keep = CullStrand(GrassStatic[globalStrand], page, source, lod);
+
+  uint local = 0;
+  if (keep)
+    InterlockedAdd(s_LodCount[lod], 1u, local);
+  GroupMemoryBarrierWithGroupSync();
+
+  // One thread per LOD claims the group's share of the bucket; ~0 marks a record the args buffer does not hold.
+  if (tid < GRASS_LOD_COUNT)
+  {
+    uint base = 0xFFFFFFFFu;
+    const uint count = s_LodCount[tid];
+    const uint record = page.SourceIndex * GRASS_LOD_COUNT + tid;
+    if (count > 0 && record < CullArgsRecords)
+    {
+      const uint indicesPerStrand = VerticesPerStrand(source, tid);
+      const uint segments = GrassSegmentsForLod(source.Counts.x, tid);
+      const uint firstIndex = segments * (segments - 1u) / 2u * 6u * GRASS_MAX_BILLBOARDS;
+      uint unused;
+      // All groups of a source agree on topology. Atomics avoid racing non-atomic writes to the argument record.
+      GrassArgs.InterlockedMax(record * GRASS_ARGS_STRIDE, indicesPerStrand, unused);
+      GrassArgs.InterlockedMax(record * GRASS_ARGS_STRIDE + 8u, firstIndex, unused);
+      uint previousInstances;
+      GrassArgs.InterlockedAdd(record * GRASS_ARGS_STRIDE + 4u, count * CullInstanceCount, previousInstances);
+      base = previousInstances / CullInstanceCount;
+    }
+    s_LodBase[tid] = base;
+  }
+  GroupMemoryBarrierWithGroupSync();
+
+  if (!keep || s_LodBase[lod] == 0xFFFFFFFFu)
+    return;
+
+  const uint index = s_LodBase[lod] + local;
+  const uint capacity = source.Layout.y;
+  if (index >= capacity)
+    return;
+
+  const uint base = source.Layout.x;
+  uint slot = base + index;
+  if (lod == 1)
+    slot = base + capacity + index;
+  else if (lod == 2)
+    slot = base + 2 * capacity - 1 - index;
+
+  if (slot < CullVisibleEntries)
+    GrassVisible[slot] = globalStrand;
+}

@@ -1,0 +1,88 @@
+HeaderV2
+{
+o
+{
+	Uuid %id{u4{14816538954488327056,15148307227119566662}}
+	s %t{"plAssetDocumentInfo"}
+	u3 %v{2}
+	s %n{"Header"}
+	p
+	{
+		s %AssetType{"Material"}
+		VarArray %Dependencies
+		{
+			s{"Shaders/Vegetation/Grass/Grass.plShader"}
+		}
+		Uuid %DocumentID{u4{14816538954488327056,15148307227119566662}}
+		u4 %Hash{1511669767587567069}
+		VarArray %MetaInfo{}
+		VarArray %Outputs{}
+		VarArray %PackageDeps
+		{
+			s{"{ ac614d7c-2b31-4a7b-aa0c-c5d8200b7b89 }"}
+		}
+		VarArray %References
+		{
+			s{"Shaders/Vegetation/Grass/Grass.plShader"}
+			s{"{ ac614d7c-2b31-4a7b-aa0c-c5d8200b7b89 }"}
+		}
+	}
+}
+}
+Objects
+{
+o
+{
+	Uuid %id{u4{17816338004652707371,8759924846538665530}}
+	s %t{"Shaders/Vegetation/Grass/Grass.plShader"}
+	u3 %v{2}
+	p
+	{
+		s %BLEND_MODE{"BLEND_MODE::BLEND_MODE_MASKED"}
+		s %DitherNoiseTexture{"{ ac614d7c-2b31-4a7b-aa0c-c5d8200b7b89 }"}
+		s %SHADING_MODE{"SHADING_MODE::SHADING_MODE_LIT"}
+		b %TWO_SIDED{1}
+		Color %base_color{f{0x9A99193E,0xCDCCCC3E,0x0AD7233D,0x0000803F}}
+		f %specular_roughness{0xCDCC4C3F}
+		f %subsurface_weight{0x0000003F}
+		Color %subsurface_color{f{0x9A99193F,0xCDCC4C3F,0xCDCC4C3E,0x0000803F}}
+		f %foliage_transmission_wrap{0x0000003F}
+		f %foliage_transmission_power{0x0000A041}
+		f %foliage_ambient_transmission{0x0000803E}
+		f %foliage_root_thickness{0x0000403F}
+		f %foliage_normal_blend{0x0000003F}
+		f %foliage_root_occlusion{0x0000003F}
+	}
+}
+o
+{
+	Uuid %id{u4{12428506261212203739,9126889171436822701}}
+	s %t{"plMaterialAssetProperties"}
+	u3 %v{4}
+	p
+	{
+		s %BaseMaterial{""}
+		s %Shader{"Shaders/Vegetation/Grass/Grass.plShader"}
+		s %ShaderMode{"plMaterialShaderMode::File"}
+		Uuid %ShaderProperties{u4{17816338004652707371,8759924846538665530}}
+		s %Surface{""}
+	}
+}
+o
+{
+	Uuid %id{u4{18096612296587978288,6449934965513159559}}
+	s %t{"plDocumentRoot"}
+	u3 %v{1}
+	s %n{"ObjectTree"}
+	p
+	{
+		VarArray %Children
+		{
+			Uuid{u4{12428506261212203739,9126889171436822701}}
+		}
+	}
+}
+}
+Types
+{
+}

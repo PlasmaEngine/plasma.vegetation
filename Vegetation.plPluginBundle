@@ -1,0 +1,21 @@
+// for a description of the options see:
+// https://plengine.net/pages/docs/editor/editor-plugins.html
+
+PluginInfo
+{
+	string %DisplayName{"Vegetation"}
+	string %Category{"Rendering"}
+	string %Icon{"VegetationIcon.png"}
+	string %Banner{"VegetationBanner.png"}
+	string %MinEngineVersion{"0.11.2"}
+	string %MaxEngineVersion{"0.11.2"}
+	string %Description{"Vegetation types, grass types, wind, touch bending and a paint tool."}
+	string %EditorPlugins{"plEditorPluginVegetation"}
+	string %EditorEnginePlugins{"plEnginePluginVegetation"}
+	string %RuntimePlugins{"plVegetationPlugin"}
+	string %PackageDependencies{}
+	string %RequiredPlugins{}
+	string %ExclusiveFeatures{}
+	string %EnabledInTemplates{"General3D"}
+	string %PlasmaBuildTargetName{"VegetationPlugin"}
+}

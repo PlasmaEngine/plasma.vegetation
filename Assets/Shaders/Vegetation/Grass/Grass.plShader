@@ -1,0 +1,1100 @@
+[PLATFORMS]
+ALL
+
+[PERMUTATIONS]
+
+// Free variables: the render pipeline drives RENDER_PASS, FORWARD_PASS_WRITE_DEPTH, MSAA, CAMERA_MODE,
+// MATERIAL_PREVIEW and VELOCITY_OUTPUT; the material asset drives the rest.
+BLEND_MODE
+RENDER_PASS
+SHADING_MODE
+TWO_SIDED
+FORWARD_PASS_WRITE_DEPTH
+MSAA
+CAMERA_MODE
+MATERIAL_PREVIEW
+VELOCITY_OUTPUT
+OPENPBR_COAT
+OPENPBR_COAT_EXTENDED
+OPENPBR_FUZZ
+
+// Pinned variables are compile-time constants and leave the permutation hash, so a render context value for
+// them is ignored and cannot request an on-demand compile. Strands are never mirrored, the engine always
+// provides last-frame object data, and grass shades with the thin-walled foliage lobe only: the screen-space
+// subsurface, transmission, thin-film and anisotropic lobes stay off. SSS_PROFILE selects a screen-space
+// profile that only the GBuffer path reads.
+SHADING_QUALITY = SHADING_QUALITY_NORMAL
+FLIP_WINDING = FALSE
+GAMEOBJECT_VELOCITY = TRUE
+SSS_PROFILE = SSS_PROFILE_NONE
+OPENPBR_ANISOTROPY = FALSE
+OPENPBR_TRANSMISSION = FALSE
+OPENPBR_TRANSMISSION_BLUR = FALSE
+OPENPBR_TRANSMISSION_DISPERSION = FALSE
+OPENPBR_THINFILM = FALSE
+OPENPBR_SUBSURFACE = FALSE
+
+[MATERIALPARAMETER]
+
+// OpenPBR Surface on GPU grass strands. The base, specular, coat, fuzz, emission and geometry parameters are the
+// shared OpenPBR set of Vegetation.plShader, so a leaf material can be re-based onto this shader without renaming
+// anything. Transmission controls the thin-walled foliage lobe: transmission_weight is how much light passes
+// through the blade, transmission_color its tint, thickness_texture where it passes (thick = less). Without a
+// thickness texture the blade's height, written by the vertex shader, stands in: tips are thinner than roots.
+// Cards are lit by their face normal blended toward the blade's growth direction (foliage_normal_blend) and
+// darkened toward the root (foliage_root_occlusion). Scale has no effect: the atlas rect of each strand fixes
+// the UVs.
+#include <Shaders/Materials/OpenPBRParams.h>
+
+// --- Foliage -------------------------------------------------------------------------------------
+
+// Wrap of the front-lit part of the translucent lobe. 0 is a plain cosine falloff, 1 lights the blade almost to
+// its back edge.
+float foliage_transmission_wrap @Default(0.5) @Clamp(0.0, 1.0) @Group("Foliage");
+
+// Bends the back-lit direction by the normal so transmission spreads over the card instead of pinning to the
+// exact anti-light direction.
+float foliage_transmission_distortion @Default(0.1) @Clamp(0.0, 0.5) @Group("Foliage");
+
+// Tightness of the back-lit glow around the light seen through the blade. Higher is tighter.
+float foliage_transmission_power @Default(20.0) @Clamp(10.0, 80.0) @Group("Foliage");
+
+// Overall strength of the back-lit transmission.
+float foliage_transmission_intensity @Default(1.0) @Clamp(0.0, 2.0) @Group("Foliage");
+
+// Share of sky light that passes through the blade regardless of direction.
+float foliage_ambient_transmission @Default(0.25) @Clamp(0.0, 1.0) @Group("Foliage");
+
+// Share of the translucency blocked at the root of a blade when no thickness texture is bound. The tip is always
+// fully thin; the blade thickens linearly toward the root.
+float foliage_root_thickness @Default(0.75) @Clamp(0.0, 1.0) @Group("Foliage");
+
+// Share of the blade's growth direction mixed into the card's face normal. 0 lights every card by its own face,
+// which gives each blade its shape but flickers between neighbours; 1 lights every blade like the ground under it,
+// which is flat. The face normal always points at the viewer on two-sided materials; the growth direction never flips.
+float foliage_normal_blend @Default(0.5) @Clamp(0.0, 1.0) @Group("Foliage");
+float foliage_specular_antialias @Default(0.2) @Clamp(0.0, 1.0) @Group("Foliage");
+
+// Height-based self-occlusion, independent of the camera and the supporting surface's orientation.
+// Feeds the material AO channel (indirect lighting and the renderer's direct-light microshadowing).
+float foliage_root_occlusion @Default(0.75) @Clamp(0.0, 1.0) @Group("Grass Base AO");
+// Fraction of blade height affected. Above this height the blade is fully unoccluded.
+float foliage_root_occlusion_height @Default(0.65) @Clamp(0.01, 1.0) @Group("Grass Base AO");
+// Higher values concentrate the darkening closer to the root.
+float foliage_root_occlusion_falloff @Default(1.5) @Clamp(0.25, 4.0) @Group("Grass Base AO");
+// Distant cover represents the visible canopy, rather than a flattened root-to-tip gradient.
+float foliage_ground_cover_occlusion @Default(0.2) @Clamp(0.0, 1.0) @Group("Grass Base AO");
+
+// Thickness maps painted as "subsurface" masks (white = translucent) flip the thickness sense.
+bool InvertThickness @Group("Foliage");
+
+[MATERIALCONFIG]
+
+#include <Shaders/Materials/OpenPBRConfig.h>
+
+[RENDERSTATE]
+
+#include <Shaders/Materials/MaterialState.h>
+
+[MATERIALCONSTANTS]
+
+#include <Shaders/Materials/OpenPBRConstants.h>
+
+// Grass additions, after the shared block so both expansions agree on the layout.
+FLOAT1(foliage_transmission_wrap);
+FLOAT1(foliage_transmission_distortion);
+FLOAT1(foliage_transmission_power);
+FLOAT1(foliage_transmission_intensity);
+FLOAT1(foliage_ambient_transmission);
+FLOAT1(foliage_root_thickness);
+FLOAT1(foliage_normal_blend);
+FLOAT1(foliage_specular_antialias);
+FLOAT1(foliage_root_occlusion);
+FLOAT1(foliage_root_occlusion_height);
+FLOAT1(foliage_root_occlusion_falloff);
+FLOAT1(foliage_ground_cover_occlusion);
+
+BOOL1(InvertThickness);
+
+[VERTEXSHADER]
+
+#define USE_NORMAL
+#define USE_TANGENT
+#define USE_TEXCOORD0
+// The pixel shader always defines USE_WORLDPOS and USE_DATAOFFSETS; both stages must declare the same interpolators.
+#define USE_WORLDPOS
+#define USE_DATAOFFSETS
+
+#if !MATERIAL_PREVIEW
+  // Color0.a carries the height along the blade (0 root, 1 tip) for the pixel shader's thickness fallback. Preview
+  // meshes have no such value and do not declare the interpolator.
+  #define USE_COLOR0
+  #define USE_TEXCOORD1
+#endif
+
+#if GAMEOBJECT_VELOCITY
+  #define USE_VELOCITY
+#endif
+
+#if RENDER_PASS == RENDER_PASS_EDITOR
+  #define USE_DEBUG_INTERPOLATOR
+#endif
+
+#if MATERIAL_PREVIEW
+
+// Asset thumbnails and previews draw the material on an ordinary mesh. MaterialVertexShader.h adds the geometry-id
+// interpolator itself.
+#include <Shaders/Materials/MaterialVertexShader.h>
+
+VS_OUT main(VS_IN Input)
+{
+  return FillVertexData(Input);
+}
+
+#else
+
+#if RENDER_PASS == RENDER_PASS_GEOMETRY_ID
+  #define USE_MESHLET_DEBUG_INTERPOLATOR
+#endif
+
+#define GRASS_DRAW_CONSTANTS
+#include <Shaders/Common/Common.h>
+#include <Shaders/Common/GlobalConstants.h>
+#include <Shaders/Common/CameraConstantsAccess.h>
+#include <Shaders/Common/ObjectConstants.h>
+#include <Shaders/Materials/MaterialInterpolator.h>
+#include <Shaders/Vegetation/Grass/GrassGpuData.h>
+#include <Shaders/Vegetation/Grass/GrassCommon.h>
+
+// VegetationWind.h animates with last frame's time and wind while PreviousFrame is set.
+struct VS_GLOBALS
+{
+  bool PreviousFrame;
+};
+static VS_GLOBALS G;
+
+#include <Shaders/Vegetation/VegetationWind.h>
+
+// Strand pool and this view's visible lists, see GrassGpuData.h. Bound by plGrassRenderer.
+StructuredBuffer<plGrassStrandStatic> GrassStatic BIND_GROUP(BG_DRAW_CALL);
+ByteAddressBuffer GrassState BIND_GROUP(BG_DRAW_CALL);
+StructuredBuffer<plGrassPageGpu> GrassPages BIND_GROUP(BG_DRAW_CALL);
+StructuredBuffer<plGrassSourceGpu> GrassSources BIND_GROUP(BG_DRAW_CALL);
+StructuredBuffer<plGrassAtlasGpu> GrassAtlas BIND_GROUP(BG_DRAW_CALL);
+StructuredBuffer<uint> GrassVisible BIND_GROUP(BG_DRAW_CALL);
+
+#define DRAW(x) GET_PUSH_CONSTANT(plGrassDrawConstants, x)
+
+struct GrassStrandPose
+{
+  float3 Root;
+  float3 Node;      // centre line point of the vertex's row
+  float3 Direction; // strand direction at that row
+};
+
+// Rest pose bent by the analytic sway and touch offset of VegetationWind.h; used beyond Simulation Distance.
+float3 GrassRestNode(float3 root, float3 axis, float worldLength, float fraction, plGrassStrandStatic s, plGrassSourceGpu source)
+{
+  return root + GrassAnalyticOffset(axis, worldLength, fraction, s, source,
+    VegetationSampleWind(root + axis * (worldLength * 0.5)), VegetationWindTime(), SampleVegetationTouch(root));
+}
+
+// Centre line node i (0 = root) of the full-resolution strand.
+float3 GrassFullNode(uint i, float3 root, float3 axis, float worldLength, uint fullSegments, bool bSimulated, bool bPrevious, plGrassPageGpu page, uint strandInPage, plGrassStrandStatic s, plGrassSourceGpu source)
+{
+  if (i == 0)
+    return root;
+
+  if (bSimulated)
+  {
+    uint address = GrassStateAddress(page, strandInPage, fullSegments, i - 1, DRAW(DrawStateSegments));
+    if (address != 0xFFFFFFFFu)
+    {
+      // The previous frame rendered the frame-start pose, which the simulation stored before its steps.
+      if (bPrevious && (source.Layout.z & GRASS_SOURCE_FLAG_STEPPED) != 0)
+      {
+        float3 simulated = root + GrassUnpackFramePose(GrassState.Load2(address + GRASS_STATE_FRAME_OFFSET));
+        float blend = 1.0 - smoothstep(source.Distances.y * 0.75, max(source.Distances.y, 0.001), length(root - source.MainCamera.xyz));
+        return lerp(GrassRestNode(root, axis, worldLength, float(i) / float(fullSegments), s, source), simulated, blend);
+      }
+
+      float3 current, stepPrevious;
+      GrassUnpackState(GrassState.Load3(address), current, stepPrevious);
+      float blend = 1.0 - smoothstep(source.Distances.y * 0.75, max(source.Distances.y, 0.001), length(root - source.MainCamera.xyz));
+      return lerp(GrassRestNode(root, axis, worldLength, float(i) / float(fullSegments), s, source), root + current, blend);
+    }
+  }
+
+  return GrassRestNode(root, axis, worldLength, float(i) / float(fullSegments), s, source);
+}
+
+// Node j of the LOD strand with `segments` segments, resampled along the full-resolution centre line.
+float3 GrassLodNode(uint j, uint segments, float3 root, float3 axis, float worldLength, uint fullSegments, bool bSimulated, bool bPrevious, plGrassPageGpu page, uint strandInPage, plGrassStrandStatic s, plGrassSourceGpu source)
+{
+  float fIndex = float(j) * float(fullSegments) / float(segments);
+  uint index = min((uint)fIndex, fullSegments - 1);
+  float3 a = GrassFullNode(index, root, axis, worldLength, fullSegments, bSimulated, bPrevious, page, strandInPage, s, source);
+  float3 b = GrassFullNode(index + 1, root, axis, worldLength, fullSegments, bSimulated, bPrevious, page, strandInPage, s, source);
+  return lerp(a, b, saturate(fIndex - float(index)));
+}
+
+GrassStrandPose GrassEvaluatePose(uint row, uint segments, uint fullSegments, bool bSimulated, bool bPrevious, plGrassPageGpu page, uint strandInPage, plGrassStrandStatic s, plGrassSourceGpu source)
+{
+  G.PreviousFrame = bPrevious;
+
+  Transform xf = source.ObjectToWorld;
+  if (bPrevious)
+    xf = source.LastObjectToWorld;
+  float3 axisLocal = GrassOctDecode(s.Axis);
+  float3 axis = GrassTransformAxis(xf, axisLocal);
+  float3 root = GrassTransformPosition(xf, s.Root);
+  float worldLength = GrassWorldLength(xf, axisLocal, GrassEffectiveLength(s, source));
+
+  uint lower = row == segments ? row - 1 : row;
+  uint upper = min(row + 1, segments);
+
+  GrassStrandPose pose;
+  pose.Root = root;
+  pose.Node = GrassLodNode(row, segments, root, axis, worldLength, fullSegments, bSimulated, bPrevious, page, strandInPage, s, source);
+  float3 lowerNode = row == lower ? pose.Node : GrassLodNode(lower, segments, root, axis, worldLength, fullSegments, bSimulated, bPrevious, page, strandInPage, s, source);
+  float3 upperNode = GrassLodNode(upper, segments, root, axis, worldLength, fullSegments, bSimulated, bPrevious, page, strandInPage, s, source);
+  float3 direction = upperNode - lowerNode;
+  float directionLength = length(direction);
+  pose.Direction = directionLength > 0.000001 ? direction / directionLength : axis;
+
+  if (GrassIsBlade(source))
+  {
+    float3 side = GrassBillboardTangent(axis, GrassBladeAngle(s, source), 0.0);
+    float3 facing = normalize(cross(axis, side));
+    float3 curve, derivative;
+    GrassBladeCurve(float(row) / float(segments), axis, facing, side, s, source, curve, derivative);
+    pose.Node += (curve - axis * (float(row) / float(segments))) * worldLength;
+    float3 deformationDerivative = direction * (float(segments) / float(upper - lower)) - axis * worldLength;
+    pose.Direction = normalize(derivative * worldLength + deformationDerivative + axis * 0.000001);
+  }
+
+  G.PreviousFrame = false;
+  return pose;
+}
+
+// Collapse high-detail vertices onto the next LOD's polyline before switching topology. Surviving points never move
+// at the boundary. Evaluate both frames with the same topology, including the previous frame's deformation.
+GrassStrandPose GrassEvaluateLodPose(uint row, uint segments, uint fullSegments, uint lod, bool simulated, bool previous,
+  plGrassPageGpu page, uint strandInPage, plGrassStrandStatic s, plGrassSourceGpu source, float distance)
+{
+  GrassStrandPose pose = GrassEvaluatePose(row, segments, fullSegments, simulated, previous, page, strandInPage, s, source);
+  if (!GrassIsBlade(source) || lod >= 2)
+    return pose;
+  uint nextSegments = GrassSegmentsForLod(fullSegments, lod + 1);
+  float boundary = source.Distances.z * (lod == 0 ? 1.0 : 3.0);
+  float morph = smoothstep(boundary * 0.75, boundary, distance);
+  if (morph <= 0.0)
+    return pose;
+  float nextRow = float(row) * float(nextSegments) / float(segments);
+  uint lo = min(uint(nextRow), nextSegments - 1);
+  GrassStrandPose a = GrassEvaluatePose(lo, nextSegments, fullSegments, simulated, previous, page, strandInPage, s, source);
+  GrassStrandPose b = GrassEvaluatePose(lo + 1, nextSegments, fullSegments, simulated, previous, page, strandInPage, s, source);
+  float f = saturate(nextRow - float(lo));
+  pose.Node = lerp(pose.Node, lerp(a.Node, b.Node, f), morph);
+  pose.Direction = normalize(lerp(pose.Direction, normalize(lerp(a.Direction, b.Direction, f)), morph));
+  return pose;
+}
+
+float3 GrassVertexPosition(GrassStrandPose pose, float3 tangent, float halfWidth, float billboardSize, uint edge, float rowFraction, float worldLength, bool bCameraBend)
+{
+  float3 side = tangent - pose.Direction * dot(tangent, pose.Direction);
+  float sideLength = length(side);
+  if (sideLength > 0.000001)
+  {
+    side /= sideLength;
+  }
+  else
+  {
+    float3 reference = abs(pose.Direction.z) < 0.99 ? float3(0, 0, 1) : float3(1, 0, 0);
+    side = normalize(cross(reference, pose.Direction));
+  }
+
+  float3 center = lerp(pose.Root, pose.Node, billboardSize);
+  float3 position = center + side * (edge == 0 ? -halfWidth : halfWidth);
+
+  // Camera bend: strands leaning away from the camera's up direction are lifted toward it, so fields seen from above
+  // keep their silhouette. Shadow passes keep the true pose.
+  if (bCameraBend && !IsShadowPass)
+  {
+    float3 up = GetCameraDirUp();
+    position += up * ((1.0 - saturate(dot(pose.Direction, up))) * 0.8 * rowFraction * worldLength);
+  }
+
+  return position;
+}
+
+float GrassBladeHalfWidth(GrassStrandPose pose, float3 axis, float3 tangent, plGrassStrandStatic s, plGrassSourceGpu source,
+  float rowFraction, float distance, float3 camera)
+{
+  float halfWidth = GrassEffectiveLength(s, source) * source.Shape.y * source.Blade.x * source.Touch.z * 0.5 * (1.0 - rowFraction);
+  halfWidth *= min(4.0, rsqrt(GrassDistanceDensity(source, distance))) * GrassBladeVisibility(s, source, distance);
+  if (!IsShadowPass)
+  {
+    float3 viewDirection = normalize(camera - pose.Node + axis * 0.00001);
+    halfWidth *= lerp(1.5, 1.0, abs(dot(normalize(cross(pose.Direction, tangent)), viewDirection)));
+  }
+  else
+  {
+    halfWidth *= 1.0 - smoothstep(source.Distances.w * 0.8, max(source.Distances.w, 0.001), distance);
+    halfWidth *= 1.0 - GrassGroundCoverBlend(source, distance);
+  }
+  return halfWidth;
+}
+
+float3 GrassGroundCoverPosition(float3 root, float3 axis, float3 tangent, uint edge, float fraction,
+  plGrassStrandStatic s, plGrassSourceGpu source, float distance)
+{
+  // A compact triangular splat follows the root's sampled tangent plane on terrain, meshes, walls or roofs.
+  // Limit its footprint on curved/discontinuous surfaces with GroundCoverMaxSize.
+  float radius = min(source.Detail.w * 0.5, 1.3 * rsqrt(max(source.Detail.y * GrassDistanceDensity(source, distance), 0.001)));
+  radius *= sqrt(GrassBladeVisibility(s, source, distance));
+  float3 along = normalize(cross(axis, tangent));
+  return root + axis * 0.01 + tangent * ((edge == 0 ? -1.0 : 1.0) * radius * (1.0 - fraction)) +
+    along * ((fraction * 2.0 - 1.0) * radius);
+}
+
+VS_OUT main(uint VertexID : SV_VertexID, uint InstanceID : SV_InstanceID)
+{
+#if CAMERA_MODE == CAMERA_MODE_STEREO
+  s_ActiveCameraEyeIndex = InstanceID % 2;
+#endif
+
+  G.PreviousFrame = false;
+
+  VS_OUT Output = (VS_OUT)0;
+  // Degenerate until a strand vertex is resolved; every rejected vertex collapses its triangle.
+  Output.Position = float4(0, 0, 0, 1);
+  Output.Normal = float3(0, 0, 1);
+  Output.Tangent = float3(1, 0, 0);
+  Output.BiTangent = float3(0, 1, 0);
+  Output.TexCoord1 = float2(0, 0);
+
+#if defined(USE_COLOR0)
+  Output.Color0 = float4(1, 1, 1, 1);
+#endif
+
+#if defined(USE_DEBUG_INTERPOLATOR)
+  Output.DebugInterpolator = float4(0.1, 0.1, 0.1, 1.0);
+#endif
+
+#if defined(USE_MESHLET_DEBUG_INTERPOLATOR)
+  Output.MeshletIndex = 0xFFFFFFFFu;
+#endif
+
+#if defined(RENDER_TARGET_ARRAY_INDEX)
+  Output.RenderTargetArrayIndex = s_ActiveCameraEyeIndex;
+#endif
+
+#if RENDER_PASS == RENDER_PASS_GEOMETRY_ID
+  // The geometry-id pixel shader owns the only push constant block this permutation may declare, so the pass draws
+  // no grass.
+  return Output;
+#else
+
+  Output.DataOffsets = uint3(DRAW(DrawInstanceDataOffset), 0, DRAW(DrawMaterialDataOffset));
+
+  const uint sourceIndex = DRAW(DrawSourceIndex);
+  if (sourceIndex >= DRAW(DrawSourceCount))
+    return Output;
+
+  const plGrassSourceGpu source = GrassSources[sourceIndex];
+  const uint lod = min(DRAW(DrawLod), 2u);
+  const uint fullSegments = clamp(source.Counts.x, 1u, (uint)GRASS_MAX_SEGMENTS);
+  const uint segments = GrassSegmentsForLod(fullSegments, lod);
+  const uint billboards = GrassBillboardsForLod(clamp(source.Counts.y, 1u, (uint)GRASS_MAX_BILLBOARDS), lod);
+  const uint verticesPerBillboard = (segments + 1u) * 2u;
+#if CAMERA_MODE == CAMERA_MODE_STEREO
+  const uint visibleIndex = InstanceID / 2u;
+#else
+  const uint visibleIndex = InstanceID;
+#endif
+  const uint billboard = VertexID / verticesPerBillboard;
+  const uint billboardVertex = VertexID % verticesPerBillboard;
+  const uint row = billboardVertex / 2u;
+  const uint edge = billboardVertex & 1u;
+
+  const uint capacity = source.Layout.y;
+  if (visibleIndex >= capacity)
+    return Output;
+
+  uint slot = source.Layout.x + visibleIndex;
+  if (lod == 1)
+    slot = source.Layout.x + capacity + visibleIndex;
+  else if (lod == 2)
+    slot = source.Layout.x + 2 * capacity - 1 - visibleIndex;
+
+  if (slot >= DRAW(DrawVisibleEntries))
+    return Output;
+
+  const uint globalStrand = GrassVisible[slot];
+  const uint pageIndex = globalStrand >> GRASS_PAGE_SHIFT;
+  if (globalStrand >= DRAW(DrawPoolStrands) || pageIndex >= DRAW(DrawPageCount))
+    return Output;
+
+  const plGrassPageGpu page = GrassPages[pageIndex];
+  if (page.SourceIndex != sourceIndex)
+    return Output;
+
+  const plGrassStrandStatic s = GrassStatic[globalStrand];
+  if (!GrassStrandIsAlive(s))
+    return Output;
+
+  const uint strandInPage = globalStrand & (GRASS_PAGE_SIZE - 1);
+  const bool bSimulated = (page.Flags & GRASS_PAGE_FLAG_SIMULATED) != 0;
+  const bool blade = GrassIsBlade(source);
+  const bool bCameraBend = !blade && (source.Layout.z & GRASS_SOURCE_FLAG_CAMERA_BEND) != 0;
+
+  float4 texMulAdd = float4(1, 1, 0, 0);
+  float atlasAspect = 1.0;
+  const uint atlasIndex = GrassStrandAtlasIndex(s);
+  if (atlasIndex < source.Counts.w && source.Counts.z + atlasIndex < DRAW(DrawAtlasCount))
+  {
+    const plGrassAtlasGpu atlas = GrassAtlas[source.Counts.z + atlasIndex];
+    texMulAdd = atlas.TexMulAdd;
+    atlasAspect = atlas.Aspect;
+  }
+
+  const float billboardSize = GrassBillboardSize(s, billboard);
+  const float strandLength = GrassEffectiveLength(s, source);
+  float halfWidth = strandLength * source.Shape.y * atlasAspect * source.Shape.z * source.Touch.z * 0.5 * billboardSize;
+  const float rowFraction = float(row) / float(segments);
+
+  const float3 rootPosition = GrassTransformPosition(source.ObjectToWorld, s.Root);
+  const float3 lodCamera = IsShadowPass ? source.MainCamera.xyz : GetCameraPosition();
+  const float lodDistance = length(rootPosition - lodCamera);
+  const GrassStrandPose pose = GrassEvaluateLodPose(row, segments, fullSegments, lod, bSimulated, false, page, strandInPage, s, source, lodDistance);
+  const float3 axis = GrassTransformAxis(source.ObjectToWorld, GrassOctDecode(s.Axis));
+  const float angle = blade ? GrassBladeAngle(s, source) : GrassStrandAngle(s);
+  const float3 tangent = GrassBillboardTangent(axis, angle, GrassBillboardAngle(s, billboard));
+  const float worldLength = GrassWorldLength(source.ObjectToWorld, GrassOctDecode(s.Axis), strandLength);
+  if (blade)
+  {
+    halfWidth = GrassBladeHalfWidth(pose, axis, tangent, s, source, rowFraction, lodDistance, GetCameraPosition());
+  }
+  float3 worldPosition = GrassVertexPosition(pose, tangent, halfWidth, billboardSize, edge, rowFraction, worldLength, bCameraBend);
+  const float groundBlend = IsShadowPass ? 0.0 : GrassGroundCoverBlend(source, lodDistance);
+  if (groundBlend > 0.0)
+    worldPosition = lerp(worldPosition, GrassGroundCoverPosition(pose.Root, axis, tangent, edge, rowFraction, s, source, lodDistance), groundBlend);
+  Output.TexCoord1 = float2(groundBlend, float(edge));
+
+  Output.WorldPosition = worldPosition;
+  Output.Position = mul(GetWorldToScreenMatrix(), float4(worldPosition, 1.0));
+  Output.Position.z = max(Output.Position.z, MaxZValue);
+
+  // Tangent frame of the card: Normal is the face normal, Tangent runs across the card (+u), BiTangent follows the
+  // engine's cross(normal, tangent) convention and therefore points from tip to root (+v), which is minus the strand
+  // direction. The pixel shader reads the strand direction back from it.
+  float3 side = normalize(tangent - pose.Direction * dot(tangent, pose.Direction) + pose.Direction * 0.00001);
+  float3 faceNormal = normalize(cross(pose.Direction, side));
+  if (blade)
+  {
+    faceNormal = normalize(faceNormal + side * ((edge == 0 ? -1.0 : 1.0) * source.Clump.w));
+    float3 clumpSide = GrassBillboardTangent(axis, float(s.AtlasFlags >> 16) * (6.2831853 / 65535.0), 0.0);
+    float3 clumpNormal = normalize(cross(axis, clumpSide));
+    clumpNormal *= dot(clumpNormal, faceNormal) < 0.0 ? -1.0 : 1.0;
+    float normalFilter = smoothstep(source.Distances.z, source.Distances.z * 3.0, lodDistance) * source.Clump.y * 0.65;
+    faceNormal = normalize(lerp(faceNormal, clumpNormal, normalFilter));
+    faceNormal = normalize(lerp(faceNormal, axis, groundBlend));
+  }
+  Output.Normal = faceNormal;
+  Output.Tangent = side;
+  Output.BiTangent = cross(faceNormal, side);
+  Output.TexCoord0 = float2(float(edge) * texMulAdd.x + texMulAdd.z, (1.0 - rowFraction) * texMulAdd.y + texMulAdd.w);
+
+#  if defined(USE_COLOR0)
+  Output.Color0 = float4(1, 1, 1, rowFraction);
+  if (blade)
+  {
+    float variation = (GrassHashToFloat(GrassPcgHash(s.AtlasFlags >> 16)) * 2.0 - 1.0) * source.Clump.z;
+    Output.Color0.rgb = float3(1.0 + variation, 1.0 + variation * 0.5, 1.0 - variation * 0.4);
+  }
+#  endif
+
+#  if defined(USE_VELOCITY)
+  // Last frame's position from the previous simulated step (or last frame's sway) and last frame's object transform.
+  const float3 lastCamera = IsShadowPass ? source.MainCamera.xyz : GetLastCameraToWorldMatrix()._m03_m13_m23;
+  const float lastDistance = length(GrassTransformPosition(source.LastObjectToWorld, s.Root) - lastCamera);
+  const GrassStrandPose lastPose = GrassEvaluateLodPose(row, segments, fullSegments, lod, bSimulated, true, page, strandInPage, s, source, lastDistance);
+  const float3 lastAxis = GrassTransformAxis(source.LastObjectToWorld, GrassOctDecode(s.Axis));
+  const float3 lastTangent = GrassBillboardTangent(lastAxis, angle, GrassBillboardAngle(s, billboard));
+  const float lastWorldLength = GrassWorldLength(source.LastObjectToWorld, GrassOctDecode(s.Axis), strandLength);
+  float lastWidth = blade ? GrassBladeHalfWidth(lastPose, lastAxis, lastTangent, s, source, rowFraction, lastDistance, lastCamera) : halfWidth;
+  float3 lastWorldPosition = GrassVertexPosition(lastPose, lastTangent, lastWidth, billboardSize, edge, rowFraction, lastWorldLength, bCameraBend);
+  const float lastGroundBlend = IsShadowPass ? 0.0 : GrassGroundCoverBlend(source, lastDistance);
+  if (lastGroundBlend > 0.0)
+    lastWorldPosition = lerp(lastWorldPosition, GrassGroundCoverPosition(lastPose.Root, lastAxis, lastTangent, edge, rowFraction, s, source, lastDistance), lastGroundBlend);
+
+  Output.LastScreenPosition = mul(GetLastWorldToScreenMatrix(), float4(lastWorldPosition, 1.0));
+  Output.LastScreenPosition.z = max(Output.LastScreenPosition.z, MaxZValue);
+  Output.ScreenPosition = Output.Position;
+#  endif
+
+  return Output;
+#endif
+}
+
+#endif
+
+[PIXELSHADER]
+
+#define USE_NORMAL
+#define USE_TANGENT
+#define USE_TEXCOORD0
+
+#if !MATERIAL_PREVIEW
+  #define USE_COLOR0
+  #define USE_TEXCOORD1
+#endif
+
+#define USE_MATERIAL_EMISSIVE
+#define USE_MATERIAL_OCCLUSION
+// This AO models neighbouring blades, not relief on the card face. It must survive edge-on views.
+#define MATERIAL_OCCLUSION_NO_VIEW_FADE
+#define USE_TWO_SIDED_LIGHTING
+#define USE_DECALS
+#define USE_FOG
+#define USE_CUSTOM_DITHER_NOISE
+#define CUSTOM_GLOBALS float2 ParallaxTexCoord;
+
+// OpenPBR is metalness-based throughout, so the base/specular split always comes from base_metalness.
+#define USE_SIMPLE_MATERIAL_MODEL
+#define USE_MATERIAL_DIFFUSE_ROUGHNESS
+#define USE_MATERIAL_SPECULAR_TINT
+
+// Thin-walled translucency is always available on grass; subsurface_weight 0 turns it off. The screen-space
+// subsurface lobe (OPENPBR_SUBSURFACE / SSS_PROFILE) is not used by grass.
+#define MATERIAL_FOLIAGE
+#define USE_MATERIAL_SUBSURFACE_COLOR
+#define USE_MATERIAL_SUBSURFACE_PARAMS
+#define USE_MATERIAL_SUBSURFACE_EXTENDED
+#define USE_MATERIAL_FOLIAGE_PARAMS
+
+// Same permutation-to-lobe mapping as Vegetation.plShader.
+#if OPENPBR_ANISOTROPY
+  #define MATERIAL_SPECULAR_ANISOTROPIC
+#endif
+
+#if OPENPBR_COAT
+  #define MATERIAL_SPECULAR_CLEARCOAT
+  #if OPENPBR_COAT_EXTENDED
+    #define USE_MATERIAL_COAT_EXTENDED
+  #endif
+#endif
+
+#if OPENPBR_FUZZ
+  #define MATERIAL_SPECULAR_SHEEN
+  #define USE_MATERIAL_FUZZ_EXTENDED
+#endif
+
+#if OPENPBR_TRANSMISSION
+  #define MATERIAL_TRANSMISSION
+  #if OPENPBR_TRANSMISSION_BLUR
+    #define MATERIAL_TRANSMISSION_BLUR
+  #endif
+  #if OPENPBR_TRANSMISSION_DISPERSION
+    #define MATERIAL_TRANSMISSION_DISPERSION
+  #endif
+#endif
+
+#if OPENPBR_THINFILM
+  #define MATERIAL_THIN_FILM
+#endif
+
+#if GAMEOBJECT_VELOCITY
+  #define USE_VELOCITY
+#endif
+
+#if RENDER_PASS == RENDER_PASS_EDITOR
+  #define USE_DEBUG_INTERPOLATOR
+#endif
+
+#define MATERIAL_EMISSIVE_LIGHTING
+
+#include <Shaders/Materials/MaterialPixelShader.h>
+
+#if !MATERIAL_PREVIEW
+  #define GRASS_DRAW_CONSTANTS
+  #include <Shaders/Vegetation/Grass/GrassGpuData.h>
+#endif
+
+// Grass binds its material textures directly (no BINDLESS_MATERIAL permutation); the names are the OpenPBR ones.
+Texture2D base_color_texture BIND_GROUP(BG_MATERIAL);
+SamplerState base_color_texture_AutoSampler BIND_GROUP(BG_MATERIAL);
+
+Texture2D geometry_normal_texture BIND_GROUP(BG_MATERIAL);
+SamplerState geometry_normal_texture_AutoSampler BIND_GROUP(BG_MATERIAL);
+
+Texture2D orm_texture BIND_GROUP(BG_MATERIAL);
+SamplerState orm_texture_AutoSampler BIND_GROUP(BG_MATERIAL);
+
+Texture2D emission_color_texture BIND_GROUP(BG_MATERIAL);
+SamplerState emission_color_texture_AutoSampler BIND_GROUP(BG_MATERIAL);
+
+Texture2D occlusion_texture BIND_GROUP(BG_MATERIAL);
+SamplerState occlusion_texture_AutoSampler BIND_GROUP(BG_MATERIAL);
+
+Texture2D specular_roughness_texture BIND_GROUP(BG_MATERIAL);
+SamplerState specular_roughness_texture_AutoSampler BIND_GROUP(BG_MATERIAL);
+
+Texture2D base_metalness_texture BIND_GROUP(BG_MATERIAL);
+SamplerState base_metalness_texture_AutoSampler BIND_GROUP(BG_MATERIAL);
+
+Texture2D specular_color_texture BIND_GROUP(BG_MATERIAL);
+SamplerState specular_color_texture_AutoSampler BIND_GROUP(BG_MATERIAL);
+
+Texture2D coat_texture BIND_GROUP(BG_MATERIAL);
+SamplerState coat_texture_AutoSampler BIND_GROUP(BG_MATERIAL);
+
+Texture2D coat_normal_texture BIND_GROUP(BG_MATERIAL);
+SamplerState coat_normal_texture_AutoSampler BIND_GROUP(BG_MATERIAL);
+
+Texture2D fuzz_texture BIND_GROUP(BG_MATERIAL);
+SamplerState fuzz_texture_AutoSampler BIND_GROUP(BG_MATERIAL);
+
+Texture2D displacement_texture BIND_GROUP(BG_MATERIAL);
+SamplerState displacement_texture_AutoSampler BIND_GROUP(BG_MATERIAL);
+
+Texture2D subsurface_color_texture BIND_GROUP(BG_MATERIAL);
+SamplerState subsurface_color_texture_AutoSampler BIND_GROUP(BG_MATERIAL);
+
+Texture2D thickness_texture BIND_GROUP(BG_MATERIAL);
+SamplerState thickness_texture_AutoSampler BIND_GROUP(BG_MATERIAL);
+
+Texture2D DitherNoiseTexture BIND_GROUP(BG_MATERIAL);
+
+#include <Shaders/Vegetation/Grass/Common/ParallaxMapping.h>
+
+// UVs come from the strand's atlas rect; parallax from displacement_texture offsets them per pixel.
+float2 GetScaledUV()
+{
+  return G.ParallaxTexCoord;
+}
+
+float3 WorldToTangentSpace(float3 worldVector)
+{
+  return float3(
+    dot(worldVector, G.Input.Tangent),
+    dot(worldVector, G.Input.BiTangent),
+    dot(worldVector, G.Input.Normal));
+}
+
+void FillCustomGlobals()
+{
+  G.ParallaxTexCoord = G.Input.TexCoord0.xy;
+#if !MATERIAL_PREVIEW
+  // Round and feather ground-cover splats in every pass, including opaque materials. The pattern is anchored to
+  // the surface rather than animated screen noise, so distant patches do not shimmer when the camera stops.
+  if (G.Input.TexCoord1.x > 0.0)
+  {
+    float height = G.Input.Color0.a;
+    float2 patch = float2((G.Input.TexCoord1.y * 2.0 - 1.0) * (1.0 - height), (height - 0.35) * 2.0);
+    float mask = 1.0 - smoothstep(0.4, 0.85, length(patch));
+    float noise = frac(sin(dot(floor(G.Input.WorldPosition * 128.0), float3(12.9898, 78.233, 37.719))) * 43758.5453);
+    clip(lerp(1.0, mask, G.Input.TexCoord1.x) - max(noise, 0.001));
+  }
+#endif
+
+  // displacement_scale is in the OpenPBR 0..10 range; /100 gives the UV offset, as on Vegetation.plShader.
+  [branch]
+  if (GetMaterialData(UseDisplacementTexture) && GetMaterialData(displacement_scale) > 0.0)
+  {
+    float3 viewDirWS = normalize(GetCameraPosition() - G.Input.WorldPosition);
+    float3 viewDirTS = WorldToTangentSpace(viewDirWS);
+
+    G.ParallaxTexCoord = ParallaxOcclusionMapping(
+      displacement_texture, displacement_texture_AutoSampler,
+      G.Input.TexCoord0.xy, viewDirTS,
+      GetMaterialData(displacement_scale) / 100.0, 16);
+  }
+}
+
+// --- OpenPBR surface -------------------------------------------------------------------------------
+
+// Card face normal (already turned toward the viewer by MaterialHelper on two-sided materials), optionally
+// perturbed by the normal texture, blended toward the strand direction by foliage_normal_blend. The strand
+// direction is minus the BiTangent (see the vertex shader) and does not flip with the face, so back-facing
+// cards lean toward the same "up" as front-facing ones. Preview meshes have no strand direction and keep the
+// mesh normal.
+float3 GetNormal()
+{
+  float3 normal = G.Input.Normal;
+
+  [branch]
+  if (GetMaterialData(UseNormalTexture))
+  {
+    float3 normalTS = DecodeNormalTexture(geometry_normal_texture.Sample(geometry_normal_texture_AutoSampler, GetScaledUV()));
+
+    const float intensity = GetMaterialData(geometry_normal_intensity);
+    normalTS = normalize(float3(normalTS.xy * intensity, max(normalTS.z, 0.0001f)));
+
+    normal = TangentToWorldSpace(normalTS);
+  }
+
+#if !MATERIAL_PREVIEW
+  const float3 strandDirection = -G.Input.BiTangent;
+  normal = lerp(normal, strandDirection, saturate(GetMaterialData(foliage_normal_blend)) * (1.0 - G.Input.TexCoord1.x));
+#endif
+
+  return normalize(normal);
+}
+
+float3 GetBaseColor()
+{
+  float3 baseColor = GetMaterialData(base_color).rgb * GetMaterialData(base_weight) * GetInstanceData().Color.rgb;
+#if !MATERIAL_PREVIEW
+  baseColor *= G.Input.Color0.rgb;
+#endif
+
+  [branch]
+  if (GetMaterialData(UseBaseColorTexture))
+  {
+    baseColor *= base_color_texture.Sample(base_color_texture_AutoSampler, GetScaledUV()).rgb;
+  }
+
+  return baseColor;
+}
+
+float GetMetallic()
+{
+  [branch]
+  if (GetMaterialData(UseRmaTexture))
+  {
+    return GetMaterialData(base_metalness) * orm_texture.Sample(orm_texture_AutoSampler, GetScaledUV()).g;
+  }
+  else if (GetMaterialData(UseOrmTexture))
+  {
+    return GetMaterialData(base_metalness) * orm_texture.Sample(orm_texture_AutoSampler, GetScaledUV()).b;
+  }
+  else if (GetMaterialData(UseMetalnessTexture))
+  {
+    return GetMaterialData(base_metalness) * base_metalness_texture.Sample(base_metalness_texture_AutoSampler, GetScaledUV()).r;
+  }
+  else
+  {
+    return GetMaterialData(base_metalness);
+  }
+}
+
+// MaterialHelper turns this into F0 via `0.16 * reflectance^2`; ((ior - 1) / (ior + 1)) / 0.4 reproduces the
+// Fresnel F0 of specular_ior exactly (1.5 gives 0.5).
+float GetReflectance()
+{
+  const float ior = max(GetMaterialData(specular_ior), 1.0f);
+  float reflectance = ((ior - 1.0f) / (ior + 1.0f)) / 0.4f;
+
+  reflectance *= GetMaterialData(specular_weight);
+
+  float3 tint = GetMaterialData(specular_color).rgb;
+
+  [branch]
+  if (GetMaterialData(UseSpecularColorTexture))
+  {
+    tint *= specular_color_texture.Sample(specular_color_texture_AutoSampler, GetScaledUV()).rgb;
+  }
+
+  return reflectance * GetLuminance(tint);
+}
+
+float3 GetSpecularTint()
+{
+  float3 tint = GetMaterialData(specular_color).rgb;
+
+  [branch]
+  if (GetMaterialData(UseSpecularColorTexture))
+  {
+    tint *= specular_color_texture.Sample(specular_color_texture_AutoSampler, GetScaledUV()).rgb;
+  }
+
+  const float luminance = GetLuminance(tint);
+  return luminance > 1e-4f ? tint / luminance : float3(1.0f, 1.0f, 1.0f);
+}
+
+float GetDiffuseRoughness()
+{
+  return GetMaterialData(base_diffuse_roughness);
+}
+
+float GetRoughness()
+{
+  float roughness = GetMaterialData(specular_roughness);
+  [branch]
+  if (GetMaterialData(UseRmaTexture))
+  {
+    roughness *= orm_texture.Sample(orm_texture_AutoSampler, GetScaledUV()).r;
+  }
+  else if (GetMaterialData(UseOrmTexture))
+  {
+    roughness *= orm_texture.Sample(orm_texture_AutoSampler, GetScaledUV()).g;
+  }
+  else if (GetMaterialData(UseSpecularRoughnessTexture))
+  {
+    roughness *= specular_roughness_texture.Sample(specular_roughness_texture_AutoSampler, GetScaledUV()).r;
+  }
+  float3 n = GetNormal();
+  float3 dx = ddx(n);
+  float3 dy = ddy(n);
+  float variance = min(0.25, (dot(dx, dx) + dot(dy, dy)) * GetMaterialData(foliage_specular_antialias));
+  return sqrt(saturate(roughness * roughness + variance));
+}
+
+float GetOpacity()
+{
+  // The instance alpha stays in: the editor's placement ghost fades a whole source through it.
+  float opacity = GetMaterialData(base_color).a * GetMaterialData(geometry_opacity) * GetInstanceData().Color.a;
+
+  [branch]
+  if (GetMaterialData(UseBaseColorTexture))
+  {
+    float textureOpacity = base_color_texture.Sample(base_color_texture_AutoSampler, GetScaledUV()).a;
+#if !MATERIAL_PREVIEW
+    textureOpacity = lerp(textureOpacity, 1.0, G.Input.TexCoord1.x);
+#endif
+    opacity *= textureOpacity;
+  }
+
+  #if BLEND_MODE == BLEND_MODE_MASKED
+    return opacity - GetMaterialData(geometry_opacity_threshold);
+  #else
+    return opacity;
+  #endif
+}
+
+float3 GetEmissiveColor()
+{
+  float3 emission = GetMaterialData(emission_color).rgb * GetMaterialData(emission_luminance);
+
+  [branch]
+  if (GetMaterialData(UseEmissionTexture))
+  {
+    emission *= emission_color_texture.Sample(emission_color_texture_AutoSampler, GetScaledUV()).rgb;
+  }
+
+  return emission;
+}
+
+float GetOcclusion()
+{
+  float occlusion = 1.0;
+
+  [branch]
+  if (GetMaterialData(UseRmaTexture))
+  {
+    occlusion = orm_texture.Sample(orm_texture_AutoSampler, GetScaledUV()).b;
+  }
+  else if (GetMaterialData(UseOrmTexture))
+  {
+    occlusion = orm_texture.Sample(orm_texture_AutoSampler, GetScaledUV()).r;
+  }
+  else if (GetMaterialData(UseOcclusionTexture))
+  {
+    occlusion = occlusion_texture.Sample(occlusion_texture_AutoSampler, GetScaledUV()).r;
+  }
+
+  if (GetMaterialData(InvertOcclusion))
+  {
+    occlusion = 1.0 - occlusion;
+  }
+
+#if defined(USE_COLOR0)
+  if (GET_PUSH_CONSTANT(plGrassDrawConstants, DrawDisableProceduralAO) != 0)
+    return occlusion;
+  // Blades shade each other most near the ground: Color0.a is the height along the blade (0 root, 1 tip).
+  // Older cached materials have zero for newly introduced constants until re-transformed.
+  float aoHeight = GetMaterialData(foliage_root_occlusion_height);
+  float aoFalloff = GetMaterialData(foliage_root_occlusion_falloff);
+  aoHeight = aoHeight > 0.0 ? saturate(aoHeight) : 0.65;
+  aoFalloff = aoFalloff > 0.0 ? clamp(aoFalloff, 0.25, 4.0) : 1.5;
+  float rootMask = pow(1.0 - smoothstep(0.0, aoHeight, saturate(G.Input.Color0.a)), aoFalloff);
+  float rootOcclusion = saturate(GetMaterialData(foliage_root_occlusion)) * rootMask;
+  float coverOcclusion = saturate(GetMaterialData(foliage_ground_cover_occlusion));
+  occlusion *= 1.0 - lerp(rootOcclusion, coverOcclusion, saturate(G.Input.TexCoord1.x));
+#endif
+
+  return occlusion;
+}
+
+float4 GetDitherNoise(float2 pixelCoord)
+{
+  uint2 noiseTextureSize;
+  DitherNoiseTexture.GetDimensions(noiseTextureSize.x, noiseTextureSize.y);
+
+  return DitherNoiseTexture.SampleLevel(PointSampler, pixelCoord / noiseTextureSize, 0);
+}
+
+// --- Foliage translucency --------------------------------------------------------------------------
+
+// Thickness mask: 0 for a thin tip, 1 for a solid root. thickness_texture follows the OpenPBR sense
+// (white = thick) unless InvertThickness says the map is a translucency mask. Without a map the blade height from
+// the vertex shader (Color0.a) stands in, blocked by foliage_root_thickness at the root.
+float GetFoliageThickness()
+{
+  [branch]
+  if (GetMaterialData(UseThicknessTexture))
+  {
+    float thickness = saturate(thickness_texture.Sample(thickness_texture_AutoSampler, GetScaledUV()).r);
+    return GetMaterialData(InvertThickness) ? 1.0 - thickness : thickness;
+  }
+
+#if defined(USE_COLOR0)
+  return saturate(GetMaterialData(foliage_root_thickness)) * (1.0 - saturate(G.Input.Color0.a));
+#else
+  return 0.0;
+#endif
+}
+
+float GetFoliageThinness()
+{
+  float thinness = 1.0 - saturate(GetFoliageThickness() * max(GetMaterialData(transmission_thickness), 0.0));
+#if !MATERIAL_PREVIEW
+  thinness *= 1.0 - saturate(G.Input.TexCoord1.x);
+#endif
+  return thinness;
+}
+
+// Tint of the transmitted light. Not multiplied by the diffuse albedo: light crossing a thin blade is coloured by
+// the blade's interior, controlled by the OpenPBR Transmission group.
+float3 GetSubsurfaceColor()
+{
+  float3 color = saturate(GetMaterialData(transmission_color).rgb);
+  // Match OpenPBR's depth convention: zero depth is a flat tint; positive depth enables
+  // Beer attenuation with thickness expressed in units of the reference depth.
+  if (GetMaterialData(transmission_depth) > 0.0)
+  {
+    float thickness = max(GetMaterialData(transmission_thickness), 0.0) * GetFoliageThickness();
+    return thickness > 0.0 ? pow(color, thickness) : float3(1.0, 1.0, 1.0);
+  }
+  return color;
+}
+
+void GetSubsurfaceParams(out float scatterPower, out float shadowFalloff)
+{
+  scatterPower = GetMaterialData(foliage_transmission_power);
+  // The lighting loop applies the lobe weight. Also disable the separate SSS blur output at weight zero.
+  shadowFalloff = GetMaterialData(transmission_weight) > 0.0 ? GetMaterialData(foliage_ambient_transmission) : 0.0;
+}
+
+// transmission_weight is the mix between the diffuse lobe and the translucent lobe; CombineMaterialLayers takes
+// the same share out of diffuse, so raising it never adds energy.
+void GetSubsurfaceExtendedParams(out float weight, out float3 radius, out float scatterAnisotropy)
+{
+  weight = saturate(GetMaterialData(transmission_weight)) * GetFoliageThinness();
+  radius = saturate(GetMaterialData(subsurface_radius) * GetMaterialData(subsurface_radius_scale).rgb);
+  scatterAnisotropy = clamp(GetMaterialData(subsurface_scatter_anisotropy), -1.0f, 1.0f);
+}
+
+void GetFoliageParams(out float wrap, out float distortion, out float intensity)
+{
+  wrap = saturate(GetMaterialData(foliage_transmission_wrap));
+  distortion = saturate(GetMaterialData(foliage_transmission_distortion));
+  intensity = max(GetMaterialData(foliage_transmission_intensity), 0.0f);
+}
+
+// --- Layers ----------------------------------------------------------------------------------------
+
+#if defined(MATERIAL_SPECULAR_CLEARCOAT)
+void GetSpecularClearCoatParams(out float clearcoat, out float clearcoatRoughness, out float3 normal)
+{
+  clearcoat = GetMaterialData(coat_weight);
+  clearcoatRoughness = GetMaterialData(coat_roughness);
+
+  [branch]
+  if (GetMaterialData(UseCoatTexture))
+  {
+    const float2 coatData = coat_texture.Sample(coat_texture_AutoSampler, GetScaledUV()).rg;
+    clearcoat *= coatData.r;
+    clearcoatRoughness *= coatData.g;
+  }
+
+  [branch]
+  if (GetMaterialData(UseCoatNormalTexture))
+  {
+    float3 coatNormalTS = DecodeNormalTexture(coat_normal_texture.Sample(coat_normal_texture_AutoSampler, GetScaledUV()));
+    normal = TangentToWorldSpace(coatNormalTS);
+  }
+  else
+  {
+    normal = normalize(G.Input.Normal);
+  }
+
+  clearcoat = saturate(clearcoat);
+  clearcoatRoughness = saturate(clearcoatRoughness);
+}
+
+void GetCoatExtendedParams(out float ior, out float3 color, out float darkening, out float anisotropy, out float anisotropyRotation)
+{
+  anisotropy = saturate(GetMaterialData(coat_roughness_anisotropy));
+  anisotropyRotation = saturate(GetMaterialData(coat_anisotropy_rotation));
+  ior = max(GetMaterialData(coat_ior), 1.0f);
+  color = GetMaterialData(coat_color).rgb;
+  darkening = saturate(GetMaterialData(coat_darkening));
+}
+#endif
+
+#if defined(MATERIAL_SPECULAR_SHEEN)
+void GetSpecularSheenParams(out float sheen, out float tintFactor)
+{
+  sheen = GetMaterialData(fuzz_weight);
+  tintFactor = 0.0f;
+
+  [branch]
+  if (GetMaterialData(UseFuzzTexture))
+  {
+    sheen *= fuzz_texture.Sample(fuzz_texture_AutoSampler, GetScaledUV()).r;
+  }
+
+  sheen = saturate(sheen);
+}
+
+void GetFuzzExtendedParams(out float roughness, out float3 color)
+{
+  const float perceptualRoughness = saturate(GetMaterialData(fuzz_roughness));
+  roughness = max(perceptualRoughness * perceptualRoughness, 1e-4f);
+  color = GetMaterialData(fuzz_color).rgb;
+}
+#endif
+
+#if defined(MATERIAL_THIN_FILM)
+void GetThinFilmParams(out float weight, out float thickness, out float ior)
+{
+  weight = saturate(GetMaterialData(thin_film_weight));
+  thickness = max(GetMaterialData(thin_film_thickness), 0.0f);
+  ior = max(GetMaterialData(thin_film_ior), 1.0f);
+}
+#endif
+
+#if defined(MATERIAL_SPECULAR_ANISOTROPIC)
+void GetSpecularAnisotopicParams(out float anisotropic, out float rotation)
+{
+  anisotropic = saturate(GetMaterialData(specular_roughness_anisotropy));
+  rotation = saturate(GetMaterialData(specular_anisotropy_rotation));
+}
+#endif
+
+#if defined(MATERIAL_TRANSMISSION)
+void GetTransmissionParams(out float weight, out float3 color, out float3 scatter, out float scatterAnisotropy, out float dispersionScale, out float abbeNumber, out float depth, out float thickness, out bool thinWalled, out float blurRadius, out float blurStrength)
+{
+  weight = saturate(GetMaterialData(transmission_weight));
+  color = GetMaterialData(transmission_color).rgb;
+  scatter = saturate(GetMaterialData(transmission_scatter).rgb);
+  scatterAnisotropy = clamp(GetMaterialData(transmission_scatter_anisotropy), -1.0f, 1.0f);
+  dispersionScale = saturate(GetMaterialData(transmission_dispersion_scale));
+  abbeNumber = max(GetMaterialData(transmission_dispersion_abbe_number), 1.0f);
+  depth = max(GetMaterialData(transmission_depth), 0.0f);
+  thickness = max(GetMaterialData(transmission_thickness), 0.0f);
+
+  [branch]
+  if (GetMaterialData(UseThicknessTexture))
+  {
+    thickness *= thickness_texture.Sample(thickness_texture_AutoSampler, GetScaledUV()).r;
+  }
+
+  thinWalled = GetMaterialData(geometry_thin_walled);
+  blurRadius = GetMaterialData(transmission_blur_radius);
+  blurStrength = GetMaterialData(transmission_blur_strength);
+}
+#endif

@@ -1,0 +1,46 @@
+// plasma.vegetation — vegetation rendering, grass, wind, touch bending, painting.
+//
+// The AUTHORED manifest, kept in source next to the plugin. Component hashes and sizes are NOT
+// here: the packaging step computes those and emits them into the published manifest.
+//
+// Field reference and validation rules: Docs/PluginPackageManagerPlan.html §05.
+
+PackageInfo
+{
+	string %Id{"plasma.vegetation"}
+	string %Version{"0.3.2"}
+	string %Publisher{"PlasmaTechnology"}
+	string %License{"MIT"}
+	string %Homepage{"https://plasmagameengine.com"}
+
+	string %MinEngineVersion{"0.11.2"}
+	string %MaxEngineVersion{"0.11.2"}
+	string %AbiTag{"win64-msvc19-0.11.2-abi6-dev"}
+
+	string %DisplayName{"Vegetation"}
+	string %Category{"Rendering"}
+	// The manifest has no third-party notice field; the Wicked Engine MIT notice ships as Assets/LICENSE.WickedEngine.txt
+	// and is named in the description.
+	string %Description{"Vegetation types with LODs, a world-wide instance store, wind driven by the scene's wind module, touch bending for characters, and a paint tool in the scene editor. Feeds from procedural placement, painted layers and hand-placed instances. Grass types grow simulated grass strands on mesh surfaces. Third-party notice: the grass strand simulation is adapted from Wicked Engine (MIT licence, see LICENSE.WickedEngine.txt)."}
+	string %Icon{"Branding/VegetationIcon.png"}
+	string %Banner{"Branding/VegetationBanner.png"}
+
+	string %EditorPlugins{"plEditorPluginVegetation"}
+	string %EditorEnginePlugins{"plEnginePluginVegetation"}
+	string %RuntimePlugins{"plVegetationPlugin"}
+	string %PackageDependencies{}
+
+	Requires { string %Id{"plasma.assets"} string %Range{"^1.0"} }
+
+	// ---- assets ---------------------------------------------------------------
+	// Mounted as a data directory when the package is installed; shaders resolve as Shaders/Vegetation/...
+	Mount { string %Path{"Assets"} string %RootName{"plasma.vegetation"} bool %Writable{false} }
+
+	Component { string %Name{"assets"} string %Platform{"any"} }
+	Component { string %Name{"manifest"} string %Platform{"any"} }
+	Component { string %Name{"runtime-win64"} string %Platform{"win64"} }
+	Component { string %Name{"editor-win64"} string %Platform{"win64"} }
+	Component { string %Name{"icon"} string %Platform{"any"} }
+	Component { string %Name{"banner"} string %Platform{"any"} }
+	Component { string %Name{"tool"} string %Platform{"any"} string %Path{"EditorIcons"} }
+}

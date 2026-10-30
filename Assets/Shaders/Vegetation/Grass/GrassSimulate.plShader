@@ -1,0 +1,151 @@
+[PLATFORMS]
+ALL
+
+[PERMUTATIONS]
+
+[COMPUTESHADER]
+
+#define GRASS_SIMULATE_CONSTANTS
+#include <Shaders/Common/Common.h>
+#include <Shaders/Vegetation/Grass/GrassGpuData.h>
+#include <Shaders/Vegetation/Grass/GrassCommon.h>
+#include <Shaders/Vegetation/VegetationTouch.h>
+#include <Shaders/Wind/WindField.h>
+
+// Verlet strand simulation, adapted from Wicked Engine's hairparticle_simulateCS.hlsl (MIT, see
+// Assets/LICENSE.WickedEngine.txt). One thread per strand of the active pages: each step moves every segment end by
+// its Verlet velocity damped by Drag, a constant pull along the rest axis (Stiffness), gravity and the wind at the
+// strand, then re-applies the segment length without crossing the surface plane. The touch map bends the pull
+// toward the push direction and presses strands down by TouchCrush; TouchRecovery strengthens the pull while a
+// crushed strand is no longer touched. Positions are stored as offsets from the strand's world root.
+
+RWByteAddressBuffer GrassStateOut BIND_GROUP(BG_DRAW_CALL);
+StructuredBuffer<plGrassStrandStatic> GrassStatic BIND_GROUP(BG_DRAW_CALL);
+StructuredBuffer<plGrassSourceGpu> GrassSources BIND_GROUP(BG_DRAW_CALL);
+StructuredBuffer<plGrassPageGpu> GrassPages BIND_GROUP(BG_DRAW_CALL);
+StructuredBuffer<uint> GrassActivePages BIND_GROUP(BG_DRAW_CALL);
+
+#define SIM(x) GET_PUSH_CONSTANT(plGrassSimulateConstants, x)
+
+[numthreads(GRASS_THREAD_GROUP_SIZE, 1, 1)]
+void main(uint3 groupId : SV_GroupID, uint3 groupThreadId : SV_GroupThreadID)
+{
+  if (groupId.y >= SIM(SimActivePageCount))
+    return;
+
+  const uint pageIndex = GrassActivePages[groupId.y];
+  if (pageIndex >= SIM(SimPageCount))
+    return;
+
+  const plGrassPageGpu page = GrassPages[pageIndex];
+  const uint strandInPage = groupId.x * GRASS_THREAD_GROUP_SIZE + groupThreadId.x;
+  if (strandInPage >= page.StrandCount || strandInPage >= GRASS_PAGE_SIZE || page.SourceIndex >= SIM(SimSourceCount))
+    return;
+
+  const uint globalStrand = pageIndex * GRASS_PAGE_SIZE + strandInPage;
+  if (globalStrand >= SIM(SimPoolStrands))
+    return;
+
+  const plGrassStrandStatic s = GrassStatic[globalStrand];
+  if (!GrassStrandIsAlive(s))
+    return;
+
+  const plGrassSourceGpu source = GrassSources[page.SourceIndex];
+  const uint segments = clamp(source.Counts.x, 1u, (uint)GRASS_MAX_SEGMENTS);
+
+  const uint lastAddress = GrassStateAddress(page, strandInPage, segments, segments - 1, SIM(SimStateSegments));
+  if (lastAddress == 0xFFFFFFFFu)
+    return;
+
+  const float3 axisLocal = GrassOctDecode(s.Axis);
+  const float3 axis = GrassTransformAxis(source.ObjectToWorld, axisLocal);
+  const float3 root = GrassTransformPosition(source.ObjectToWorld, s.Root);
+  const float worldLength = GrassWorldLength(source.ObjectToWorld, axisLocal, GrassEffectiveLength(s, source));
+  const float segmentLength = worldLength / float(segments);
+  const float3 tangent = GrassBillboardTangent(axis, GrassStrandAngle(s), 0.0);
+
+  const float stiffness = max(0.0, source.Sim.x);
+  const float drag = saturate(source.Sim.y);
+  const float gravity = max(0.0, source.Sim.z);
+  const float touchCrush = saturate(source.Touch.x);
+  const float touchRecovery = max(0.0, source.Touch.y);
+
+  // Wind at the strand's middle plus a per-strand flutter across the wind.
+  float3 wind = SampleWindField(root + axis * (worldLength * 0.5));
+  const float windSpeed = length(wind);
+  if (windSpeed > 0.0001)
+  {
+    float3 across = cross(axis, wind / windSpeed);
+    float phase = GrassHashToFloat(s.Seed) * 6.2831853;
+    wind += across * (sin(WindTime * 7.0 + phase) * windSpeed * 0.15);
+  }
+  wind *= source.Sim.w;
+
+  // Touch: push direction and strength in xy, crush in z.
+  const float4 touch = SampleVegetationTouch(root);
+  const float pushAmount = saturate(length(touch.xy));
+  const float crushAmount = saturate(touch.z) * touchCrush;
+  const float touchAmount = saturate(pushAmount + crushAmount);
+  float3 pushDirection = float3(touch.xy, 0.0);
+  pushDirection -= axis * dot(pushDirection, axis);
+  const float pushLength = length(pushDirection);
+  pushDirection = pushLength > 0.0001 ? pushDirection / pushLength : tangent;
+  const float bend = saturate(pushAmount * 1.2 + crushAmount);
+  const float3 pullAxis = normalize(lerp(axis, pushDirection, bend * 0.9));
+  const float3 touchForce = pushDirection * (pushAmount * 3.0) - axis * (crushAmount * 3.0);
+
+  float3 current[GRASS_MAX_SEGMENTS];
+  float3 previous[GRASS_MAX_SEGMENTS];
+  const bool bWake = (page.Flags & GRASS_PAGE_FLAG_WAKE) != 0;
+
+  // The pose entering this frame's steps is what the previous frame rendered; it is stored once as the frame-start
+  // pose, so motion vectors span the whole frame however many steps run.
+  [loop]
+  for (uint j = 0; j < segments; ++j)
+  {
+    const uint address = GrassStateAddress(page, strandInPage, segments, j, SIM(SimStateSegments));
+    float3 c, p;
+    if (bWake)
+    {
+      c = GrassAnalyticOffset(axis, worldLength, float(j + 1) / float(segments), s, source,
+        SampleWindField(root + axis * (worldLength * 0.5)), WindTime, touch);
+      p = c;
+    }
+    else
+      GrassUnpackState(GrassStateOut.Load3(address), c, p);
+    current[j] = root + c;
+    previous[j] = bWake ? current[j] : root + p;
+    GrassStateOut.Store2(address + GRASS_STATE_FRAME_OFFSET, GrassPackFramePose(c));
+  }
+
+  const float dt = SIM(SimStepTime);
+  const uint steps = min(SIM(SimSteps), 4u);
+
+  [loop]
+  for (uint step = 0; step < steps; ++step)
+  {
+    const float3 tipDirection = normalize(current[segments - 1] - root + axis * 0.00001);
+    const float crushDepth = 1.0 - saturate(dot(tipDirection, axis));
+    const float pull = stiffness * (1.0 + touchRecovery * crushDepth * (1.0 - touchAmount));
+
+    float3 base = root;
+    [loop]
+    for (uint k = 0; k < segments; ++k)
+    {
+      const float heightFactor = float(k + 1) / float(segments);
+      const float3 force = pullAxis * pull + float3(0, 0, -gravity) + (wind + touchForce) * heightFactor;
+      float3 next = current[k] + (current[k] - previous[k]) * (1.0 - drag) + force * dt;
+      next = GrassConstrain(next, base, axis, segmentLength);
+      previous[k] = current[k];
+      current[k] = next;
+      base = next;
+    }
+  }
+
+  [loop]
+  for (uint m = 0; m < segments; ++m)
+  {
+    const uint address = GrassStateAddress(page, strandInPage, segments, m, SIM(SimStateSegments));
+    GrassStateOut.Store3(address, GrassPackState(current[m] - root, previous[m] - root));
+  }
+}

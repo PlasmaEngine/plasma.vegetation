@@ -1,0 +1,109 @@
+# Asset Types
+
+Vegetation Type;Vegetation Type
+
+# Actions
+
+VegetationTypeCategory;Vegetation
+VegetationType.Wind.Menu;Preview Wind;Wind strength used by the preview.
+VegetationType.Wind.Off;Off
+VegetationType.Wind.Light;Light
+VegetationType.Wind.Moderate;Moderate
+VegetationType.Wind.Strong;Strong
+VegetationType.Touch;Touch;Push the preview plant once, like a character walking through it.
+Gizmo.Mode.Vegetation;Vegetation;Paint, erase and place vegetation in the scene.
+Vegetation.Panel;Vegetation
+
+# Components
+
+plVegetationInstanceComponent;Vegetation Instance
+plVegetationInstanceComponent::Type;Type;The vegetation type asset to place.
+plVegetationInstanceComponent::ColorSeed;Color Seed;Selects the colour from the type's gradient and drives the hue variation.
+plVegetationInstanceComponent::CastShadows;Cast Shadows
+plVegetationInstanceComponent::TouchBending;Touch Bending;Whether characters bend this plant.
+plVegetationLayerComponent;Vegetation Layer
+plVegetationTouchComponent;Vegetation Touch
+plVegetationTouchComponent::Radius;Radius;Radius of the bending sphere in metres.
+plVegetationTouchComponent::Strength;Strength;How far plants inside the sphere bend away.
+plVegetationTouchComponent::VelocityInfluence;Velocity Influence;How much the mover's speed adds to the push direction.
+plVegetationTouchComponent::Crush;Crush;How far plants are pressed down while touched.
+
+# Vegetation Type properties
+
+plVegetationTypeAssetProperties::Lods;LODs;Meshes from highest to lowest detail with the screen-height fraction at which each turns on.
+plVegetationTypeAssetProperties::Materials;Material Overrides;Per material slot; leave empty to keep the mesh material.
+plVegetationTypeAssetProperties::Wind;Wind
+plVegetationTypeAssetProperties::Touch;Touch
+plVegetationTypeAssetProperties::Placement;Placement
+plVegetationTypeAssetProperties::Render;Rendering
+plVegetationTypeAssetLod::Mesh;Mesh
+plVegetationTypeAssetLod::ScreenSize;Screen Size;Screen-height fraction at which this level turns on.
+plVegetationTypeAssetWind::BendStiffness;Bend Stiffness;0 = grass, 1 = rigid trunk.
+plVegetationTypeAssetWind::BendHeight;Bend Height;Metres over which trunk bending ramps to full.
+plVegetationTypeAssetWind::BranchAmplitude;Branch Amplitude (B);Multiplier for the blue vertex channel: up and down movement.
+plVegetationTypeAssetWind::BranchFrequency;Branch Frequency
+plVegetationTypeAssetWind::EdgeAmplitude;Edge Amplitude (R);Multiplier for the red vertex channel: flutter at the outsides.
+plVegetationTypeAssetWind::EdgeFrequency;Edge Frequency
+plVegetationTypeAssetWind::PhaseScale;Phase Scale (G);Seconds of delay for a green vertex channel value of 1.
+plVegetationTypeAssetTouch::TouchStrength;Touch Strength;0 = rigid to characters, 1 = full bend.
+plVegetationTypeAssetTouch::Recovery;Recovery;How fast the plant springs back, per second.
+plVegetationTypeAssetTouch::Crush;Crush;How far touched vertices are pressed down.
+plVegetationTypeAssetTouch::CollisionPrefab;Collision Prefab;Instantiated for instances near characters so they block movement.
+plVegetationTypeAssetTouch::CollisionRadius;Collision Radius;Distance from a character within which collision prefabs exist.
+plVegetationTypeAssetTouch::TouchTag;Touch Tag;Reported to touch sources for audio and effects.
+plVegetationTypeAssetPlacement::MinScale;Min Scale
+plVegetationTypeAssetPlacement::MaxScale;Max Scale
+plVegetationTypeAssetPlacement::AlignToNormal;Align To Normal;0 = upright, 1 = follows the surface normal.
+plVegetationTypeAssetPlacement::MaxSlope;Max Slope;Steeper surfaces are skipped by placement.
+plVegetationTypeAssetPlacement::Sink;Sink;How far instances are pushed into the ground.
+plVegetationTypeAssetPlacement::MinSpacing;Min Spacing
+plVegetationTypeAssetPlacement::ColorGradient;Color Gradient;Sampled by the instance colour seed.
+plVegetationTypeAssetPlacement::HueVariation;Hue Variation
+plVegetationTypeAssetRender::CullDistance;Cull Distance
+plVegetationTypeAssetRender::ShadowCullDistance;Shadow Distance
+plVegetationTypeAssetRender::ThinningStart;Thinning Start;Fraction of the cull distance where instances start to thin out.
+plVegetationTypeAssetRender::LodCrossfade;LOD Crossfade
+plVegetationTypeAssetRender::CastShadows;Cast Shadows
+plVegetationTypeAssetRender::AffectsGI;Affects GI
+plVegetationTypeAssetRender::UseImpostor;Use Impostor
+
+# Grass
+
+Grass Type;Grass Type
+GrassTypeCategory;Grass
+GrassType.Wind.Menu;Preview Wind;Wind strength used by the preview.
+GrassType.Wind.Off;Off
+GrassType.Wind.Light;Light
+GrassType.Wind.Moderate;Moderate
+GrassType.Wind.Strong;Strong
+plGrassSurfaceComponent;Grass Surface
+plGrassSurfaceComponent::Mesh;Mesh;Strands grow from every triangle of this mesh.
+plGrassSurfaceComponent::GrassType;Grass Type;Look, simulation and distance settings of the strands.
+plGrassSurfaceComponent::VertexLengths;Vertex Lengths;Per-vertex length mask, 0..1; triangles whose vertices are all 0 grow no strands.
+plGrassAtlasRect::TexMulAdd;Texture Rect;Scale (xy) and offset (zw) into the material's texture.
+plGrassAtlasRect::Size;Size;Strand length multiplier for this rect.
+plGrassTypeAssetProperties::StrandsPerSquareMeter;Strands per m2;Strand count is the surface area times this value, up to 100000 per component.
+plGrassTypeAssetProperties::SegmentCount;Segments;Simulated segments per strand at full detail.
+plGrassTypeAssetProperties::BillboardCount;Billboards;Crossed cards per strand at full detail.
+plGrassTypeAssetProperties::RandomSeed;Random Seed
+plGrassTypeAssetProperties::Length;Length
+plGrassTypeAssetProperties::Width;Width;Card width relative to the strand length and texture aspect.
+plGrassTypeAssetProperties::Randomness;Randomness;How much strand lengths vary.
+plGrassTypeAssetProperties::Uniformity;Uniformity;Spatial frequency of the atlas rect selection.
+plGrassTypeAssetProperties::AtlasRects;Atlas Rects
+plGrassTypeAssetProperties::Material;Material;Leave empty for the default grass material.
+plGrassTypeAssetProperties::Stiffness;Stiffness
+plGrassTypeAssetProperties::Drag;Drag
+plGrassTypeAssetProperties::GravityPower;Gravity
+plGrassTypeAssetProperties::WindInfluence;Wind Influence
+plGrassTypeAssetProperties::CameraBend;Camera Bend;Bends strands away from the camera when viewed from above.
+plGrassTypeAssetProperties::Collision;Collision;Characters and dynamic bodies push strands aside.
+plGrassTypeAssetProperties::CollisionLayer;Collision Layer
+plGrassTypeAssetProperties::CollisionRadius;Collision Radius
+plGrassTypeAssetProperties::TouchCrush;Touch Crush;How far touched strands are pressed down.
+plGrassTypeAssetProperties::TouchRecovery;Touch Recovery;How fast touched strands recover, per second.
+plGrassTypeAssetProperties::ViewDistance;View Distance
+plGrassTypeAssetProperties::SimulationDistance;Simulation Distance
+plGrassTypeAssetProperties::LodStartDistance;LOD Start Distance
+plGrassTypeAssetProperties::ShadowDistance;Shadow Distance
+plGrassTypeAssetProperties::PatchSize;Patch Size
