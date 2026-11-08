@@ -7,8 +7,8 @@ PluginInfo
 	string %Category{"Rendering"}
 	string %Icon{"VegetationIcon.png"}
 	string %Banner{"VegetationBanner.png"}
-	string %MinEngineVersion{"0.11.2"}
-	string %MaxEngineVersion{"0.11.2"}
+	string %MinEngineVersion{"0.12.0"}
+	string %MaxEngineVersion{"0.12.0"}
 	string %Description{"Vegetation types, grass types, wind, touch bending and a paint tool."}
 	string %EditorPlugins{"plEditorPluginVegetation"}
 	string %EditorEnginePlugins{"plEnginePluginVegetation"}
