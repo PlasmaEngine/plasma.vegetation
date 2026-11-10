@@ -13,8 +13,9 @@
 /// counts, and a pass that moves the results into the states the grass draws read them in (arguments as
 /// IndirectArgument, lists and pool as vertex shader resources).
 ///
-/// Must be declared before the passes that draw grass. plGrassPipelineExtension adds it to every pipeline asset that
-/// draws opaque or depth-only geometry; plGrassRenderer draws nothing for views whose pipeline has no active cull pass.
+/// Must be declared before the passes that draw grass. The plugin registers it as the pipeline injection
+/// "plasma.vegetation/GrassCull" (VegetationPluginPCH.cpp), which the engine places in every pipeline that draws
+/// opaque or depth-only geometry; plGrassRenderer draws nothing for views whose pipeline has no active cull pass.
 class PL_VEGETATIONPLUGIN_DLL plGrassCullPass : public plRenderPipelinePass
 {
   PL_ADD_DYNAMIC_REFLECTION(plGrassCullPass, plRenderPipelinePass);
