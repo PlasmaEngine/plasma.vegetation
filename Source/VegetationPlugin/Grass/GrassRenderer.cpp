@@ -92,7 +92,7 @@ void plGrassRenderer::RenderBatch(const plRenderViewContext& renderViewContext, 
     if (!s_bWarned)
     {
       s_bWarned = true;
-      plLog::Warning("Render pipeline '{}' has no Grass Cull pass; GPU grass is not drawn in it. Pipelines built in code or without an opaque or depth-only pass do not receive one from plGrassPipelineExtension.", pPass->GetPipeline()->GetViewName());
+      plLog::Warning("Render pipeline '{}' has no Grass Cull pass; GPU grass is not drawn in it. The engine places one in pipelines with an opaque, G-buffer or depth-only pass (injection 'plasma.vegetation/GrassCull'). Pipelines built in code, or without such a pass, or with pipeline injections switched off, do not get one.", pPass->GetPipeline()->GetViewName());
     }
     return;
   }

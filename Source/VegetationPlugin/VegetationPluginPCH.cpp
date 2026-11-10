@@ -2,9 +2,43 @@
 
 #include <Core/ResourceManager/ResourceManager.h>
 #include <Foundation/Configuration/Startup.h>
+#include <RendererCore/Pipeline/RenderPipelineInjection.h>
+#include <VegetationPlugin/Grass/GrassContactAOPass.h>
+#include <VegetationPlugin/Grass/GrassCullPass.h>
 #include <VegetationPlugin/Grass/GrassGpuManager.h>
 #include <VegetationPlugin/Grass/GrassTypeResource.h>
 #include <VegetationPlugin/Resources/VegetationTypeResource.h>
+
+namespace
+{
+  const char* const s_szInjectionOwner = "plasma.vegetation";
+
+  /// Grass needs two passes in the pipelines that draw it. The engine places them and keeps the pipeline working if
+  /// one cannot be placed or fails. Pipeline assets never contain them, so they load without this plugin.
+  void RegisterPipelineInjections()
+  {
+    // Culls the grass of a view before any pass draws it: the opaque and G-buffer passes, and the depth-only pass of
+    // the shadow pipelines, so grass casts shadows. FrameStart is found in exactly those pipelines and orders the pass
+    // ahead of every other pass.
+    plRenderPipelineInjectionDesc cull;
+    cull.m_sName.Assign("plasma.vegetation/GrassCull");
+    cull.m_sOwner.Assign(s_szInjectionOwner);
+    cull.m_sPoint.Assign(plRenderPipelineInjectionPoints::FrameStart);
+    cull.m_pPassType = plGetStaticRTTI<plGrassCullPass>();
+    plRenderPipelineInjections::Register(cull).IgnoreResult();
+
+    // Darkens the scene's ambient occlusion where grass stands, behind the AO pass and in front of all its readers.
+    // Shadow and picking pipelines have no AO pass and get none.
+    plRenderPipelineInjectionDesc contactAO;
+    contactAO.m_sName.Assign("plasma.vegetation/GrassContactAO");
+    contactAO.m_sOwner.Assign(s_szInjectionOwner);
+    contactAO.m_sPoint.Assign(plRenderPipelineInjectionPoints::AfterAmbientOcclusion);
+    contactAO.m_pPassType = plGetStaticRTTI<plGrassContactAOPass>();
+    contactAO.Bind("AO", "AO", "AO");
+    contactAO.Read("Depth", "Depth");
+    plRenderPipelineInjections::Register(contactAO).IgnoreResult();
+  }
+} // namespace
 
 // clang-format off
 PL_BEGIN_SUBSYSTEM_DECLARATION(Vegetation, VegetationPlugin)
@@ -34,10 +68,14 @@ PL_BEGIN_SUBSYSTEM_DECLARATION(Vegetation, VegetationPlugin)
       plGrassTypeResourceHandle hResource = plResourceManager::CreateResource<plGrassTypeResource>("Missing Grass Type", std::move(desc), "Empty Grass Type");
       plResourceManager::SetResourceTypeMissingFallback<plGrassTypeResource>(hResource);
     }
+
+    RegisterPipelineInjections();
   }
 
   ON_CORESYSTEMS_SHUTDOWN
   {
+    plRenderPipelineInjections::UnregisterOwner(s_szInjectionOwner);
+
     plResourceManager::SetResourceTypeMissingFallback<plVegetationTypeResource>(plVegetationTypeResourceHandle());
     plVegetationTypeResource::CleanupDynamicPluginReferences();
     plResourceManager::SetResourceTypeMissingFallback<plGrassTypeResource>(plGrassTypeResourceHandle());
@@ -69,7 +107,6 @@ PL_STATICLINK_LIBRARY(VegetationPlugin)
   PL_STATICLINK_REFERENCE(VegetationPlugin_Components_VegetationTouchComponent);
   PL_STATICLINK_REFERENCE(VegetationPlugin_Grass_GrassCullPass);
   PL_STATICLINK_REFERENCE(VegetationPlugin_Grass_GrassGpuManager);
-  PL_STATICLINK_REFERENCE(VegetationPlugin_Grass_GrassPipelineExtension);
   PL_STATICLINK_REFERENCE(VegetationPlugin_Grass_GrassRenderComponent);
   PL_STATICLINK_REFERENCE(VegetationPlugin_Grass_GrassRenderer);
   PL_STATICLINK_REFERENCE(VegetationPlugin_Grass_GrassSurfaceComponent);
