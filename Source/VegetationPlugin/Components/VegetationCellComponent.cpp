@@ -206,7 +206,11 @@ void plVegetationCellComponent::OnMsgExtractRenderData(plMsgExtractRenderData& m
   else
   {
     vCameraPosition = pCamera->GetCenterPosition();
-    fTanHalfFov = plMath::Tan(pCamera->GetFovY(1.0f) * 0.5f);
+    // Match the projection used by Vegetation.plShader. A square aspect selects a different LOD on
+    // horizontal-FOV cameras, whose leaves are then discarded by the shader's crossfade.
+    const auto& viewport = msg.m_pView->GetViewport();
+    const float fAspectRatio = viewport.width / plMath::Max(viewport.height, 1.0f);
+    fTanHalfFov = plMath::Tan(pCamera->GetFovY(fAspectRatio) * 0.5f);
 
     if (bMain)
     {
@@ -247,17 +251,17 @@ void plVegetationCellComponent::BuildBatches(const plVegetationCellGroup& group,
   if (bShadow)
     fCullDistance = plMath::Min(fCullDistance, render.m_fShadowCullDistance * fDistanceScale);
 
-  // The instance data allocations persist, so the cull and LOD pass only reruns when something that feeds it moved:
-  // the camera by a few percent of the cull distance, the cvars, or the cell's content (a version change clears
-  // the states before we get here). A static camera costs nothing per frame.
-  const float fRefillDistance = plMath::Max(0.5f, fCullDistance * 0.04f);
+  // The shader evaluates crossfade against this frame's camera. Cached membership must follow that camera
+  // too: a percentage of cull distance can leave a nearby tree in a fully discarded LOD for tens of metres.
+  // Keep allocations and reuse membership only while the camera/projection and other inputs are unchanged.
   const bool bRefill = set.m_uiFrame == 0 || set.m_fFillDistanceScale != fDistanceScale || set.m_fFillDensity != fDensity ||
-                       (vCameraPosition - set.m_vFillCamera).GetLengthSquared() > fRefillDistance * fRefillDistance;
+                       set.m_fFillTanHalfFov != fTanHalfFov || !vCameraPosition.IsEqual(set.m_vFillCamera, 0.0001f);
 
   if (bRefill && set.m_uiFrame != uiCurrentFrame)
   {
     set.m_uiFrame = uiCurrentFrame;
     set.m_vFillCamera = vCameraPosition;
+    set.m_fFillTanHalfFov = fTanHalfFov;
     set.m_fFillDistanceScale = fDistanceScale;
     set.m_fFillDensity = fDensity;
 

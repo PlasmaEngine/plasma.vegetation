@@ -56,6 +56,7 @@ private:
   {
     plUInt64 m_uiFrame = 0;
     plVec3 m_vFillCamera = plVec3(plMath::MaxValue<float>()); ///< camera position the batches were last built for
+    float m_fFillTanHalfFov = 0.0f;
     float m_fFillDistanceScale = -1.0f;
     float m_fFillDensity = -1.0f;
     LodBatch m_Lods[plVegetationMaxLods];
