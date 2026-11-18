@@ -8,6 +8,7 @@
 #include <Foundation/Profiling/Profiling.h>
 #include <Foundation/Types/TagRegistry.h>
 #include <Foundation/Utilities/Stats.h>
+#include <RendererCore/Pipeline/RenderDataManager.h>
 #include <RendererCore/Pipeline/View.h>
 #include <RendererCore/RenderWorld/RenderWorld.h>
 #include <RendererCore/Components/RenderComponent.h>
@@ -28,6 +29,9 @@ plCVarInt cvar_VegetationGrassUploadBudgetKB("Vegetation.Grass.UploadBudgetKB", 
 plCVarBool cvar_VegetationTouchPhysics("Vegetation.Touch.Physics", true, plCVarFlags::Default, "Dynamic physics bodies and characters inside the touch map bend vegetation and grass without a Vegetation Touch component");
 plCVarInt cvar_VegetationTouchPhysicsCollisionLayer("Vegetation.Touch.PhysicsCollisionLayer", -1, plCVarFlags::Default, "Collision layer of the physics touch query: bodies whose layer collides with it bend vegetation. -1 queries with layer 0");
 plCVarInt cvar_VegetationTouchMaxPhysicsSources("Vegetation.Touch.MaxPhysicsSources", 32, plCVarFlags::Default, "Most physics bodies that bend vegetation per frame, nearest to the camera first");
+
+extern plCVarBool cvar_VegetationEnabled;
+extern plCVarFloat cvar_VegetationRayTracingRange;
 
 // clang-format off
 PL_IMPLEMENT_WORLD_MODULE(plVegetationWorldModule);
@@ -73,10 +77,14 @@ void plVegetationWorldModule::Initialize()
   grassDesc.m_Phase = plWorldModule::UpdateFunctionDesc::Phase::PostTransform;
   grassDesc.m_bOnlyUpdateWhenSimulating = false;
   RegisterUpdateFunction(grassDesc);
+
+  plRTSceneChunkSource::Register(GetWorld(), this);
 }
 
 void plVegetationWorldModule::Deinitialize()
 {
+  plRTSceneChunkSource::Unregister(GetWorld(), this);
+
   WorldClear();
   plVegetationTouchMapManager::RemoveWorld(GetWorld()->GetIndex());
 
@@ -1391,6 +1399,39 @@ void plVegetationWorldModule::ReportMainCamera(const plVec3& vPosition, float fT
 {
   m_vMainCameraPosition = vPosition;
   m_fMainCameraTanHalfFov = plMath::Max(fTanHalfFovY, 0.01f);
+}
+
+void plVegetationWorldModule::GetRTChunks(const plView& view, const plBoundingBox& box, plDynamicArray<plSharedPtr<plRefCounted>>& out_chunks) const
+{
+  PL_IGNORE_UNUSED(view);
+
+  const float fRangeCap = cvar_VegetationRayTracingRange.GetValue();
+  if (!cvar_VegetationEnabled || fRangeCap <= 0.0f || m_Cells.IsEmpty())
+    return;
+
+  PL_PROFILE_SCOPE("Vegetation RT Chunks");
+
+  const plRenderDataManager* pRenderDataManager = GetWorld()->GetModuleReadOnly<plRenderDataManager>();
+  if (pRenderDataManager == nullptr)
+    return;
+
+  // The box centre sits on the grid the ray tracing scene snaps to, so the cells handed out stay the same while the
+  // camera moves inside one grid step. A cell is a 32 m column; its instances reach a little beyond it.
+  const plVec3 vCenter = box.GetCenter();
+  const float fReach = fRangeCap + plVegetationCellSize * 1.5f;
+
+  for (auto it = m_Cells.GetIterator(); it.IsValid(); ++it)
+  {
+    const plVegetationCell* pCell = it.Value();
+
+    const plVec2 vCellCenter = pCell->m_vOrigin.GetAsVec2() + plVec2(plVegetationCellSize * 0.5f);
+    if ((vCellCenter - vCenter.GetAsVec2()).GetLengthSquared() > fReach * fReach)
+      continue;
+
+    const plVegetationCellComponent* pComponent = nullptr;
+    if (GetWorld()->TryGetComponent(pCell->m_hComponent, pComponent))
+      pComponent->GetRTChunks(pRenderDataManager, vCenter, fRangeCap, out_chunks);
+  }
 }
 
 PL_STATICLINK_FILE(VegetationPlugin, VegetationPlugin_World_VegetationWorldModule);

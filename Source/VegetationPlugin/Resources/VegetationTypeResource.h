@@ -62,8 +62,37 @@ struct PL_VEGETATIONPLUGIN_DLL plVegetationRenderSettings
   float m_fThinningStart = 0.6f;  ///< Fraction of the cull distance where stochastic thinning begins.
   float m_fLodCrossfade = 0.1f;   ///< Fraction of an LOD's screen-size range used for the dithered crossfade.
   bool m_bCastShadows = true;
-  bool m_bAffectsGI = false;
+  bool m_bAffectsGI = false; ///< Part of the file layout only; plVegetationRayTracingSettings decides.
   bool m_bUseImpostor = false;
+
+  void Save(plStreamWriter& inout_stream) const;
+  void Load(plStreamReader& inout_stream);
+};
+
+/// \brief Whether a type is part of the ray tracing scene (GI, reflections, ray traced shadows).
+struct PL_VEGETATIONPLUGIN_DLL plVegetationRayTracingMode
+{
+  using StorageType = plUInt8;
+
+  enum Enum
+  {
+    Automatic, ///< Types that stand at least 1.2 m tall are included.
+    Included,
+    Excluded,
+
+    Default = Automatic
+  };
+};
+
+PL_DECLARE_REFLECTABLE_TYPE(PL_VEGETATIONPLUGIN_DLL, plVegetationRayTracingMode);
+
+/// \brief How the ray tracing scene sees a type. It holds one fixed mesh per instance, independent of the camera,
+/// at rest pose.
+struct PL_VEGETATIONPLUGIN_DLL plVegetationRayTracingSettings
+{
+  plEnum<plVegetationRayTracingMode> m_Mode;
+  plInt8 m_iLod = 0;     ///< LOD whose mesh is traced, clamped to the type's LODs.
+  float m_fRange = 0.0f; ///< Distance up to which instances are in the scene; 0 uses the cull distance.
 
   void Save(plStreamWriter& inout_stream) const;
   void Load(plStreamReader& inout_stream);
@@ -84,6 +113,7 @@ struct PL_VEGETATIONPLUGIN_DLL plVegetationTypeResourceDescriptor
   plVegetationTouchSettings m_Touch;
   plVegetationPlacementSettings m_Placement;
   plVegetationRenderSettings m_Render;
+  plVegetationRayTracingSettings m_RayTracing;
 
   void Save(plStreamWriter& inout_stream) const;
   plResult Load(plStreamReader& inout_stream);
@@ -113,8 +143,23 @@ public:
   /// \brief Radius of LOD0's bounding sphere at scale 1; 1 until the mesh has loaded.
   float GetBoundingRadius() const;
 
+  /// \brief How far LOD0's bounding box reaches above the pivot at scale 1; 1 until the mesh has loaded.
+  float GetBoundingHeight() const;
+
   /// \brief Picks the LOD for a projected screen-height fraction, highest detail first.
   plUInt32 SelectLod(float fScreenSize) const;
+
+  /// \brief Whether the type's instances are part of the ray tracing scene.
+  ///
+  /// out_bKnown is false while an automatic type's size is not known yet (its first LOD mesh is still loading); the
+  /// result is false then.
+  bool IsInRayTracingScene(bool& out_bKnown) const;
+
+  /// \brief The LOD whose mesh the ray tracing scene traces.
+  plUInt32 GetRayTracingLod() const;
+
+  /// \brief Distance up to which instances are part of the ray tracing scene, before any quality cap.
+  float GetRayTracingRange() const;
 
 private:
   virtual plResourceLoadDesc UnloadData(Unload WhatToUnload) override;
@@ -128,4 +173,5 @@ private:
   plHybridArray<plMaterialResourceHandle, 4> m_MaterialOverrides;
   plColorGradientResourceHandle m_hColorGradient;
   mutable float m_fBoundingRadius = 0.0f;
+  mutable float m_fBoundingHeight = 1.0f;
 };

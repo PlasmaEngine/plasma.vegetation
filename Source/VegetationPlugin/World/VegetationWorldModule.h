@@ -6,6 +6,7 @@
 #include <Foundation/Containers/Map.h>
 #include <Foundation/Types/UniquePtr.h>
 #include <RendererCore/Pipeline/Declarations.h>
+#include <RendererCore/Scene/SceneRegistry.h>
 #include <VegetationPlugin/Grass/GrassGpuManager.h>
 #include <VegetationPlugin/Resources/VegetationTypeResource.h>
 #include <VegetationPlugin/VegetationDeclarations.h>
@@ -53,7 +54,9 @@ struct plVegetationCell
 };
 
 /// \brief Owner of every vegetation instance in a world. See plVegetationWorldModuleInterface.
-class PL_VEGETATIONPLUGIN_DLL plVegetationWorldModule : public plVegetationWorldModuleInterface
+///
+/// For the ray tracing scene it is a chunk source: the cells in range hand out one frozen snapshot per type.
+class PL_VEGETATIONPLUGIN_DLL plVegetationWorldModule : public plVegetationWorldModuleInterface, public plRTSceneChunkSource
 {
   PL_DECLARE_WORLD_MODULE();
   PL_ADD_DYNAMIC_REFLECTION(plVegetationWorldModule, plVegetationWorldModuleInterface);
@@ -72,6 +75,9 @@ public:
   virtual void QueryInstances(const plBoundingSphere& sphere, plDynamicArray<plVegetationInstanceRef>& out_instances) const override;
   virtual void RemoveInstances(plArrayPtr<const plVegetationInstanceRef> instances) override;
   virtual void RegisterTouchSource(const plVec3& vPosition, float fRadius, float fStrength, const plVec3& vVelocity) override;
+
+  // plRTSceneChunkSource
+  virtual void GetRTChunks(const plView& view, const plBoundingBox& box, plDynamicArray<plSharedPtr<plRefCounted>>& out_chunks) const override;
 
   /// \brief Same as the string overload with an already resolved type.
   plVegetationTileHandle AddInstances(const plVegetationTypeResourceHandle& hType, plArrayPtr<const plVegetationInstanceDesc> instances, plVegetationSource::Enum source);

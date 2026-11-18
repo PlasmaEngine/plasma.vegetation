@@ -5,8 +5,7 @@
 #include <Foundation/Math/Angle.h>
 #include <Foundation/Reflection/Reflection.h>
 #include <Foundation/Strings/String.h>
-
-struct plVegetationTypeResourceDescriptor;
+#include <VegetationPlugin/Resources/VegetationTypeResource.h>
 
 /// One level of detail: a mesh and the screen-height fraction at which it turns on.
 struct plVegetationTypeAssetLod
@@ -63,11 +62,20 @@ struct plVegetationTypeAssetRender
   float m_fThinningStart = 0.6f;
   float m_fLodCrossfade = 0.1f;
   bool m_bCastShadows = true;
-  bool m_bAffectsGI = false;
   bool m_bUseImpostor = false;
 };
 
 PL_DECLARE_REFLECTABLE_TYPE(PL_NO_LINKAGE, plVegetationTypeAssetRender);
+
+/// How the ray tracing scene (GI, reflections, ray traced shadows) sees the type.
+struct plVegetationTypeAssetRayTracing
+{
+  plEnum<plVegetationRayTracingMode> m_Mode;
+  plInt8 m_iLod = 0;     ///< clamped to the type's LODs
+  float m_fRange = 0.0f; ///< 0: the cull distance
+};
+
+PL_DECLARE_REFLECTABLE_TYPE(PL_NO_LINKAGE, plVegetationTypeAssetRayTracing);
 
 /// The reflected content of a Vegetation Type document.
 class plVegetationTypeAssetProperties : public plReflectedClass
@@ -87,4 +95,5 @@ public:
   plVegetationTypeAssetTouch m_Touch;
   plVegetationTypeAssetPlacement m_Placement;
   plVegetationTypeAssetRender m_Render;
+  plVegetationTypeAssetRayTracing m_RayTracing;
 };

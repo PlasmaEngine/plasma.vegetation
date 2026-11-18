@@ -64,8 +64,14 @@ plVegetationTypeAssetRender::ShadowCullDistance;Shadow Distance
 plVegetationTypeAssetRender::ThinningStart;Thinning Start;Fraction of the cull distance where instances start to thin out.
 plVegetationTypeAssetRender::LodCrossfade;LOD Crossfade
 plVegetationTypeAssetRender::CastShadows;Cast Shadows
-plVegetationTypeAssetRender::AffectsGI;Affects GI
 plVegetationTypeAssetRender::UseImpostor;Use Impostor
+plVegetationTypeAssetProperties::RayTracing;Ray Tracing
+plVegetationTypeAssetRayTracing::AffectsGI;Affects GI;Whether the type is part of the ray tracing scene (GI, reflections, ray traced shadows). Automatic includes types that stand 1.2 m or taller: bushes and trees, not grass or ground cover.
+plVegetationTypeAssetRayTracing::Lod;Ray Tracing Mesh;LOD whose mesh is traced, 0 being the most detailed. The mesh does not follow the camera or the wind. Billboard LODs made of large cut-out cards trace slowly and look wrong in reflections.
+plVegetationTypeAssetRayTracing::Range;Ray Tracing Range;Distance up to which instances are in the ray tracing scene. 0 uses the cull distance. Vegetation.RayTracing.Range caps it.
+plVegetationRayTracingMode::Automatic;Automatic (by height)
+plVegetationRayTracingMode::Included;On
+plVegetationRayTracingMode::Excluded;Off
 
 # Grass
 
