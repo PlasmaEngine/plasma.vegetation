@@ -72,8 +72,19 @@ PL_BEGIN_STATIC_REFLECTED_TYPE(plVegetationTypeAssetRender, plNoBase, 1, plRTTID
     PL_MEMBER_PROPERTY("ThinningStart", m_fThinningStart)->AddAttributes(new plDefaultValueAttribute(0.6f), new plClampValueAttribute(0.0f, 1.0f)),
     PL_MEMBER_PROPERTY("LodCrossfade", m_fLodCrossfade)->AddAttributes(new plDefaultValueAttribute(0.1f), new plClampValueAttribute(0.0f, 0.5f)),
     PL_MEMBER_PROPERTY("CastShadows", m_bCastShadows)->AddAttributes(new plDefaultValueAttribute(true)),
-    PL_MEMBER_PROPERTY("AffectsGI", m_bAffectsGI),
     PL_MEMBER_PROPERTY("UseImpostor", m_bUseImpostor),
+  }
+  PL_END_PROPERTIES;
+}
+PL_END_STATIC_REFLECTED_TYPE;
+
+PL_BEGIN_STATIC_REFLECTED_TYPE(plVegetationTypeAssetRayTracing, plNoBase, 1, plRTTIDefaultAllocator<plVegetationTypeAssetRayTracing>)
+{
+  PL_BEGIN_PROPERTIES
+  {
+    PL_ENUM_MEMBER_PROPERTY("AffectsGI", plVegetationRayTracingMode, m_Mode),
+    PL_MEMBER_PROPERTY("Lod", m_iLod)->AddAttributes(new plDefaultValueAttribute(0), new plClampValueAttribute(0, static_cast<plInt32>(plVegetationMaxLods) - 1)),
+    PL_MEMBER_PROPERTY("Range", m_fRange)->AddAttributes(new plClampValueAttribute(0.0f, 5000.0f), new plSuffixAttribute(" m")),
   }
   PL_END_PROPERTIES;
 }
@@ -89,6 +100,7 @@ PL_BEGIN_DYNAMIC_REFLECTED_TYPE(plVegetationTypeAssetProperties, 1, plRTTIDefaul
     PL_MEMBER_PROPERTY("Touch", m_Touch),
     PL_MEMBER_PROPERTY("Placement", m_Placement),
     PL_MEMBER_PROPERTY("Render", m_Render),
+    PL_MEMBER_PROPERTY("RayTracing", m_RayTracing),
   }
   PL_END_PROPERTIES;
 }
@@ -142,6 +154,9 @@ void plVegetationTypeAssetProperties::FillDescriptor(plVegetationTypeResourceDes
   out_desc.m_Render.m_fThinningStart = m_Render.m_fThinningStart;
   out_desc.m_Render.m_fLodCrossfade = m_Render.m_fLodCrossfade;
   out_desc.m_Render.m_bCastShadows = m_Render.m_bCastShadows;
-  out_desc.m_Render.m_bAffectsGI = m_Render.m_bAffectsGI;
   out_desc.m_Render.m_bUseImpostor = m_Render.m_bUseImpostor;
+
+  out_desc.m_RayTracing.m_Mode = m_RayTracing.m_Mode;
+  out_desc.m_RayTracing.m_iLod = m_RayTracing.m_iLod;
+  out_desc.m_RayTracing.m_fRange = m_RayTracing.m_fRange;
 }

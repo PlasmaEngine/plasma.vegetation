@@ -1,6 +1,7 @@
 #include <VegetationPlugin/VegetationPluginPCH.h>
 
 #include <Core/ResourceManager/ResourceManager.h>
+#include <Foundation/Configuration/CVar.h>
 #include <Foundation/IO/Stream.h>
 #include <Foundation/Utilities/AssetFileHeader.h>
 #include <VegetationPlugin/Resources/VegetationTypeResource.h>
@@ -8,7 +9,20 @@
 // clang-format off
 PL_BEGIN_DYNAMIC_REFLECTED_TYPE(plVegetationTypeResource, 1, plRTTIDefaultAllocator<plVegetationTypeResource>)
 PL_END_DYNAMIC_REFLECTED_TYPE;
+
+PL_BEGIN_STATIC_REFLECTED_ENUM(plVegetationRayTracingMode, 1)
+  PL_ENUM_CONSTANTS(plVegetationRayTracingMode::Automatic, plVegetationRayTracingMode::Included, plVegetationRayTracingMode::Excluded)
+PL_END_STATIC_REFLECTED_ENUM;
 // clang-format on
+
+namespace
+{
+  /// Types that stand at least this tall are part of the ray tracing scene when their mode is Automatic. Height
+  /// separates ground cover from bushes and trees where the radius does not: a grass patch is wide but low.
+  constexpr float c_fAutomaticRayTracingHeight = 1.2f;
+} // namespace
+
+plCVarInt cvar_VegetationRayTracingLodOverride("Vegetation.RayTracing.LodOverride", -1, plCVarFlags::Default, "Diagnostic: the LOD every vegetation type traces, instead of its own Ray Tracing Mesh setting. -1 = off.");
 
 PL_RESOURCE_IMPLEMENT_COMMON_CODE(plVegetationTypeResource);
 
@@ -102,9 +116,23 @@ void plVegetationRenderSettings::Load(plStreamReader& inout_stream)
   inout_stream >> m_bUseImpostor;
 }
 
+void plVegetationRayTracingSettings::Save(plStreamWriter& inout_stream) const
+{
+  inout_stream << m_Mode;
+  inout_stream << m_iLod;
+  inout_stream << m_fRange;
+}
+
+void plVegetationRayTracingSettings::Load(plStreamReader& inout_stream)
+{
+  inout_stream >> m_Mode;
+  inout_stream >> m_iLod;
+  inout_stream >> m_fRange;
+}
+
 void plVegetationTypeResourceDescriptor::Save(plStreamWriter& inout_stream) const
 {
-  const plUInt8 uiVersion = 1;
+  const plUInt8 uiVersion = 2;
   inout_stream << uiVersion;
 
   inout_stream << m_Lods.GetCount();
@@ -124,6 +152,7 @@ void plVegetationTypeResourceDescriptor::Save(plStreamWriter& inout_stream) cons
   m_Touch.Save(inout_stream);
   m_Placement.Save(inout_stream);
   m_Render.Save(inout_stream);
+  m_RayTracing.Save(inout_stream);
 }
 
 plResult plVegetationTypeResourceDescriptor::Load(plStreamReader& inout_stream)
@@ -131,7 +160,7 @@ plResult plVegetationTypeResourceDescriptor::Load(plStreamReader& inout_stream)
   plUInt8 uiVersion = 0;
   inout_stream >> uiVersion;
 
-  if (uiVersion != 1)
+  if (uiVersion < 1 || uiVersion > 2)
   {
     plLog::Error("Unknown vegetation type version {}", uiVersion);
     return PL_FAILURE;
@@ -160,6 +189,11 @@ plResult plVegetationTypeResourceDescriptor::Load(plStreamReader& inout_stream)
   m_Touch.Load(inout_stream);
   m_Placement.Load(inout_stream);
   m_Render.Load(inout_stream);
+
+  // Version 1 files carry no ray tracing settings: such a type is in the scene by its size.
+  m_RayTracing = plVegetationRayTracingSettings();
+  if (uiVersion >= 2)
+    m_RayTracing.Load(inout_stream);
 
   return PL_SUCCESS;
 }
@@ -292,7 +326,14 @@ float plVegetationTypeResource::GetBoundingRadius() const
 
   const plBoundingBoxSphere& bounds = pMesh->GetBounds();
   m_fBoundingRadius = bounds.IsValid() ? plMath::Max(bounds.m_fSphereRadius + bounds.m_vCenter.GetLength(), 0.01f) : 1.0f;
+  m_fBoundingHeight = bounds.IsValid() ? plMath::Max(bounds.m_vCenter.z + bounds.m_vBoxHalfExtends.z, 0.0f) : 1.0f;
   return m_fBoundingRadius;
+}
+
+float plVegetationTypeResource::GetBoundingHeight() const
+{
+  GetBoundingRadius();
+  return m_fBoundingHeight;
 }
 
 plUInt32 plVegetationTypeResource::SelectLod(float fScreenSize) const
@@ -309,6 +350,45 @@ plUInt32 plVegetationTypeResource::SelectLod(float fScreenSize) const
   }
 
   return uiCount - 1;
+}
+
+bool plVegetationTypeResource::IsInRayTracingScene(bool& out_bKnown) const
+{
+  out_bKnown = true;
+
+  switch (m_Descriptor.m_RayTracing.m_Mode)
+  {
+    case plVegetationRayTracingMode::Included:
+      return true;
+    case plVegetationRayTracingMode::Excluded:
+      return false;
+    default:
+      break;
+  }
+
+  // GetBoundingRadius caches the bounds only once the first LOD mesh has loaded.
+  GetBoundingRadius();
+  out_bKnown = m_fBoundingRadius > 0.0f;
+  return out_bKnown && m_fBoundingHeight >= c_fAutomaticRayTracingHeight;
+}
+
+plUInt32 plVegetationTypeResource::GetRayTracingLod() const
+{
+  const plUInt32 uiCount = m_LodMeshes.GetCount();
+  if (uiCount == 0)
+    return 0;
+
+  if (const plInt32 iOverride = cvar_VegetationRayTracingLodOverride; iOverride >= 0)
+    return plMath::Min(static_cast<plUInt32>(iOverride), uiCount - 1);
+
+  const plInt8 iLod = m_Descriptor.m_RayTracing.m_iLod;
+  return plMath::Min(static_cast<plUInt32>(plMath::Max<plInt8>(iLod, 0)), uiCount - 1);
+}
+
+float plVegetationTypeResource::GetRayTracingRange() const
+{
+  const float fRange = m_Descriptor.m_RayTracing.m_fRange;
+  return fRange > 0.0f ? fRange : m_Descriptor.m_Render.m_fCullDistance;
 }
 
 PL_STATICLINK_FILE(VegetationPlugin, VegetationPlugin_Resources_VegetationTypeResource);
