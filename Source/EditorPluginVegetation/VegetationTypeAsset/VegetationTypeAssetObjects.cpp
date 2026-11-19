@@ -17,7 +17,7 @@ namespace
   constexpr plUInt8 s_uiCompositeStatsVersion = 1;
 
   /// Reads the numbers the summary shows from a version 1 statistics file; any other version fails.
-  plResult ReadCompositeStats(plStreamReader& inout_stream, plVegetationCompositeInfo& out_info)
+  plResult ReadCompositeStats(plStreamReader& inout_stream, plVegetationCompositeSummary& out_info)
   {
     plUInt8 uiVersion = 0;
     inout_stream >> uiVersion;
@@ -65,9 +65,9 @@ namespace
   }
 } // namespace
 
-plVegetationCompositeInfo plVegetationCompositeInfo::Query(plStringView sMeshGuid)
+plVegetationCompositeSummary plVegetationCompositeSummary::Query(plStringView sMeshGuid)
 {
-  plVegetationCompositeInfo info;
+  plVegetationCompositeSummary info;
 
   plUuid guid;
   if (sMeshGuid.IsEmpty() || !plConversionUtils::TryConvertStringToUuid(sMeshGuid, guid))
@@ -90,7 +90,7 @@ plVegetationCompositeInfo plVegetationCompositeInfo::Query(plStringView sMeshGui
   plFileReader file;
   if (file.Open(sStatsFile).Succeeded())
   {
-    plVegetationCompositeInfo stats = info;
+    plVegetationCompositeSummary stats = info;
     if (ReadCompositeStats(file, stats).Succeeded())
     {
       info = stats;
@@ -101,7 +101,7 @@ plVegetationCompositeInfo plVegetationCompositeInfo::Query(plStringView sMeshGui
   return info;
 }
 
-plString plVegetationCompositeInfo::GetSummary() const
+plString plVegetationCompositeSummary::GetSummary() const
 {
   if (!m_bComposite)
     return {};

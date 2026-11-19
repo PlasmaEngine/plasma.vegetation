@@ -62,7 +62,7 @@ void plVegetationTypeAssetDocument::UpdateCompositeInfo()
 
   m_sCompositeMesh = sMesh;
 
-  const plString sSummary = plVegetationCompositeInfo::Query(sMesh).GetSummary();
+  const plString sSummary = plVegetationCompositeSummary::Query(sMesh).GetSummary();
   if (current.IsA<plString>() && current.Get<plString>() == sSummary)
     return;
 

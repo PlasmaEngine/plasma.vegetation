@@ -13,7 +13,7 @@ class plDocumentObject;
 
 /// \brief What the editor knows about a foliage composite mesh asset without the engine process: whether the asset is
 /// one (its document type) and the numbers its last transform wrote beside its outputs.
-struct PL_EDITORPLUGINVEGETATION_DLL plVegetationCompositeInfo
+struct PL_EDITORPLUGINVEGETATION_DLL plVegetationCompositeSummary
 {
   bool m_bComposite = false;
   bool m_bHasStats = false; ///< false until the composite has been transformed by this engine version
@@ -25,7 +25,7 @@ struct PL_EDITORPLUGINVEGETATION_DLL plVegetationCompositeInfo
   float m_fRadius = 0.0f;
 
   /// \brief Looks up the mesh asset (guid string) in the asset curator; reads the build statistics of a composite.
-  static plVegetationCompositeInfo Query(plStringView sMeshGuid);
+  static plVegetationCompositeSummary Query(plStringView sMeshGuid);
 
   /// \brief One line for the property grid.
   plString GetSummary() const;
