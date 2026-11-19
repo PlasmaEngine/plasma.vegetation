@@ -1,21 +1,31 @@
 #include <EditorPluginVegetation/EditorPluginVegetationPCH.h>
 
 #include <EditorFramework/Actions/TransformGizmoActions.h>
+#include <EditorPluginVegetation/Paint/VegetationLayerFill.h>
 #include <EditorPluginVegetation/Paint/VegetationPaintActions.h>
 #include <EditorPluginVegetation/Paint/VegetationPaintEditTool.h>
 #include <GuiFoundation/Action/ActionManager.h>
 #include <GuiFoundation/Action/ActionMapManager.h>
 
 plActionDescriptorHandle plVegetationPaintActions::s_hPaintTool;
+plActionDescriptorHandle plVegetationPaintActions::s_hLayerFill;
 
 void plVegetationPaintActions::RegisterActions()
 {
   // No shortcut: V belongs to the visualizer toggle and B to the modeling brush.
   s_hPaintTool = PL_REGISTER_ACTION_1("Gizmo.Mode.Vegetation", plActionScope::Document, "Gizmo", "", plGizmoAction, plGetStaticRTTI<plVegetationPaintEditTool>());
+
+  // Scriptable: runs from action_execute with the scene document; the panel's Fill Layer is the interactive path.
+  s_hLayerFill = PL_REGISTER_ACTION_0("Vegetation.Layer.Fill", plActionScope::Document, "Vegetation", "", plVegetationLayerFillAction);
+
+  plVegetationLayerFill::Startup();
 }
 
 void plVegetationPaintActions::UnregisterActions()
 {
+  plVegetationLayerFill::Shutdown();
+
+  plActionManager::UnregisterAction(s_hLayerFill);
   plActionManager::UnregisterAction(s_hPaintTool);
 }
 

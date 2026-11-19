@@ -67,6 +67,7 @@ void plVegetationStrokeRequest::Write(plStreamWriter& inout_stream) const
   inout_stream << m_vFillMax;
   inout_stream << m_fTreesPerHectare;
   inout_stream << m_bRemoveClearings;
+  inout_stream << m_bFillReplace;
 }
 
 plResult plVegetationStrokeRequest::Read(plStreamReader& inout_stream)
@@ -110,6 +111,7 @@ plResult plVegetationStrokeRequest::Read(plStreamReader& inout_stream)
   m_vFillMax.SetZero();
   m_fTreesPerHectare = 600.0f;
   m_bRemoveClearings = false;
+  m_bFillReplace = false;
 
   if (uiVersion >= 5)
   {
@@ -118,6 +120,7 @@ plResult plVegetationStrokeRequest::Read(plStreamReader& inout_stream)
     inout_stream >> m_vFillMax;
     inout_stream >> m_fTreesPerHectare;
     inout_stream >> m_bRemoveClearings;
+    inout_stream >> m_bFillReplace;
   }
 
   if (m_uiMode > plVegetationBrushMode::Clearing)
@@ -155,6 +158,45 @@ bool plVegetationStrokeRequest::ApplyClearingStamp(plVegetationLayerData& inout_
   }
 
   inout_data.Compact();
+  return bChanged;
+}
+
+bool plVegetationStrokeRequest::ApplyFillReplace(plVegetationLayerData& inout_data, plGrassCoverageData* pGrass) const
+{
+  if (!m_bFillReplace)
+    return false;
+
+  const plVec2 vMin = m_vFillMin.GetAsVec2().CompMin(m_vFillMax.GetAsVec2());
+  const plVec2 vMax = m_vFillMin.GetAsVec2().CompMax(m_vFillMax.GetAsVec2());
+  bool bChanged = false;
+
+  if (!m_Types.IsEmpty())
+  {
+    for (auto& entry : inout_data.m_Entries)
+    {
+      if (!m_Types.Contains(entry.m_sType))
+        continue;
+
+      for (plUInt32 i = entry.m_Instances.GetCount(); i > 0; --i)
+      {
+        const plVec3& p = entry.m_Instances[i - 1].m_vPosition;
+        if (p.x >= vMin.x && p.y >= vMin.y && p.x <= vMax.x && p.y <= vMax.y)
+        {
+          entry.m_Instances.RemoveAtAndSwap(i - 1);
+          bChanged = true;
+        }
+      }
+    }
+
+    inout_data.Compact();
+  }
+
+  // an empty list would erase every type
+  if (pGrass != nullptr && !m_GrassTypes.IsEmpty())
+  {
+    bChanged |= pGrass->EraseInRect(m_GrassTypes, vMin, vMax) > 0;
+  }
+
   return bChanged;
 }
 

@@ -108,6 +108,7 @@ namespace
     float m_fTexel = 0.5f;
     float m_fReferenceZ = 0.0f;
     float m_fCosMaxSlope = 0.0f;
+    bool m_bRejectMisses = false; ///< Fill: a column without ground gets no grass (the brush falls back to its pick plane)
     plInt32 m_iX0 = 0;
     plInt32 m_iY0 = 0;
     plInt32 m_iCountX = 0;
@@ -140,9 +141,9 @@ namespace
       {
         centre.m_bDone = true;
         centre.m_Sample.m_fHeight = m_fReferenceZ;
-        m_pCaster->Cast(vPosition.x, vPosition.y, m_fReferenceZ, centre.m_Sample.m_fHeight, centre.m_Sample.m_vNormal);
+        const bool bHit = m_pCaster->Cast(vPosition.x, vPosition.y, m_fReferenceZ, centre.m_Sample.m_fHeight, centre.m_Sample.m_vNormal);
 
-        centre.m_bValid = centre.m_Sample.m_vNormal.z >= m_fCosMaxSlope;
+        centre.m_bValid = (bHit || !m_bRejectMisses) && centre.m_Sample.m_vNormal.z >= m_fCosMaxSlope;
         if (centre.m_bValid)
         {
           // four-corner test: corners that disagree mark the texel, which keeps its centre sample
@@ -289,7 +290,8 @@ namespace
     plDynamicArray<plUInt32> m_Species; ///< index into the request's species, plInvalidIndex for an unchecked type
     float m_fMaxSpacing = 0.0f;
 
-    void Gather(const plVegetationLayerData* pData, const plVegetationStrokeRequest& request, plArrayPtr<const SpeciesRules> species)
+    /// bLayerSpace keeps the positions in the layer's local space instead of transforming them to world space.
+    void Gather(const plVegetationLayerData* pData, const plVegetationStrokeRequest& request, plArrayPtr<const SpeciesRules> species, bool bLayerSpace = false)
     {
       if (pData == nullptr)
         return;
@@ -322,7 +324,7 @@ namespace
 
         for (const auto& inst : entry.m_Instances)
         {
-          m_Positions.PushBack(request.m_LayerTransform.TransformPosition(inst.m_vPosition));
+          m_Positions.PushBack(bLayerSpace ? inst.m_vPosition : request.m_LayerTransform.TransformPosition(inst.m_vPosition));
           m_Spacings.PushBack(fSpacing);
           m_Species.PushBack(uiSpecies);
         }
@@ -600,30 +602,99 @@ void plVegetationBrushHandler::EvaluatePaint(plWorld* pWorld, const plVegetation
   }
 }
 
+namespace
+{
+  /// Fill works in the layer's local space: the region, the clearings and the coverage are there. Spacing and
+  /// distances are world metres, so they shrink by the layer's average xy scale; the ground is cast along the layer's
+  /// up axis from far above the region.
+  struct FillSpace
+  {
+    plVec3 m_vMin = plVec3::MakeZero();
+    plVec3 m_vMax = plVec3::MakeZero();
+    float m_fScale = 1.0f;        ///< world metres per layer unit in xy
+    float m_fAreaScale = 1.0f;    ///< world m^2 per layer unit^2
+    float m_fReferenceZ = 0.0f;
+    GrassColumnCaster m_Caster;
+    bool m_bHasPhysics = false;
+
+    void Init(plWorld* pWorld, const plVegetationStrokeRequest& request)
+    {
+      m_vMin = request.m_vFillMin.CompMin(request.m_vFillMax);
+      m_vMax = request.m_vFillMin.CompMax(request.m_vFillMax);
+
+      const plVec2 vAxisScale = request.m_LayerTransform.m_vScale.Abs().GetAsVec2().CompMax(plVec2(0.0001f));
+      m_fScale = 0.5f * (vAxisScale.x + vAxisScale.y);
+      m_fAreaScale = vAxisScale.x * vAxisScale.y;
+      m_fReferenceZ = 0.5f * (m_vMin.z + m_vMax.z);
+
+      const float fUpScale = plMath::Max(plMath::Abs(request.m_LayerTransform.m_vScale.z), 0.0001f);
+      m_Caster.Init(pWorld, request.m_LayerTransform, s_fFillCastHeight + 0.5f * (m_vMax.z - m_vMin.z) * fUpScale);
+      m_bHasPhysics = m_Caster.m_pPhysics != nullptr;
+    }
+
+    /// Ground under a layer-space column; without physics the reference height and the layer's up.
+    bool Cast(const plVec2& v, float& out_fHeight, plVec3& out_vNormal) const
+    {
+      if (!m_bHasPhysics)
+      {
+        out_fHeight = m_fReferenceZ;
+        out_vNormal.Set(0, 0, 1);
+        return true;
+      }
+
+      return m_Caster.Cast(v.x, v.y, m_fReferenceZ, out_fHeight, out_vNormal);
+    }
+  };
+
+  void FillPlants(const plVegetationStrokeRequest& request, const FillSpace& space, const plVegetationLayerData* pExisting, plVegetationStrokeResult& out_result);
+  void FillGrass(const plVegetationStrokeRequest& request, const FillSpace& space, const plVegetationLayerData* pExisting, plVegetationStrokeResult& out_result);
+} // namespace
+
 void plVegetationBrushHandler::EvaluateFill(plWorld* pWorld, const plVegetationStrokeRequest& request, plVegetationStrokeResult& out_result, const plVegetationLayerData* pExisting)
 {
-  if (request.m_Types.IsEmpty())
+  if (request.m_Types.IsEmpty() && request.m_GrassTypes.IsEmpty())
     return;
 
   PL_LOG_BLOCK("Vegetation Fill");
 
-  const plPhysicsWorldModuleInterface* pPhysics = pWorld->GetModuleReadOnly<plPhysicsWorldModuleInterface>();
-  const plPhysicsQueryParameters params(0, plPhysicsShapeType::Static);
+  FillSpace space;
+  space.Init(pWorld, request);
+  if (space.m_vMax.x <= space.m_vMin.x || space.m_vMax.y <= space.m_vMin.y)
+    return;
 
+  // With Replace the region's plants of the fill types are gone already, so they neither count nor keep spacing.
+  plVegetationLayerData replaced;
+  if (request.m_bFillReplace && pExisting != nullptr)
+  {
+    replaced = *pExisting;
+    request.ApplyFillReplace(replaced, nullptr);
+    pExisting = &replaced;
+  }
+
+  if (!request.m_Types.IsEmpty())
+    FillPlants(request, space, pExisting, out_result);
+
+  if (!request.m_GrassTypes.IsEmpty())
+    FillGrass(request, space, pExisting, out_result);
+}
+
+namespace
+{
+void FillPlants(const plVegetationStrokeRequest& request, const FillSpace& space, const plVegetationLayerData* pExisting, plVegetationStrokeResult& out_result)
+{
   plHybridArray<SpeciesRules, 8> species;
   ResolveSpecies(request, species);
 
-  const plVec3 vMin = request.m_vFillMin.CompMin(request.m_vFillMax);
-  const plVec3 vMax = request.m_vFillMin.CompMax(request.m_vFillMax);
+  const plVec3 vMin = space.m_vMin;
+  const plVec3 vMax = space.m_vMax;
   const plVec2 vSize = (vMax - vMin).GetAsVec2();
-  const double fArea = static_cast<double>(vSize.x) * vSize.y;
-  if (fArea <= 0.0)
-    return;
+  const double fArea = static_cast<double>(vSize.x) * vSize.y * space.m_fAreaScale; // world m^2
+  const float fInvScale = 1.0f / space.m_fScale;
 
   ExistingPlants existing;
-  existing.Gather(pExisting, request, species);
+  existing.Gather(pExisting, request, species, true);
 
-  const float fReach = plVegetationScatter::GetPairSpacing(GetMaxSpacing(species), plMath::Max(GetMaxSpacing(species), existing.m_fMaxSpacing));
+  const float fReach = fInvScale * plVegetationScatter::GetPairSpacing(GetMaxSpacing(species), plMath::Max(GetMaxSpacing(species), existing.m_fMaxSpacing));
 
   // Existing plants of the checked types inside the rectangle count toward the density; everything nearby keeps its
   // spacing.
@@ -640,20 +711,18 @@ void plVegetationBrushHandler::EvaluateFill(plWorld* pWorld, const plVegetationS
 
     plVegetationScatterObstacle& obstacle = obstacles.ExpandAndGetRef();
     obstacle.m_vPosition = v;
-    obstacle.m_fMinSpacing = existing.m_Spacings[i];
+    obstacle.m_fMinSpacing = existing.m_Spacings[i] * fInvScale;
   }
 
+  // clearings are layer-space discs already
   plDynamicArray<plVegetationScatterClearing> clearings;
   if (pExisting != nullptr)
   {
-    const plVec2 vAxisScale = request.m_LayerTransform.m_vScale.Abs().GetAsVec2();
-    const float fScale = 0.5f * (vAxisScale.x + vAxisScale.y);
-
     for (const auto& clearing : pExisting->m_Clearings)
     {
       plVegetationScatterClearing& c = clearings.ExpandAndGetRef();
-      c.m_vCenter = request.m_LayerTransform.TransformPosition(plVec3(clearing.m_vCenter.x, clearing.m_vCenter.y, 0.0f)).GetAsVec2();
-      c.m_fRadius = clearing.m_fRadius * fScale;
+      c.m_vCenter = clearing.m_vCenter;
+      c.m_fRadius = clearing.m_fRadius;
     }
   }
 
@@ -672,15 +741,11 @@ void plVegetationBrushHandler::EvaluateFill(plWorld* pWorld, const plVegetationS
   {
     plVegetationScatterSpecies& s = scatterSpecies.ExpandAndGetRef();
     s.m_fWeight = rules.m_fWeight;
-    s.m_fMinSpacing = rules.m_fMinSpacing;
-    s.m_fClearingAvoidance = rules.m_fClearingAvoidance;
+    s.m_fMinSpacing = rules.m_fMinSpacing * fInvScale;
+    s.m_fClearingAvoidance = rules.m_fClearingAvoidance * fInvScale;
   }
 
-  // Top-down casts from well above the region reach the ground wherever the picks were; without physics the plants
-  // stand on the plane through the picked corners.
-  const float fTop = vMax.z + s_fFillCastHeight;
-  const float fLength = (vMax.z - vMin.z) + 2.0f * s_fFillCastHeight;
-  const float fPlaneZ = 0.5f * (vMin.z + vMax.z);
+  const plTransform& layer = request.m_LayerTransform;
 
   plDynamicArray<plVec3> hitPositions;
   plDynamicArray<plVec3> hitNormals;
@@ -693,7 +758,7 @@ void plVegetationBrushHandler::EvaluateFill(plWorld* pWorld, const plVegetationS
   plVegetationScatterDesc desc;
   desc.m_vMin = vMin.GetAsVec2();
   desc.m_vMax = vMax.GetAsVec2();
-  desc.m_fDensity = static_cast<float>(fWanted / fArea);
+  desc.m_fDensity = static_cast<float>(fWanted / (static_cast<double>(vSize.x) * vSize.y)); // per layer unit^2
   desc.m_uiMaxPoints = s_uiMaxFillInstances;
   desc.m_uiSeed = request.m_uiSeed;
   desc.m_Species = scatterSpecies;
@@ -701,21 +766,17 @@ void plVegetationBrushHandler::EvaluateFill(plWorld* pWorld, const plVegetationS
   desc.m_Clearings = clearings;
   desc.m_Accept = [&](const plVec2& v, plUInt32 uiSpecies) -> bool
   {
-    plVec3 vPosition(v.x, v.y, fPlaneZ);
-    plVec3 vSurfaceNormal(0, 0, 1);
-
-    if (pPhysics != nullptr)
+    float fHeight = 0.0f;
+    plVec3 vLocalNormal(0, 0, 1);
+    if (!space.Cast(v, fHeight, vLocalNormal))
     {
-      plPhysicsCastResult hit;
-      if (!pPhysics->Raycast(hit, plVec3(v.x, v.y, fTop), plVec3(0, 0, -1), fLength, params))
-      {
-        ++uiMissed;
-        return false;
-      }
-
-      vPosition = hit.m_vPosition;
-      vSurfaceNormal = hit.m_vNormal;
+      ++uiMissed;
+      return false;
     }
+
+    const plVec3 vPosition = layer.TransformPosition(plVec3(v.x, v.y, fHeight));
+    plVec3 vSurfaceNormal = layer.m_qRotation * vLocalNormal;
+    vSurfaceNormal.NormalizeIfNotZero(plVec3(0, 0, 1)).IgnoreResult();
 
     if (vSurfaceNormal.z < species[uiSpecies].m_fCosMaxSlope)
     {
@@ -744,6 +805,96 @@ void plVegetationBrushHandler::EvaluateFill(plWorld* pWorld, const plVegetationS
 
   plLog::Info("Placed {} of {} plants over {} ha in {} ms ({} casts without ground, {} too steep).", points.GetCount(), static_cast<plUInt64>(fWanted + 0.5), plArgF(fArea / 10000.0, 2), plArgF((plTime::Now() - start).GetMilliseconds(), 0), uiMissed, uiTooSteep);
 }
+
+/// Most coverage texels one Fill writes per grass type.
+constexpr plUInt64 s_uiMaxFillTexels = 16ull * 1024ull * 1024ull;
+
+/// Texels per side of one block: the column cache of a block is bounded, columns are shared by the grass types.
+constexpr plInt32 s_iFillTexelBlock = 256;
+
+void FillGrass(const plVegetationStrokeRequest& request, const FillSpace& space, const plVegetationLayerData* pExisting, plVegetationStrokeResult& out_result)
+{
+  plGrassCoverageData& delta = out_result.m_GrassDelta;
+  delta.m_fTexelSize = plGrassCoverageData::ClampTexelSize(request.m_fTexelSize);
+
+  plInt32 iX0, iY0, iX1, iY1;
+  if (!delta.GetTexelRect(space.m_vMin.GetAsVec2(), space.m_vMax.GetAsVec2(), iX0, iY0, iX1, iY1))
+    return;
+
+  const plUInt64 uiTexels = static_cast<plUInt64>(iX1 - iX0 + 1) * static_cast<plUInt64>(iY1 - iY0 + 1);
+  if (uiTexels > s_uiMaxFillTexels)
+  {
+    plLog::Warning("Grass Fill covers {} texels; filling at most {}. Fill a smaller region or raise the layer's Grass Texel Size.", uiTexels, s_uiMaxFillTexels);
+    iY1 = iY0 + static_cast<plInt32>(s_uiMaxFillTexels / static_cast<plUInt64>(iX1 - iX0 + 1)) - 1;
+  }
+
+  // the same clearings as plants, without avoidance: grass types have none
+  plDynamicArray<plVegetationScatterClearing> clearings;
+  if (pExisting != nullptr)
+  {
+    for (const auto& clearing : pExisting->m_Clearings)
+    {
+      plVegetationScatterClearing& c = clearings.ExpandAndGetRef();
+      c.m_vCenter = clearing.m_vCenter;
+      c.m_fRadius = clearing.m_fRadius;
+    }
+  }
+
+  // The engine's grass sampler, with the fill's long reach: centre and corner columns per texel, slope test,
+  // discontinuity flag.
+  const plTime start = plTime::Now();
+  plUInt32 uiWritten = 0;
+
+  for (plInt32 iBlockY = iY0; iBlockY <= iY1; iBlockY += s_iFillTexelBlock)
+  {
+    for (plInt32 iBlockX = iX0; iBlockX <= iX1; iBlockX += s_iFillTexelBlock)
+    {
+      GrassStampSampler sampler;
+      sampler.m_pCaster = &space.m_Caster;
+      sampler.m_fTexel = delta.m_fTexelSize;
+      sampler.m_fReferenceZ = space.m_fReferenceZ;
+      sampler.m_fCosMaxSlope = plMath::Cos(request.m_MaxSlope);
+      sampler.m_bRejectMisses = true;
+      sampler.m_iX0 = iBlockX;
+      sampler.m_iY0 = iBlockY;
+      sampler.m_iCountX = plMath::Min(s_iFillTexelBlock, iX1 - iBlockX + 1);
+      sampler.m_iCountY = plMath::Min(s_iFillTexelBlock, iY1 - iBlockY + 1);
+      sampler.m_Centres.SetCount(sampler.m_iCountX * sampler.m_iCountY);
+      sampler.m_Corners.SetCount((sampler.m_iCountX + 1) * (sampler.m_iCountY + 1));
+
+      GrassStampSampler* pSampler = &sampler;
+      const FillSpace* pSpace = &space;
+      const plDynamicArray<plVegetationScatterClearing>* pClearings = &clearings;
+      const plGrassCoverageData::SampleFunc func = [pSampler, pSpace, pClearings](const plVec2& vPosition, plGrassCoverageSample& out_sample) -> bool
+      {
+        for (const auto& c : *pClearings)
+        {
+          if ((c.m_vCenter - vPosition).GetLengthSquared() < c.m_fRadius * c.m_fRadius)
+            return false;
+        }
+
+        if (!pSpace->m_bHasPhysics)
+        {
+          out_sample.m_fHeight = pSpace->m_fReferenceZ;
+          out_sample.m_vNormal.Set(0, 0, 1);
+          out_sample.m_bDiscontinuous = false;
+          return true;
+        }
+
+        return pSampler->Sample(vPosition, out_sample);
+      };
+
+      for (const plString& sType : request.m_GrassTypes)
+      {
+        if (!sType.IsEmpty())
+          uiWritten += delta.PaintTexelRect(sType, iBlockX, iBlockY, iBlockX + sampler.m_iCountX - 1, iBlockY + sampler.m_iCountY - 1, request.m_fDensity, request.m_fLength, func);
+      }
+    }
+  }
+
+  plLog::Info("Filled {} grass texels of {} type(s) in {} ms.", uiWritten, request.m_GrassTypes.GetCount(), plArgF((plTime::Now() - start).GetMilliseconds(), 0));
+}
+} // namespace
 
 void plVegetationBrushHandler::EvaluateGrass(plWorld* pWorld, const plVegetationStrokeRequest& request, plVegetationStrokeResult& out_result)
 {

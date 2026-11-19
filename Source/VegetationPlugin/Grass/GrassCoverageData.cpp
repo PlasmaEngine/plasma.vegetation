@@ -598,6 +598,120 @@ plUInt32 plGrassCoverageData::ModifyDensityInDisc(plArrayPtr<const plString> typ
   return uiChanged;
 }
 
+bool plGrassCoverageData::GetTexelRect(const plVec2& vMin, const plVec2& vMax, plInt32& out_iTexelX0, plInt32& out_iTexelY0, plInt32& out_iTexelX1, plInt32& out_iTexelY1) const
+{
+  // texels whose centre (i + 0.5) * size lies in [min, max]
+  out_iTexelX0 = static_cast<plInt32>(plMath::Ceil(vMin.x / m_fTexelSize - 0.5f));
+  out_iTexelY0 = static_cast<plInt32>(plMath::Ceil(vMin.y / m_fTexelSize - 0.5f));
+  out_iTexelX1 = static_cast<plInt32>(plMath::Floor(vMax.x / m_fTexelSize - 0.5f));
+  out_iTexelY1 = static_cast<plInt32>(plMath::Floor(vMax.y / m_fTexelSize - 0.5f));
+  return out_iTexelX0 <= out_iTexelX1 && out_iTexelY0 <= out_iTexelY1;
+}
+
+plUInt32 plGrassCoverageData::PaintTexelRect(plStringView sType, plInt32 iTexelX0, plInt32 iTexelY0, plInt32 iTexelX1, plInt32 iTexelY1, float fDensity, float fLength, SampleFunc sampler)
+{
+  const plUInt8 uiDensity = QuantizeRound(plMath::Clamp(fDensity, 0.0f, 1.0f));
+  if (sType.IsEmpty() || uiDensity == 0)
+    return 0;
+
+  const plUInt8 uiLength = QuantizeRound(plMath::Clamp(fLength, 0.0f, 1.0f));
+
+  BeginChange(false);
+
+  plGrassCoverageEntry& entry = GetOrAddEntry(sType);
+  plUInt32 uiWritten = 0;
+
+  for (plInt32 iY = iTexelY0; iY <= iTexelY1; ++iY)
+  {
+    const plInt32 iTileY = FloorDivTile(iY);
+    if (!IsTileInRange(iTileY))
+      continue;
+
+    for (plInt32 iX = iTexelX0; iX <= iTexelX1; ++iX)
+    {
+      const plInt32 iTileX = FloorDivTile(iX);
+      if (!IsTileInRange(iTileX))
+        continue;
+
+      const plVec2 vCenter = GetTexelCenter(iX, iY);
+
+      plGrassCoverageSample sample;
+      if (sampler.IsValid() && !sampler(vCenter, sample))
+        continue;
+
+      plGrassCoverageTile& tile = GetOrAddTile(entry, iTileX, iTileY, sample.m_fHeight);
+      const plUInt32 uiTexel = static_cast<plUInt32>((iY - iTileY * TileSide) * TileSide + (iX - iTileX * TileSide));
+
+      plGrassCoverageTexel& texel = tile.m_Texels[uiTexel];
+      texel.m_uiDensity = plMath::Max(texel.m_uiDensity, uiDensity);
+      texel.m_uiLength = uiLength;
+      tile.SetTexelHeight(uiTexel, sample.m_fHeight);
+      plGrassCoverageTexel::EncodeNormal(sample.m_vNormal, texel.m_uiNormal);
+      texel.m_uiFlags = sample.m_bDiscontinuous ? plGrassCoverageTexelFlags::Discontinuous : 0;
+
+      MarkTileChanged(entry, plGrassCoverageTile::MakeKey(iTileX, iTileY));
+      ++uiWritten;
+    }
+  }
+
+  if (entry.m_Tiles.IsEmpty())
+  {
+    Compact();
+  }
+
+  EndChange();
+  return uiWritten;
+}
+
+plUInt32 plGrassCoverageData::EraseInRect(plArrayPtr<const plString> types, const plVec2& vMin, const plVec2& vMax)
+{
+  plInt32 iX0, iY0, iX1, iY1;
+  if (!GetTexelRect(vMin, vMax, iX0, iY0, iX1, iY1))
+    return 0;
+
+  BeginChange(false);
+
+  plUInt32 uiChanged = 0;
+  for (auto& entry : m_Entries)
+  {
+    if (!MatchesType(types, entry.m_sType))
+      continue;
+
+    for (auto it = entry.m_Tiles.GetIterator(); it.IsValid(); ++it)
+    {
+      plGrassCoverageTile& tile = it.Value();
+      bool bTileChanged = false;
+
+      for (plUInt32 i = 0; i < plGrassCoverageTile::TexelCount; ++i)
+      {
+        plGrassCoverageTexel& texel = tile.m_Texels[i];
+        if (texel.m_uiDensity == 0)
+          continue;
+
+        const plInt32 iX = tile.m_iX * TileSide + static_cast<plInt32>(i % plGrassCoverageTile::TexelsPerSide);
+        const plInt32 iY = tile.m_iY * TileSide + static_cast<plInt32>(i / plGrassCoverageTile::TexelsPerSide);
+        if (iX < iX0 || iX > iX1 || iY < iY0 || iY > iY1)
+          continue;
+
+        texel.m_uiDensity = 0;
+        bTileChanged = true;
+        ++uiChanged;
+      }
+
+      if (bTileChanged)
+        MarkTileChanged(entry, it.Key());
+    }
+  }
+
+  if (uiChanged > 0)
+  {
+    Compact();
+  }
+
+  EndChange();
+  return uiChanged;
+}
+
 plUInt32 plGrassCoverageData::EraseInDisc(plArrayPtr<const plString> types, const plGrassCoverageStamp& stamp)
 {
   const float fStrength = plMath::Clamp(stamp.m_fStrength, 0.0f, 1.0f);

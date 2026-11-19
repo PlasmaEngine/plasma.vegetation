@@ -22,6 +22,18 @@ plVegetationInstanceComponent::ColorSeed;Color Seed;Selects the colour from the 
 plVegetationInstanceComponent::CastShadows;Cast Shadows
 plVegetationInstanceComponent::TouchBending;Touch Bending;Whether characters bend this plant.
 plVegetationLayerComponent;Vegetation Layer
+plVegetationLayerComponent::FillSpecies;Species;Vegetation Types (plants) and Grass Types (coverage) the Fill scatters, each with its share. Run the Fill with the Vegetation panel's Fill Layer or the Vegetation.Layer.Fill action.
+plVegetationLayerComponent::FillTreesPerHectare;Trees / ha;Plants of the plant types per hectare the filled region ends up with; plants already there count.
+plVegetationLayerComponent::FillGrassDensity;Grass Density;Coverage density the Grass Types get, 0..1.
+plVegetationLayerComponent::FillGrassLength;Grass Length;Coverage length the Grass Types get, 0..1.
+plVegetationLayerComponent::FillGrassMaxSlope;Grass Max Slope;Steepest ground the Grass Types are filled on.
+plVegetationLayerComponent::FillCenter;Center;Centre of the filled box in the layer's space.
+plVegetationLayerComponent::FillExtent;Extent;Size of the filled box in the layer's space; zero fills the whole area the layer already covers.
+plVegetationLayerComponent::FillSeed;Seed
+plVegetationLayerComponent::FillReplace;Replace Existing;The species' plants and coverage inside the region go first; otherwise the Fill adds to them.
+plVegetationFillSpecies::Type;Type
+plVegetationFillSpecies::Weight;Weight;Share among the plant types (times the type's Density Weight); 0 skips the type.
+Vegetation.Layer.Fill;Fill Vegetation Layer
 plVegetationTouchComponent;Vegetation Touch
 plVegetationTouchComponent::Radius;Radius;Radius of the bending sphere in metres.
 plVegetationTouchComponent::Strength;Strength;How far plants inside the sphere bend away.
