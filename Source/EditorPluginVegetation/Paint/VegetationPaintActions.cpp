@@ -38,8 +38,7 @@ void plVegetationPaintActions::MapActions()
     if (plActionMap* pMap = plActionMapManager::GetActionMap(szMapping))
     {
       pMap->MapAction(s_hPaintTool, "G.Gizmos", 5.6f);
-      // Mapped so every scene document instantiates it: an unmapped document action cannot run, not even from
-      // action_execute. Scene > Fill Vegetation Layer repeats the selected layers' last fill.
+      // Scene > Fill Vegetation Layer repeats the selected layers' last fill.
       pMap->MapAction(s_hLayerFill, "G.Scene", 4.5f);
     }
     else
@@ -50,7 +49,11 @@ void plVegetationPaintActions::MapActions()
   for (const char* szMapping : szToolBars)
   {
     if (plActionMap* pMap = plActionMapManager::GetActionMap(szMapping))
+    {
       pMap->MapAction(s_hPaintTool, "GizmoCategory", 5.6f);
+      // Menus build their actions lazily; the toolbar instantiates Fill with the document, so scripts can run it too.
+      pMap->MapAction(s_hLayerFill, "GizmoCategory", 5.61f);
+    }
     else
       plLog::Warning("Action map '{0}' not found - the Vegetation tool will not appear in that toolbar.", szMapping);
   }
