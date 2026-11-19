@@ -30,8 +30,16 @@ public:
   static void Startup();
   static void Shutdown();
 
-  /// \brief Places instances for one paint stamp. Exposed for tests.
-  static void EvaluatePaint(plWorld* pWorld, const plVegetationStrokeRequest& request, plVegetationStrokeResult& out_result);
+  /// \brief Places instances for one Paint or Place stamp. Exposed for tests.
+  ///
+  /// Paint scatters with plVegetationScatter on the pick's tangent plane, keeping the spacing to pExisting (the target
+  /// layer as it stands, layer space; it holds the earlier stamps of the running stroke) and out of its clearings. Place
+  /// puts exactly one instance at the pick and ignores both.
+  static void EvaluatePaint(plWorld* pWorld, const plVegetationStrokeRequest& request, plVegetationStrokeResult& out_result, const plVegetationLayerData* pExisting = nullptr);
+
+  /// \brief Scatters the checked plants over the request's fill rectangle until it holds m_fTreesPerHectare of them,
+  /// keeping the spacing to pExisting and out of its clearings, and snaps them top-down onto static collision.
+  static void EvaluateFill(plWorld* pWorld, const plVegetationStrokeRequest& request, plVegetationStrokeResult& out_result, const plVegetationLayerData* pExisting = nullptr);
 
   /// \brief Samples the texels under a Paint stamp for every grass type of the request into out_result.m_GrassDelta.
   static void EvaluateGrass(plWorld* pWorld, const plVegetationStrokeRequest& request, plVegetationStrokeResult& out_result);

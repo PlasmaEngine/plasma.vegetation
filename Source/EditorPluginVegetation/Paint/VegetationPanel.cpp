@@ -194,7 +194,7 @@ void plVegetationPanel::UpdateTypeDependentUi()
 {
   auto& s = plVegetationBrush::s_Settings;
 
-  if (!s.IsPlaceAvailable() && s.m_Mode == plVegetationBrushMode::Place)
+  if (!s.IsModeAvailable(s.m_Mode))
   {
     s.m_Mode = plVegetationBrushMode::Paint;
     plVegetationBrush::NotifySettingsChanged();
@@ -323,6 +323,16 @@ void plVegetationPanel::ToggleTool()
     else
       pGameObjectDoc->SetActiveEditTool(plGetStaticRTTI<plVegetationPaintEditTool>());
   }
+}
+
+void plVegetationPanel::FillLayer()
+{
+  // the tool of this scene does the fill; it exists once it has been activated
+  if (!IsToolActive())
+    ToggleTool();
+
+  if (IsToolActive())
+    plVegetationBrush::RequestFillLayer(m_pDocument);
 }
 
 void plVegetationPanel::OnTypesChanged()
@@ -596,6 +606,8 @@ void plVegetationPanel::BrushEventHandler(const plVegetationBrushEvent& e)
       break;
     case plVegetationBrushEvent::Type::StrokeApplied:
       UpdateStatistics();
+      break;
+    default:
       break;
   }
 }

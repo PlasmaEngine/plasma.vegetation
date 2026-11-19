@@ -8,7 +8,8 @@
 
 void plVegetationLayerData::Serialize(plStreamWriter& inout_stream) const
 {
-  const plUInt8 uiVersion = 1;
+  // Version 2 only adds the clearings; a layer without any stays version 1, readable by older versions of the plugin.
+  const plUInt8 uiVersion = m_Clearings.IsEmpty() ? 1 : 2;
   inout_stream << uiVersion;
 
   inout_stream << m_Entries.GetCount();
@@ -25,15 +26,26 @@ void plVegetationLayerData::Serialize(plStreamWriter& inout_stream) const
       inout_stream << inst.m_uiColorSeed;
     }
   }
+
+  if (uiVersion >= 2)
+  {
+    inout_stream << m_Clearings.GetCount();
+    for (const auto& clearing : m_Clearings)
+    {
+      inout_stream << clearing.m_vCenter;
+      inout_stream << clearing.m_fRadius;
+    }
+  }
 }
 
 plResult plVegetationLayerData::Deserialize(plStreamReader& inout_stream)
 {
   m_Entries.Clear();
+  m_Clearings.Clear();
 
   plUInt8 uiVersion = 0;
   inout_stream >> uiVersion;
-  if (uiVersion != 1)
+  if (uiVersion < 1 || uiVersion > 2)
     return PL_FAILURE;
 
   plUInt32 uiEntries = 0;
@@ -55,6 +67,18 @@ plResult plVegetationLayerData::Deserialize(plStreamReader& inout_stream)
       inout_stream >> inst.m_qRotation;
       inout_stream >> inst.m_fScale;
       inout_stream >> inst.m_uiColorSeed;
+    }
+  }
+
+  if (uiVersion >= 2)
+  {
+    plUInt32 uiCount = 0;
+    inout_stream >> uiCount;
+    m_Clearings.SetCountUninitialized(uiCount);
+    for (auto& clearing : m_Clearings)
+    {
+      inout_stream >> clearing.m_vCenter;
+      inout_stream >> clearing.m_fRadius;
     }
   }
 
@@ -137,6 +161,43 @@ void plVegetationLayerData::Append(const plVegetationLayerData& other)
     auto& entry = GetOrAddEntry(otherEntry.m_sType);
     entry.m_Instances.PushBackRange(otherEntry.m_Instances);
   }
+
+  for (const auto& clearing : other.m_Clearings)
+  {
+    AddClearing(clearing.m_vCenter, clearing.m_fRadius);
+  }
+}
+
+bool plVegetationLayerData::AddClearing(const plVec2& vCenter, float fRadius)
+{
+  if (fRadius <= 0.0f)
+    return false;
+
+  // A drag stamps every half radius; a stamp that lies inside an earlier disc adds nothing.
+  for (const auto& clearing : m_Clearings)
+  {
+    if ((clearing.m_vCenter - vCenter).GetLength() + fRadius <= clearing.m_fRadius + 0.001f)
+      return false;
+  }
+
+  auto& clearing = m_Clearings.ExpandAndGetRef();
+  clearing.m_vCenter = vCenter;
+  clearing.m_fRadius = fRadius;
+  return true;
+}
+
+plUInt32 plVegetationLayerData::RemoveClearings(const plVec2& vCenter, float fRadius, const plVec2& vAxisScale)
+{
+  plUInt32 uiRemoved = 0;
+  for (plUInt32 i = m_Clearings.GetCount(); i > 0; --i)
+  {
+    if ((m_Clearings[i - 1].m_vCenter - vCenter).CompMul(vAxisScale).GetLength() <= fRadius)
+    {
+      m_Clearings.RemoveAtAndCopy(i - 1);
+      ++uiRemoved;
+    }
+  }
+  return uiRemoved;
 }
 
 plUInt32 plVegetationLayerData::RemoveInSphere(const plVec3& vCenter, float fRadius, float fFalloff, float fStrength, plArrayPtr<const plString> types, plUInt32 uiSeed, const plVec3& vAxisScale)

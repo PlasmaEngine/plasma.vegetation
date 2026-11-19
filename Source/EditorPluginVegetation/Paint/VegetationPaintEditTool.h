@@ -28,10 +28,23 @@ public:
   virtual bool GetSupportsMoveParentOnly() const override;
 
   // called by the brush context
-  void BeginStroke(plVegetationBrushMode::Enum mode);
+  /// \param bRemoveClearings Clearing mode only: the stroke erases clearings instead of painting them.
+  void BeginStroke(plVegetationBrushMode::Enum mode, bool bRemoveClearings = false);
   void StrokeSegment(const plVec3& vCenter, const plVec3& vNormal);
   void EndStroke();
   void PlaceSingle(const plVec3& vCenter, const plVec3& vNormal);
+
+  /// \brief Fill: scatters the checked plants over the world-space rectangle spanned by two picked corners, up to the
+  /// panel's Trees / ha, as one undo step.
+  void FillRect(const plVec3& vCorner0, const plVec3& vCorner1);
+
+  /// \brief Fill over the target layer's area: the rectangle around its plants, or a square of the panel's Fill extent
+  /// around the layer object when it has none yet.
+  void FillLayer();
+
+  /// \brief The clearings of the target layer in world space (centre at the layer's height, radius), for the brush
+  /// overlay. Empty without a target layer.
+  void GetClearings(plDynamicArray<plVec3>& out_centers, plDynamicArray<float>& out_radii) const;
 
   /// \brief Place mode: asks the engine to show a ghost of the plant where a click would put it. The ghost uses the
   /// same seed as the click, so what is shown is what gets placed.
@@ -80,6 +93,7 @@ private:
   bool m_bStrokeActive = false;
   bool m_bCommitPending = false;
   plVegetationBrushMode::Enum m_StrokeMode = plVegetationBrushMode::Paint;
+  bool m_bStrokeRemoveClearings = false;
   plUInt32 m_uiStrokeId = 0;
   plUInt32 m_uiNextSegment = 0;
   plUInt32 m_uiPendingSegments = 0;

@@ -85,3 +85,11 @@ void plVegetationBrush::NotifyStrokeApplied()
   e.m_Type = plVegetationBrushEvent::Type::StrokeApplied;
   s_Events.Broadcast(e);
 }
+
+void plVegetationBrush::RequestFillLayer(const plDocument* pDocument)
+{
+  plVegetationBrushEvent e;
+  e.m_Type = plVegetationBrushEvent::Type::FillLayerRequested;
+  e.m_pDocument = pDocument;
+  s_Events.Broadcast(e);
+}
