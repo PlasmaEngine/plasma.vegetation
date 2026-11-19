@@ -38,7 +38,7 @@ struct PL_VEGETATIONPLUGIN_DLL plVegetationTouchSettings
   void Load(plStreamReader& inout_stream);
 };
 
-/// \brief Default placement rules; a placement source may tighten them.
+/// \brief Placement rules of a type. The paint tool's Paint and Fill use them unless the brush overrides them.
 struct PL_VEGETATIONPLUGIN_DLL plVegetationPlacementSettings
 {
   float m_fMinScale = 0.8f;
@@ -46,12 +46,20 @@ struct PL_VEGETATIONPLUGIN_DLL plVegetationPlacementSettings
   float m_fAlignToNormal = 0.6f;
   plAngle m_MaxSlope = plAngle::MakeFromDegree(45.0f);
   float m_fSink = 0.05f;
-  float m_fMinSpacing = 0.4f;
-  plString m_sColorGradient; ///< Optional plColorGradientResource sampled by the instance colour seed.
+  float m_fMinSpacing = 0.4f; ///< Distance between two instances of this type; between types the mean of both.
+  plString m_sColorGradient;  ///< Optional plColorGradientResource sampled by the instance colour seed.
   float m_fHueVariation = 0.05f;
+
+  // Version 3 of the type file; part of the extra block Save/LoadExtra write after the ray tracing settings.
+  float m_fDensityWeight = 1.0f;     ///< Relative share of this type when several types are scattered together.
+  float m_fClearingAvoidance = 0.0f; ///< Distance in metres instances keep from a clearing painted on the layer.
 
   void Save(plStreamWriter& inout_stream) const;
   void Load(plStreamReader& inout_stream);
+
+  /// \brief The settings added with version 3, stored at the end of the type file.
+  void SaveExtra(plStreamWriter& inout_stream) const;
+  void LoadExtra(plStreamReader& inout_stream);
 };
 
 /// \brief Distances and flags for the renderer.
@@ -161,6 +169,13 @@ public:
   /// \brief Distance up to which instances are part of the ray tracing scene, before any quality cap.
   float GetRayTracingRange() const;
 
+  /// \brief The type's placement rules (scale, slope, spacing, sink, alignment, density weight, clearing avoidance).
+  const plVegetationPlacementSettings& GetPlacement() const { return m_Descriptor.m_Placement; }
+
+  /// \brief Whether LOD 0 is a foliage composite (a tree of instanced parts, plFoliageComposite). False while the mesh
+  /// is still loading.
+  bool IsFoliageComposite() const;
+
 private:
   virtual plResourceLoadDesc UnloadData(Unload WhatToUnload) override;
   virtual plResourceLoadDesc UpdateContent(plStreamReader* Stream) override;
@@ -174,4 +189,5 @@ private:
   plColorGradientResourceHandle m_hColorGradient;
   mutable float m_fBoundingRadius = 0.0f;
   mutable float m_fBoundingHeight = 1.0f;
+  mutable plInt8 m_iFoliageComposite = -1; ///< -1 until LOD 0 has loaded, then 0 or 1
 };
