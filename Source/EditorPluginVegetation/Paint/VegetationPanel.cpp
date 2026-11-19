@@ -8,6 +8,7 @@
 #include <EditorFramework/EngineShell/DocumentFrame.h>
 #include <EditorFramework/EngineShell/EngineShell.h>
 #include <EditorPluginVegetation/Paint/VegetationBrushSettings.h>
+#include <EditorPluginVegetation/Paint/VegetationLayerFill.h>
 #include <EditorPluginVegetation/Paint/VegetationPaintEditTool.h>
 #include <EditorPluginVegetation/Paint/VegetationPanel.h>
 #include <EditorPluginVegetation/Paint/VegetationPanelView.h>
@@ -353,7 +354,19 @@ void plVegetationPanel::OnLayerChanged(int iIndex)
     return;
 
   m_iLayerIndex = iIndex;
-  plVegetationBrush::s_Settings.m_LayerComponent = m_LayerGuids[iIndex];
+  auto& s = plVegetationBrush::s_Settings;
+  s.m_LayerComponent = m_LayerGuids[iIndex];
+
+  // the panel's Fill values follow the layer's Fill settings, which the last Fill stored there
+  if (const plDocumentObject* pLayer = GetTargetLayer())
+  {
+    plVegetationFillSettings fill;
+    fill.ReadFrom(pLayer);
+    s.m_fTreesPerHectare = fill.m_fTreesPerHectare;
+    s.m_fFillGrassDensity = fill.m_fGrassDensity;
+    s.m_bFillReplace = fill.m_bReplace;
+  }
+
   UpdateStatistics();
   plVegetationBrush::NotifySettingsChanged();
 }

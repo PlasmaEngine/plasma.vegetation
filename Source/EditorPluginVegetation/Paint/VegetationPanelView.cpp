@@ -56,7 +56,7 @@ namespace
 
   /// The number fields; their names, text bindings and submit events are "Veg.<name>", "Veg.<name>Text" and
   /// "Veg.<name>Submit".
-  const char* s_szFields[] = {"MaxSlope", "MinScale", "MaxScale", "MinSpacing", "Sink", "TreesPerHectare", "FillExtent"};
+  const char* s_szFields[] = {"MaxSlope", "MinScale", "MaxScale", "MinSpacing", "Sink", "TreesPerHectare", "FillExtent", "FillGrassDensity"};
 
   plString FieldName(plUInt32 uiField, plStringView sSuffix = {})
   {
@@ -68,13 +68,13 @@ namespace
   float GetFieldValue(plUInt32 uiField)
   {
     const auto& s = plVegetationBrush::s_Settings;
-    const float values[] = {s.m_MaxSlope.GetDegree(), s.m_fMinScale, s.m_fMaxScale, s.m_fMinSpacing, s.m_fSink, s.m_fTreesPerHectare, s.m_fFillExtent};
+    const float values[] = {s.m_MaxSlope.GetDegree(), s.m_fMinScale, s.m_fMaxScale, s.m_fMinSpacing, s.m_fSink, s.m_fTreesPerHectare, s.m_fFillExtent, s.m_fFillGrassDensity};
     return values[uiField];
   }
 
   plUInt8 GetFieldDecimals(plUInt32 uiField)
   {
-    const plUInt8 decimals[] = {0, 2, 2, 2, 2, 0, 0};
+    const plUInt8 decimals[] = {0, 2, 2, 2, 2, 0, 0, 2};
     return decimals[uiField];
   }
 
@@ -338,7 +338,7 @@ plString plVegetationPanelView::GetStructureKey() const
   const auto& s = plVegetationBrush::s_Settings;
 
   plStringBuilder key;
-  key.SetFormat("{}|{}|{}|{}|{}|{}|{}|{}|{}|", m_pPanel->IsToolActive(), m_pPanel->GetLayerIndex(), static_cast<plUInt32>(s.m_Mode), s.IsPlaceAvailable(), s.GetSelectedGrassCount() > 0, s.m_bAlignToNormal, m_pPanel->CanResnap(), m_pPanel->CanClearCoverage(), s.m_bOverrideTypeRules);
+  key.SetFormat("{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|", m_pPanel->IsToolActive(), m_pPanel->GetLayerIndex(), static_cast<plUInt32>(s.m_Mode), s.IsPlaceAvailable(), s.GetSelectedGrassCount() > 0, s.m_bAlignToNormal, m_pPanel->CanResnap(), m_pPanel->CanClearCoverage(), s.m_bOverrideTypeRules, s.m_bFillReplace, s.GetSelectedPlantCount() > 0);
 
   for (const plString& sLayer : m_pPanel->GetLayerNames())
     key.Append(sLayer, "/");
@@ -445,7 +445,7 @@ void plVegetationPanelView::BuildDocument()
 
     if (!s.IsPlaceAvailable())
     {
-      plUiText* pWarning = Text(pContent, "Place and Fill need a plant type. Grass Types are painted as coverage.");
+      plUiText* pWarning = Text(pContent, "Place needs a plant type. Grass Types are painted as coverage.");
       Place(pWarning, plRectFloat(10, y, fWidth - 20, 18));
       pWarning->m_uiFontSize = FontSize - 2;
       pWarning->m_Color = Warning();
@@ -553,20 +553,27 @@ void plVegetationPanelView::BuildDocument()
       {
         DimText("Slope, scale, spacing, sink and alignment come from each type.");
 
-        // grass coverage has no type rules for its slope: Paint keeps the brush's
-        if (s.m_Mode == plVegetationBrushMode::Paint && bLength)
+        // grass coverage has no type rules for its slope: Paint and Fill keep the brush's
+        if ((s.m_Mode == plVegetationBrushMode::Paint || s.m_Mode == plVegetationBrushMode::Fill) && bLength)
           FieldRow("Grass slope", 0, "\xC2\xB0", "Steepest ground the checked Grass Types are painted on.");
       }
     }
 
     if (s.m_Mode == plVegetationBrushMode::Fill)
     {
-      FieldRow("Trees / ha", 5, {}, "Plants of the checked types per hectare (10000 m\xC2\xB2) the filled area ends up with; plants already there count. Spacing and slope may keep it lower.");
-      FieldRow("Fill extent", 6, " m", "Fill Layer on a layer without plants fills a square of this side around the layer object.");
+      if (s.GetSelectedPlantCount() > 0)
+        FieldRow("Trees / ha", 5, {}, "Plants of the checked types per hectare (10000 m\xC2\xB2) the filled area ends up with; plants already there count. Spacing and slope may keep it lower.");
+      if (bLength)
+        FieldRow("Grass density", 7, {}, "Coverage density the checked Grass Types get over the filled area, 0..1; Length is the brush's Length.");
+      FieldRow("Fill extent", 6, " m", "Fill Layer on an empty layer fills a square of this side around the layer object.");
+
+      CheckRow(pContent, plRectFloat(10, y, fWidth - 20, 20), "Replace existing", {}, "Veg.FillReplace", s.m_bFillReplace);
+      SetToolTip(board, "Veg.FillReplace", "The checked types' plants and coverage inside the filled area go first; unchecked, Fill adds to what is there.");
+      y += 26.0f;
 
       const float fFill = ToolButtonWidth("Fill Layer", true);
       ToolButton(pContent, plRectFloat(10, y, fFill, ControlHeight), "Fill Layer", "Veg.FillLayer", IconPath(Icon::Add), false, s.IsFillAvailable());
-      SetToolTip(board, "Veg.FillLayer", "Fills the area of the target layer's plants, or the Fill extent square around the layer object when it has none. One undo step.");
+      SetToolTip(board, "Veg.FillLayer", "Fills the target layer's whole area (its plants, coverage and clearings), or the Fill extent square around the layer object when it is empty. One undo step; the values are stored as the layer's Fill settings, which the Vegetation.Layer.Fill action repeats.");
       y += ControlHeight + 6.0f;
 
       DimText("Or drag a rectangle in the viewport.");
@@ -804,6 +811,9 @@ void plVegetationPanelView::CommitField(Field field)
     case Field::FillExtent:
       s.m_fFillExtent = plMath::Clamp(static_cast<float>(fValue), 1.0f, 20000.0f);
       break;
+    case Field::FillGrassDensity:
+      s.m_fFillGrassDensity = plMath::Clamp(static_cast<float>(fValue), 0.0f, 1.0f);
+      break;
     default:
       break;
   }
@@ -912,6 +922,11 @@ void plVegetationPanelView::OnUiEvent(const plMsgUiEvent& event)
   else if (sId == "Veg.Override")
   {
     s.m_bOverrideTypeRules = !s.m_bOverrideTypeRules;
+    plVegetationBrush::NotifySettingsChanged();
+  }
+  else if (sId == "Veg.FillReplace")
+  {
+    s.m_bFillReplace = !s.m_bFillReplace;
     plVegetationBrush::NotifySettingsChanged();
   }
   else if (sId == "Veg.FillLayer")

@@ -42,6 +42,7 @@ private:
     Sink,
     TreesPerHectare,
     FillExtent,
+    FillGrassDensity,
     Count
   };
 

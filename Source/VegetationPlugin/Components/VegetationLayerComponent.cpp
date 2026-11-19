@@ -7,6 +7,17 @@
 #include <VegetationPlugin/World/VegetationWorldModule.h>
 
 // clang-format off
+PL_BEGIN_STATIC_REFLECTED_TYPE(plVegetationFillSpecies, plNoBase, 1, plRTTIDefaultAllocator<plVegetationFillSpecies>)
+{
+  PL_BEGIN_PROPERTIES
+  {
+    PL_MEMBER_PROPERTY("Type", m_sType)->AddAttributes(new plAssetBrowserAttribute("CompatibleAsset_Vegetation_Type;CompatibleAsset_Grass_Type")),
+    PL_MEMBER_PROPERTY("Weight", m_fWeight)->AddAttributes(new plDefaultValueAttribute(1.0f), new plClampValueAttribute(0.0f, 100.0f)),
+  }
+  PL_END_PROPERTIES;
+}
+PL_END_STATIC_REFLECTED_TYPE;
+
 PL_BEGIN_COMPONENT_TYPE(plVegetationLayerComponent, 2, plComponentMode::Static)
 {
   PL_BEGIN_PROPERTIES
@@ -16,6 +27,15 @@ PL_BEGIN_COMPONENT_TYPE(plVegetationLayerComponent, 2, plComponentMode::Static)
     PL_ACCESSOR_PROPERTY("GrassCoverage", GetGrassCoverageBlob, SetGrassCoverageBlob)->AddAttributes(new plHiddenAttribute()),
     PL_ACCESSOR_PROPERTY("GrassTexelSize", GetGrassTexelSize, SetGrassTexelSize)->AddAttributes(new plDefaultValueAttribute(plGrassCoverageData::DefaultTexelSize), new plClampValueAttribute(plGrassCoverageData::MinTexelSize, plGrassCoverageData::MaxTexelSize), new plSuffixAttribute(" m")),
     PL_ACCESSOR_PROPERTY_READ_ONLY("GrassTileCount", GetGrassTileCount),
+    PL_ARRAY_MEMBER_PROPERTY("FillSpecies", m_FillSpecies)->AddAttributes(new plGroupAttribute("Fill")),
+    PL_MEMBER_PROPERTY("FillTreesPerHectare", m_fFillTreesPerHectare)->AddAttributes(new plDefaultValueAttribute(600.0f), new plClampValueAttribute(0.0f, 100000.0f)),
+    PL_MEMBER_PROPERTY("FillGrassDensity", m_fFillGrassDensity)->AddAttributes(new plDefaultValueAttribute(1.0f), new plClampValueAttribute(0.0f, 1.0f)),
+    PL_MEMBER_PROPERTY("FillGrassLength", m_fFillGrassLength)->AddAttributes(new plDefaultValueAttribute(1.0f), new plClampValueAttribute(0.0f, 1.0f)),
+    PL_MEMBER_PROPERTY("FillGrassMaxSlope", m_FillGrassMaxSlope)->AddAttributes(new plDefaultValueAttribute(plAngle::MakeFromDegree(40.0f)), new plClampValueAttribute(plAngle::MakeFromDegree(0.0f), plAngle::MakeFromDegree(90.0f))),
+    PL_MEMBER_PROPERTY("FillCenter", m_vFillCenter),
+    PL_MEMBER_PROPERTY("FillExtent", m_vFillExtent)->AddAttributes(new plClampValueAttribute(plVec2(0.0f), plVec2(100000.0f)), new plSuffixAttribute(" m")),
+    PL_MEMBER_PROPERTY("FillSeed", m_uiFillSeed)->AddAttributes(new plDefaultValueAttribute(1)),
+    PL_MEMBER_PROPERTY("FillReplace", m_bFillReplace),
   }
   PL_END_PROPERTIES;
   PL_BEGIN_MESSAGEHANDLERS

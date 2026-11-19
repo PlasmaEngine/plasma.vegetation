@@ -165,6 +165,17 @@ public:
   /// a sampler the surface is the plane z = 0. Returns the number of texels written.
   plUInt32 PaintInDisc(plStringView sType, const plGrassCoverageStamp& stamp, SampleFunc sampler = {});
 
+  /// \brief Fill: raises density toward fDensity and writes fLength and the sampled surface for every texel of the
+  /// inclusive texel range. The sampler rejects texels (too steep, in a clearing). Returns the texels written.
+  plUInt32 PaintTexelRect(plStringView sType, plInt32 iTexelX0, plInt32 iTexelY0, plInt32 iTexelX1, plInt32 iTexelY1, float fDensity, float fLength, SampleFunc sampler = {});
+
+  /// \brief The inclusive texel range whose centres lie inside the layer-space rectangle; false when it holds none.
+  bool GetTexelRect(const plVec2& vMin, const plVec2& vMax, plInt32& out_iTexelX0, plInt32& out_iTexelY0, plInt32& out_iTexelX1, plInt32& out_iTexelY1) const;
+
+  /// \brief Fill with replace: clears the given types (empty = all) in every texel whose centre lies inside the
+  /// layer-space rectangle. Returns the texels cleared.
+  plUInt32 EraseInRect(plArrayPtr<const plString> types, const plVec2& vMin, const plVec2& vMax);
+
   /// \brief Lowers density by Strength * weight. An empty types list matches all types. Returns the texels changed.
   plUInt32 EraseInDisc(plArrayPtr<const plString> types, const plGrassCoverageStamp& stamp);
 

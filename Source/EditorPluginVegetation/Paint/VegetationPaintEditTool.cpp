@@ -5,6 +5,7 @@
 #include <EditorFramework/DocumentWindow/EngineDocumentWindow.h>
 #include <EditorFramework/DocumentWindow/GameObjectDocumentWindow.h>
 #include <EditorPluginVegetation/Paint/VegetationBrushSettings.h>
+#include <EditorPluginVegetation/Paint/VegetationLayerFill.h>
 #include <EditorPluginVegetation/Paint/VegetationPaintEditTool.h>
 #include <EditorFramework/DocumentWindow/EngineViewWidget.h>
 #include <Foundation/Time/Time.h>
@@ -357,38 +358,71 @@ void plVegetationPaintEditTool::StrokeSegment(const plVec3& vCenter, const plVec
   }
 }
 
-void plVegetationPaintEditTool::FillRect(const plVec3& vCorner0, const plVec3& vCorner1)
+void plVegetationPaintEditTool::FillWithPanelSettings(const plVec2& vCenter, const plVec2& vExtent, plUInt32 uiSeed)
 {
   const auto& s = plVegetationBrush::s_Settings;
-  if (s.GetSelectedPlantCount() == 0)
+  if (s.GetSelectedTypeCount() == 0)
   {
-    plLog::Warning("Vegetation: check at least one plant type in the Vegetation panel to fill. Grass Types are painted as coverage.");
+    plLog::Warning("Vegetation: check at least one plant or Grass Type in the Vegetation panel to fill.");
     return;
   }
 
-  const plVec3 vMin = vCorner0.CompMin(vCorner1);
-  const plVec3 vMax = vCorner0.CompMax(vCorner1);
+  const plDocumentObject* pComponent = GetLayerComponentObject();
+  if (pComponent == nullptr)
+  {
+    plLog::Warning("Vegetation: no target layer selected. Pick or create a layer in the Vegetation panel.");
+    return;
+  }
+
+  // The panel's values become the layer's Fill settings in the same undo step, so Vegetation.Layer.Fill repeats this
+  // fill.
+  plVegetationFillSettings settings;
+  for (const auto& type : s.m_Types)
+  {
+    if (type.m_bSelected && !type.m_sGuid.IsEmpty())
+    {
+      auto& species = settings.m_Species.ExpandAndGetRef();
+      species.m_sType = type.m_sGuid;
+      species.m_fWeight = type.m_fWeight;
+    }
+  }
+  settings.m_fTreesPerHectare = s.m_fTreesPerHectare;
+  settings.m_fGrassDensity = s.m_fFillGrassDensity;
+  settings.m_fGrassLength = s.m_fLength;
+  settings.m_GrassMaxSlope = s.m_MaxSlope;
+  settings.m_vCenter = vCenter;
+  settings.m_vExtent = vExtent;
+  settings.m_uiSeed = uiSeed;
+  settings.m_bReplace = s.m_bFillReplace;
+
+  // the brush's placement overrides travel along
+  plVegetationStrokeRequest brush;
+  FillRequest(brush, plVegetationBrushMode::Fill, plVec3::MakeZero(), plVec3(0, 0, 1));
+
+  const plStatus status = plVegetationLayerFill::FillLayer(static_cast<plGameObjectDocument*>(GetDocument()), pComponent, settings, true, &brush);
+  if (status.Failed())
+    plLog::Warning("Vegetation Fill: {}", status.m_sMessage);
+}
+
+void plVegetationPaintEditTool::FillRect(const plVec3& vCorner0, const plVec3& vCorner1)
+{
+  const plDocumentObject* pComponent = GetLayerComponentObject();
+  if (pComponent == nullptr)
+  {
+    plLog::Warning("Vegetation: no target layer selected. Pick or create a layer in the Vegetation panel.");
+    return;
+  }
+
+  // the dragged rectangle in the layer's space
+  const plTransform inv = GetDocument()->GetGlobalTransform(pComponent->GetParent()).GetInverse();
+  const plVec2 a = inv.TransformPosition(vCorner0).GetAsVec2();
+  const plVec2 b = inv.TransformPosition(vCorner1).GetAsVec2();
+  const plVec2 vMin = a.CompMin(b);
+  const plVec2 vMax = a.CompMax(b);
   if (vMax.x - vMin.x < 0.5f || vMax.y - vMin.y < 0.5f)
     return;
 
-  BeginStroke(plVegetationBrushMode::Fill);
-  if (!m_bStrokeActive)
-    return;
-
-  plVegetationStrokeRequest request;
-  FillRequest(request, plVegetationBrushMode::Fill, 0.5f * (vMin + vMax), plVec3(0, 0, 1));
-  request.m_uiSegment = m_uiNextSegment++;
-  request.m_vFillMin = vMin;
-  request.m_vFillMax = vMax;
-  request.m_fTreesPerHectare = s.m_fTreesPerHectare;
-  request.m_GrassTypes.Clear(); // Fill places plants only
-  request.m_uiSeed = plHashingUtils::xxHash32(&vMin, sizeof(plVec3), plHashingUtils::xxHash32(&vMax, sizeof(plVec3))) ^ m_uiStrokeId;
-
-  ++m_uiPendingSegments;
-  SendRequest(request);
-
-  // commits as one undo step once the engine answered
-  EndStroke();
+  FillWithPanelSettings(0.5f * (vMin + vMax), vMax - vMin, plHashingUtils::xxHash32(&vMin, sizeof(plVec2), plHashingUtils::xxHash32(&vMax, sizeof(plVec2))));
 }
 
 void plVegetationPaintEditTool::FillLayer()
@@ -403,22 +437,18 @@ void plVegetationPaintEditTool::FillLayer()
     return;
   }
 
-  plBoundingBox bounds = plBoundingBox::MakeInvalid();
-  for (const auto& entry : data.m_Entries)
+  ++m_uiFillCount;
+
+  // The whole layer; a layer with nothing on it yet gets the square of the Fill extent around its object.
+  if (data.IsEmpty() && grass.IsEmpty() && data.m_Clearings.IsEmpty())
   {
-    for (const auto& inst : entry.m_Instances)
-      bounds.ExpandToInclude(layerTransform.TransformPosition(inst.m_vPosition));
+    const plVec2 vAxisScale = layerTransform.m_vScale.Abs().GetAsVec2().CompMax(plVec2(0.0001f));
+    const float fExtent = plMath::Max(plVegetationBrush::s_Settings.m_fFillExtent, 1.0f);
+    FillWithPanelSettings(plVec2::MakeZero(), plVec2(fExtent / vAxisScale.x, fExtent / vAxisScale.y), m_uiFillCount);
+    return;
   }
 
-  if (!bounds.IsValid() || bounds.GetHalfExtents().x < 0.25f || bounds.GetHalfExtents().y < 0.25f)
-  {
-    // a layer without plants yet: the square of the Fill extent around the layer object
-    const float fHalf = 0.5f * plMath::Max(plVegetationBrush::s_Settings.m_fFillExtent, 1.0f);
-    const plVec3 vCenter = layerTransform.m_vPosition;
-    bounds = plBoundingBox::MakeFromMinMax(vCenter - plVec3(fHalf, fHalf, 0.0f), vCenter + plVec3(fHalf, fHalf, 0.0f));
-  }
-
-  FillRect(bounds.m_vMin, bounds.m_vMax);
+  FillWithPanelSettings(plVec2::MakeZero(), plVec2::MakeZero(), m_uiFillCount);
 }
 
 void plVegetationPaintEditTool::GetClearings(plDynamicArray<plVec3>& out_centers, plDynamicArray<float>& out_radii) const

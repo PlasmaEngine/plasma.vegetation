@@ -5,7 +5,9 @@
 #include <TestFramework/Utilities/TestLogInterface.h>
 #include <TestFramework/Utilities/TestSetup.h>
 #include <VegetationPlugin/Components/VegetationBrushProtocol.h>
+#include <VegetationPlugin/Components/VegetationLayerComponent.h>
 #include <VegetationPlugin/Components/VegetationLayerData.h>
+#include <VegetationPlugin/Grass/GrassCoverageData.h>
 #include <VegetationPlugin/Placement/VegetationScatter.h>
 #include <VegetationPlugin/Resources/VegetationTypeResource.h>
 
@@ -527,7 +529,7 @@ PL_CREATE_SIMPLE_TEST(Vegetation, StrokeRequestVersions)
   PL_TEST_BLOCK(plTestBlock::Enabled, "A version 4 request still reads and places with the brush values")
   {
     // version 4 is version 5 without the trailing fields
-    constexpr plUInt32 uiVersion5Bytes = sizeof(bool) + 2 * sizeof(plVec3) + sizeof(float) + sizeof(bool);
+    constexpr plUInt32 uiVersion5Bytes = sizeof(bool) + 2 * sizeof(plVec3) + sizeof(float) + sizeof(bool) + sizeof(bool);
     plDataBuffer old = buffer;
     old.SetCount(old.GetCount() - uiVersion5Bytes);
     old[0] = 4;
@@ -538,4 +540,146 @@ PL_CREATE_SIMPLE_TEST(Vegetation, StrokeRequestVersions)
     PL_TEST_FLOAT(read.m_fRadius, 7.0f, 0.0f);
     PL_TEST_INT(read.m_Types.GetCount(), 1);
   }
+}
+
+PL_CREATE_SIMPLE_TEST(Vegetation, GrassFill)
+{
+  plGrassCoverageData grass;
+  grass.m_fTexelSize = 0.5f;
+
+  PL_TEST_BLOCK(plTestBlock::Enabled, "Texel rect holds the texels whose centres lie inside")
+  {
+    plInt32 x0, y0, x1, y1;
+    PL_TEST_BOOL(grass.GetTexelRect(plVec2(0.0f), plVec2(10.0f, 5.0f), x0, y0, x1, y1));
+    PL_TEST_INT(x0, 0);
+    PL_TEST_INT(y0, 0);
+    PL_TEST_INT(x1, 19);
+    PL_TEST_INT(y1, 9);
+
+    PL_TEST_BOOL(grass.GetTexelRect(plVec2(-1.1f, 0.2f), plVec2(-0.2f, 0.7f), x0, y0, x1, y1)); // centres -0.75, -0.25 and 0.25
+    PL_TEST_INT(x0, -2);
+    PL_TEST_INT(x1, -1);
+    PL_TEST_INT(y0, 0);
+    PL_TEST_INT(y1, 0);
+
+    PL_TEST_BOOL(!grass.GetTexelRect(plVec2(0.3f), plVec2(0.4f), x0, y0, x1, y1));
+  }
+
+  PL_TEST_BLOCK(plTestBlock::Enabled, "Fill writes every accepted texel; the sampler excludes a clearing and steep ground")
+  {
+    const plVec2 vClearing(5.0f, 5.0f);
+    const plGrassCoverageData::SampleFunc sampler = [&](const plVec2& v, plGrassCoverageSample& out_sample) -> bool
+    {
+      if ((v - vClearing).GetLength() < 2.0f)
+        return false;
+
+      out_sample.m_fHeight = 3.0f + v.x * 0.01f;
+      out_sample.m_vNormal.Set(0, 0, 1);
+      return v.y < 9.0f; // "too steep" above 9 m
+    };
+
+    plInt32 x0, y0, x1, y1;
+    PL_TEST_BOOL(grass.GetTexelRect(plVec2(0.0f), plVec2(10.0f), x0, y0, x1, y1));
+    const plUInt32 uiWritten = grass.PaintTexelRect("grass", x0, y0, x1, y1, 0.8f, 0.5f, sampler);
+
+    plUInt32 uiExpected = 0;
+    for (plInt32 y = y0; y <= y1; ++y)
+    {
+      for (plInt32 x = x0; x <= x1; ++x)
+      {
+        const plVec2 c = grass.GetTexelCenter(x, y);
+        if ((c - vClearing).GetLength() >= 2.0f && c.y < 9.0f)
+          ++uiExpected;
+      }
+    }
+
+    PL_TEST_INT(uiWritten, uiExpected);
+    PL_TEST_BOOL(grass.GetPaintedArea() > 0.0);
+
+    // density and length as asked, nothing in the clearing
+    const plGrassCoverageEntry* pEntry = grass.FindEntry("grass");
+    PL_TEST_BOOL(pEntry != nullptr);
+    plUInt32 uiPainted = 0;
+    for (auto it = pEntry->m_Tiles.GetIterator(); it.IsValid(); ++it)
+    {
+      const plGrassCoverageTile& tile = it.Value();
+      for (plUInt32 i = 0; i < plGrassCoverageTile::TexelCount; ++i)
+      {
+        if (tile.m_Texels[i].m_uiDensity == 0)
+          continue;
+
+        ++uiPainted;
+        PL_TEST_INT(tile.m_Texels[i].m_uiDensity, 204);
+        PL_TEST_INT(tile.m_Texels[i].m_uiLength, 128);
+        const plVec2 c = grass.GetTexelCenter(tile.m_iX * 16 + static_cast<plInt32>(i % 16), tile.m_iY * 16 + static_cast<plInt32>(i / 16));
+        PL_TEST_BOOL((c - vClearing).GetLength() >= 2.0f);
+        PL_TEST_FLOAT(tile.GetTexelHeight(i), 3.0f + c.x * 0.01f, 0.002f);
+      }
+    }
+    PL_TEST_INT(uiPainted, uiExpected);
+  }
+
+  PL_TEST_BLOCK(plTestBlock::Enabled, "Fill with Replace clears the fill types in the region only")
+  {
+    plGrassCoverageData copy = grass;
+    plInt32 x0, y0, x1, y1;
+    copy.GetTexelRect(plVec2(0.0f), plVec2(10.0f), x0, y0, x1, y1);
+    copy.PaintTexelRect("other", x0, y0, x1, y1, 1.0f, 1.0f);
+
+    plVegetationLayerData data;
+    for (plInt32 i = 0; i < 10; ++i)
+    {
+      plVegetationLayerInstance& a = data.GetOrAddEntry("tree").m_Instances.ExpandAndGetRef();
+      a.m_vPosition = plVec3(i * 2.0f, 1.0f, 0.0f);
+      plVegetationLayerInstance& b = data.GetOrAddEntry("bush").m_Instances.ExpandAndGetRef();
+      b.m_vPosition = plVec3(i * 2.0f, 1.0f, 0.0f);
+    }
+
+    plVegetationStrokeRequest request;
+    request.m_uiMode = plVegetationBrushMode::Fill;
+    request.m_vFillMin = plVec3(0.0f, 0.0f, -5.0f);
+    request.m_vFillMax = plVec3(5.0f, 5.0f, 5.0f);
+    request.m_Types.PushBack("tree");
+    request.m_GrassTypes.PushBack("grass");
+
+    PL_TEST_BOOL(!request.ApplyFillReplace(data, &copy)); // only with Replace
+    request.m_bFillReplace = true;
+    PL_TEST_BOOL(request.ApplyFillReplace(data, &copy));
+
+    PL_TEST_INT(data.FindEntry("tree")->m_Instances.GetCount(), 7); // x = 0, 2, 4 went
+    PL_TEST_INT(data.FindEntry("bush")->m_Instances.GetCount(), 10);
+
+    for (const plGrassCoverageEntry& entry : copy.m_Entries)
+    {
+      for (auto it = entry.m_Tiles.GetIterator(); it.IsValid(); ++it)
+      {
+        const plGrassCoverageTile& tile = it.Value();
+        for (plUInt32 i = 0; i < plGrassCoverageTile::TexelCount; ++i)
+        {
+          if (tile.m_Texels[i].m_uiDensity == 0)
+            continue;
+
+          const plVec2 c = copy.GetTexelCenter(tile.m_iX * 16 + static_cast<plInt32>(i % 16), tile.m_iY * 16 + static_cast<plInt32>(i / 16));
+          if (entry.m_sType == "grass")
+            PL_TEST_BOOL(c.x > 5.0f || c.y > 5.0f);
+        }
+      }
+    }
+
+    PL_TEST_FLOAT(static_cast<float>(copy.GetPaintedArea(*copy.FindEntry("other"))), 100.0f, 0.01f);
+  }
+}
+
+PL_CREATE_SIMPLE_TEST(Vegetation, LayerFillProperties)
+{
+  // the names the scripted editor sets with object_modify
+  const plRTTI* pType = plGetStaticRTTI<plVegetationLayerComponent>();
+  for (const char* szName : {"FillSpecies", "FillTreesPerHectare", "FillGrassDensity", "FillGrassLength", "FillGrassMaxSlope", "FillCenter", "FillExtent", "FillSeed", "FillReplace"})
+  {
+    PL_TEST_BOOL_MSG(pType->FindPropertyByName(szName) != nullptr, "%s", szName);
+  }
+
+  const plRTTI* pSpecies = plGetStaticRTTI<plVegetationFillSpecies>();
+  PL_TEST_BOOL(pSpecies->FindPropertyByName("Type") != nullptr);
+  PL_TEST_BOOL(pSpecies->FindPropertyByName("Weight") != nullptr);
 }
