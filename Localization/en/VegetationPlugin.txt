@@ -30,7 +30,8 @@ plVegetationTouchComponent::Crush;Crush;How far plants are pressed down while to
 
 # Vegetation Type properties
 
-plVegetationTypeAssetProperties::Lods;LODs;Meshes from highest to lowest detail with the screen-height fraction at which each turns on.
+plVegetationTypeAssetProperties::Lods;LODs;Meshes from highest to lowest detail with the screen-height fraction at which each turns on. A foliage composite as LOD 0 switches between its parts and its merged mesh by itself and needs no other LOD.
+plVegetationTypeAssetProperties::Composite;Composite;LOD 0 is a foliage composite: what its last transform built.
 plVegetationTypeAssetProperties::Materials;Material Overrides;Per material slot; leave empty to keep the mesh material.
 plVegetationTypeAssetProperties::Wind;Wind
 plVegetationTypeAssetProperties::Touch;Touch
@@ -56,9 +57,11 @@ plVegetationTypeAssetPlacement::MaxScale;Max Scale
 plVegetationTypeAssetPlacement::AlignToNormal;Align To Normal;0 = upright, 1 = follows the surface normal.
 plVegetationTypeAssetPlacement::MaxSlope;Max Slope;Steeper surfaces are skipped by placement.
 plVegetationTypeAssetPlacement::Sink;Sink;How far instances are pushed into the ground.
-plVegetationTypeAssetPlacement::MinSpacing;Min Spacing
+plVegetationTypeAssetPlacement::MinSpacing;Min Spacing;Distance Paint and Fill keep between two plants of this type; between types the mean of both.
 plVegetationTypeAssetPlacement::ColorGradient;Color Gradient;Sampled by the instance colour seed.
 plVegetationTypeAssetPlacement::HueVariation;Hue Variation
+plVegetationTypeAssetPlacement::DensityWeight;Density Weight;Share of this type when Paint or Fill scatters several checked types together.
+plVegetationTypeAssetPlacement::ClearingAvoidance;Clearing Avoidance;Distance from the edge of a painted clearing that this type keeps free.
 plVegetationTypeAssetRender::CullDistance;Cull Distance
 plVegetationTypeAssetRender::ShadowCullDistance;Shadow Distance
 plVegetationTypeAssetRender::ThinningStart;Thinning Start;Fraction of the cull distance where instances start to thin out.

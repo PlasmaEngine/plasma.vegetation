@@ -2,6 +2,7 @@
 
 #include <Core/World/Component.h>
 #include <Core/World/ComponentManager.h>
+#include <Foundation/Containers/HashTable.h>
 #include <VegetationPlugin/Components/VegetationLayerData.h>
 #include <VegetationPlugin/Grass/GrassCoverageData.h>
 #include <VegetationPlugin/VegetationDeclarations.h>
@@ -75,12 +76,23 @@ public:
 
 private:
   void OnMsgTransformChanged(plMsgTransformChanged& msg);
+
+  /// Brings the world module up to date with the parsed data. Instances register in chunks of one type and one
+  /// vegetation cell; only chunks whose content changed are removed and added again, so a stroke or a fill touches the
+  /// cells it reached, not the whole layer.
   void Register();
   void Unregister();
 
+  /// One registered chunk: the instances of one type inside one vegetation cell.
+  struct Chunk
+  {
+    plUInt64 m_uiContentHash = 0;
+    plVegetationTileHandle m_hTile;
+  };
+
   plDataBuffer m_Data;
   plVegetationLayerData m_Parsed;
-  plHybridArray<plVegetationTileHandle, 4> m_Tiles;
+  plHashTable<plUInt64, Chunk> m_Chunks; ///< by type and cell
   bool m_bDirty = false;
 
   plDataBuffer m_GrassCoverage;

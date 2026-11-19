@@ -47,6 +47,9 @@ PL_PLUGIN_ON_LOADED()
 
   plVegetationTypeActions::RegisterActions();
 
+  plPropertyMetaState::GetSingleton()->m_Events.AddEventHandler(plVegetationTypeAssetProperties::PropertyMetaStateEventHandler);
+  plPropertyMetaState::GetSingleton()->m_ContainerEvents.AddEventHandler(plVegetationTypeAssetProperties::ContainerMetaStateEventHandler);
+
   // Vegetation Type asset window
   {
     plActionMapManager::RegisterActionMap("VegetationTypeAssetMenuBar").IgnoreResult();
@@ -92,6 +95,9 @@ PL_PLUGIN_ON_UNLOADED()
   plVegetationPanelManager::Shutdown();
   plVegetationPaintActions::UnregisterActions();
   plGrassTypeActions::UnregisterActions();
+
+  plPropertyMetaState::GetSingleton()->m_ContainerEvents.RemoveEventHandler(plVegetationTypeAssetProperties::ContainerMetaStateEventHandler);
+  plPropertyMetaState::GetSingleton()->m_Events.RemoveEventHandler(plVegetationTypeAssetProperties::PropertyMetaStateEventHandler);
   plVegetationTypeActions::UnregisterActions();
 
   UnregisterIconFolder();

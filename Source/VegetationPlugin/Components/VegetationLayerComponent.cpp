@@ -90,7 +90,6 @@ void plVegetationLayerComponent::Update()
     return;
 
   m_bDirty = false;
-  Unregister();
   Register();
 }
 
@@ -174,7 +173,10 @@ void plVegetationLayerComponent::OnMsgTransformChanged(plMsgTransformChanged& ms
 void plVegetationLayerComponent::Register()
 {
   if (m_Parsed.IsEmpty())
+  {
+    Unregister();
     return;
+  }
 
   plVegetationWorldModule* pModule = GetWorld()->GetOrCreateModule<plVegetationWorldModule>();
   if (pModule == nullptr)
@@ -183,47 +185,106 @@ void plVegetationLayerComponent::Register()
   const plTransform ownerTransform = GetOwner()->GetGlobalTransform();
   const float fOwnerScale = ownerTransform.m_vScale.GetLength() / plMath::Sqrt(3.0f);
 
-  plDynamicArray<plVegetationInstanceDesc> descs;
+  // The owner transform is part of every chunk's content: moving the layer re-registers all of it.
+  const plUInt64 uiTransformHash = plHashingUtils::xxHash64(&ownerTransform, sizeof(plTransform));
 
-  for (const auto& entry : m_Parsed.m_Entries)
+  struct Bucket
   {
+    plUInt64 m_uiKey = 0;
+    plUInt32 m_uiEntry = 0;
+    plUInt64 m_uiHash = 0;
+    plDynamicArray<plVegetationInstanceDesc> m_Descs;
+  };
+
+  plDynamicArray<Bucket> buckets;
+  plHashTable<plUInt64, plUInt32> bucketOfKey;
+
+  for (plUInt32 e = 0; e < m_Parsed.m_Entries.GetCount(); ++e)
+  {
+    const auto& entry = m_Parsed.m_Entries[e];
     if (entry.m_sType.IsEmpty() || entry.m_Instances.IsEmpty())
       continue;
 
-    descs.Clear();
-    descs.Reserve(entry.m_Instances.GetCount());
+    const plUInt64 uiTypeHash = plHashingUtils::StringHash(entry.m_sType.GetView());
 
     for (const auto& inst : entry.m_Instances)
     {
-      plVegetationInstanceDesc& desc = descs.ExpandAndGetRef();
-      desc.m_vPosition = ownerTransform.TransformPosition(inst.m_vPosition);
+      const plVec3 vPosition = ownerTransform.TransformPosition(inst.m_vPosition);
+
+      // the world module's cell of the instance
+      const plInt32 iCell[2] = {static_cast<plInt32>(plMath::Floor(vPosition.x / plVegetationCellSize)), static_cast<plInt32>(plMath::Floor(vPosition.y / plVegetationCellSize))};
+      const plUInt64 uiKey = plHashingUtils::xxHash64(iCell, sizeof(iCell), uiTypeHash);
+
+      plUInt32 uiBucket = 0;
+      if (!bucketOfKey.TryGetValue(uiKey, uiBucket))
+      {
+        uiBucket = buckets.GetCount();
+        bucketOfKey.Insert(uiKey, uiBucket);
+
+        Bucket& bucket = buckets.ExpandAndGetRef();
+        bucket.m_uiKey = uiKey;
+        bucket.m_uiEntry = e;
+        bucket.m_uiHash = uiTransformHash ^ uiTypeHash;
+      }
+
+      Bucket& bucket = buckets[uiBucket];
+
+      // position, rotation and scale are contiguous; the padding after the colour seed is not hashed
+      bucket.m_uiHash = plHashingUtils::xxHash64(&inst.m_vPosition, sizeof(plVec3) + sizeof(plQuat) + sizeof(float), bucket.m_uiHash);
+      bucket.m_uiHash = plHashingUtils::xxHash64(&inst.m_uiColorSeed, sizeof(plUInt8), bucket.m_uiHash);
+
+      plVegetationInstanceDesc& desc = bucket.m_Descs.ExpandAndGetRef();
+      desc.m_vPosition = vPosition;
       desc.m_qRotation = ownerTransform.m_qRotation * inst.m_qRotation;
       desc.m_fScale = inst.m_fScale * fOwnerScale;
       desc.m_uiColorSeed = inst.m_uiColorSeed;
     }
+  }
 
-    const plVegetationTileHandle hTile = pModule->AddInstances(entry.m_sType, descs, plVegetationSource::Painted);
-    if (!hTile.IsInvalidated())
-    {
-      m_Tiles.PushBack(hTile);
-    }
+  // chunks that are gone or changed leave first
+  plHybridArray<plUInt64, 64> removed;
+  for (auto it = m_Chunks.GetIterator(); it.IsValid(); ++it)
+  {
+    plUInt32 uiBucket = 0;
+    if (bucketOfKey.TryGetValue(it.Key(), uiBucket) && buckets[uiBucket].m_uiHash == it.Value().m_uiContentHash)
+      continue;
+
+    pModule->RemoveTile(it.Value().m_hTile);
+    removed.PushBack(it.Key());
+  }
+
+  for (plUInt64 uiKey : removed)
+    m_Chunks.Remove(uiKey);
+
+  for (const Bucket& bucket : buckets)
+  {
+    if (m_Chunks.Contains(bucket.m_uiKey))
+      continue;
+
+    const plVegetationTileHandle hTile = pModule->AddInstances(m_Parsed.m_Entries[bucket.m_uiEntry].m_sType, bucket.m_Descs, plVegetationSource::Painted);
+    if (hTile.IsInvalidated())
+      continue;
+
+    Chunk& chunk = m_Chunks[bucket.m_uiKey];
+    chunk.m_uiContentHash = bucket.m_uiHash;
+    chunk.m_hTile = hTile;
   }
 }
 
 void plVegetationLayerComponent::Unregister()
 {
-  if (m_Tiles.IsEmpty())
+  if (m_Chunks.IsEmpty())
     return;
 
   if (plVegetationWorldModule* pModule = GetWorld()->GetModule<plVegetationWorldModule>())
   {
-    for (plVegetationTileHandle hTile : m_Tiles)
+    for (auto it = m_Chunks.GetIterator(); it.IsValid(); ++it)
     {
-      pModule->RemoveTile(hTile);
+      pModule->RemoveTile(it.Value().m_hTile);
     }
   }
 
-  m_Tiles.Clear();
+  m_Chunks.Clear();
 }
 
 PL_STATICLINK_FILE(VegetationPlugin, VegetationPlugin_Components_VegetationLayerComponent);

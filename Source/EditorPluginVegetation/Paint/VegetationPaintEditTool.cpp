@@ -116,6 +116,13 @@ void plVegetationPaintEditTool::SetPickTransparent(bool bEnable)
 
 void plVegetationPaintEditTool::BrushEventHandler(const plVegetationBrushEvent& e)
 {
+  if (e.m_Type == plVegetationBrushEvent::Type::FillLayerRequested)
+  {
+    if (e.m_pDocument == GetDocument())
+      FillLayer();
+    return;
+  }
+
   if (e.m_Type != plVegetationBrushEvent::Type::SettingsChanged || !IsActive())
     return;
 
@@ -226,7 +233,7 @@ bool plVegetationPaintEditTool::LoadLayerData(plVegetationLayerData& out_data, p
   return true;
 }
 
-void plVegetationPaintEditTool::BeginStroke(plVegetationBrushMode::Enum mode)
+void plVegetationPaintEditTool::BeginStroke(plVegetationBrushMode::Enum mode, bool bRemoveClearings)
 {
   if (m_bStrokeActive)
     EndStroke();
@@ -252,6 +259,7 @@ void plVegetationPaintEditTool::BeginStroke(plVegetationBrushMode::Enum mode)
   m_bStrokeDirty = false;
   m_bStrokeGrassDirty = false;
   m_StrokeMode = mode;
+  m_bStrokeRemoveClearings = bRemoveClearings && mode == plVegetationBrushMode::Clearing;
   ++m_uiStrokeId;
   m_uiNextSegment = 0;
   m_uiPendingSegments = 0;
@@ -325,8 +333,131 @@ void plVegetationPaintEditTool::StrokeSegment(const plVec3& vCenter, const plVec
       break;
     }
 
+    case plVegetationBrushMode::Clearing:
+    {
+      // Editor side like Erase; the engine repeats the stamp on its stroke preview.
+      plVegetationStrokeRequest request;
+      FillRequest(request, m_StrokeMode, vCenter, vNormal);
+      request.m_bRemoveClearings = m_bStrokeRemoveClearings;
+      request.m_bStrokePreview = true;
+      request.m_bMirrorOnly = true;
+
+      if (request.ApplyClearingStamp(m_StrokeData))
+      {
+        m_bStrokeDirty = true;
+      }
+
+      m_bStrokePreviewSent = true;
+      SendRequest(request);
+      break;
+    }
+
     default:
       break;
+  }
+}
+
+void plVegetationPaintEditTool::FillRect(const plVec3& vCorner0, const plVec3& vCorner1)
+{
+  const auto& s = plVegetationBrush::s_Settings;
+  if (s.GetSelectedPlantCount() == 0)
+  {
+    plLog::Warning("Vegetation: check at least one plant type in the Vegetation panel to fill. Grass Types are painted as coverage.");
+    return;
+  }
+
+  const plVec3 vMin = vCorner0.CompMin(vCorner1);
+  const plVec3 vMax = vCorner0.CompMax(vCorner1);
+  if (vMax.x - vMin.x < 0.5f || vMax.y - vMin.y < 0.5f)
+    return;
+
+  BeginStroke(plVegetationBrushMode::Fill);
+  if (!m_bStrokeActive)
+    return;
+
+  plVegetationStrokeRequest request;
+  FillRequest(request, plVegetationBrushMode::Fill, 0.5f * (vMin + vMax), plVec3(0, 0, 1));
+  request.m_uiSegment = m_uiNextSegment++;
+  request.m_vFillMin = vMin;
+  request.m_vFillMax = vMax;
+  request.m_fTreesPerHectare = s.m_fTreesPerHectare;
+  request.m_GrassTypes.Clear(); // Fill places plants only
+  request.m_uiSeed = plHashingUtils::xxHash32(&vMin, sizeof(plVec3), plHashingUtils::xxHash32(&vMax, sizeof(plVec3))) ^ m_uiStrokeId;
+
+  ++m_uiPendingSegments;
+  SendRequest(request);
+
+  // commits as one undo step once the engine answered
+  EndStroke();
+}
+
+void plVegetationPaintEditTool::FillLayer()
+{
+  plVegetationLayerData data;
+  plGrassCoverageData grass;
+  plTransform layerTransform;
+  plUuid layer;
+  if (!LoadLayerData(data, grass, layerTransform, layer))
+  {
+    plLog::Warning("Vegetation: no target layer selected. Pick or create a layer in the Vegetation panel.");
+    return;
+  }
+
+  plBoundingBox bounds = plBoundingBox::MakeInvalid();
+  for (const auto& entry : data.m_Entries)
+  {
+    for (const auto& inst : entry.m_Instances)
+      bounds.ExpandToInclude(layerTransform.TransformPosition(inst.m_vPosition));
+  }
+
+  if (!bounds.IsValid() || bounds.GetHalfExtents().x < 0.25f || bounds.GetHalfExtents().y < 0.25f)
+  {
+    // a layer without plants yet: the square of the Fill extent around the layer object
+    const float fHalf = 0.5f * plMath::Max(plVegetationBrush::s_Settings.m_fFillExtent, 1.0f);
+    const plVec3 vCenter = layerTransform.m_vPosition;
+    bounds = plBoundingBox::MakeFromMinMax(vCenter - plVec3(fHalf, fHalf, 0.0f), vCenter + plVec3(fHalf, fHalf, 0.0f));
+  }
+
+  FillRect(bounds.m_vMin, bounds.m_vMax);
+}
+
+void plVegetationPaintEditTool::GetClearings(plDynamicArray<plVec3>& out_centers, plDynamicArray<float>& out_radii) const
+{
+  out_centers.Clear();
+  out_radii.Clear();
+
+  plVegetationLayerData data;
+  plGrassCoverageData grass;
+  plTransform layerTransform;
+  plUuid layer;
+
+  // during a stroke the stroke data already holds its new clearings
+  const plVegetationLayerData* pData = &m_StrokeData;
+  if (!m_bStrokeActive)
+  {
+    const plDocumentObject* pComponent = GetLayerComponentObject();
+    if (pComponent == nullptr)
+      return;
+
+    const plVariant value = pComponent->GetTypeAccessor().GetValue("Data");
+    if (!value.IsA<plDataBuffer>() || data.FromBuffer(value.Get<plDataBuffer>()).Failed())
+      return;
+
+    layerTransform = GetDocument()->GetGlobalTransform(pComponent->GetParent());
+    pData = &data;
+  }
+  else
+  {
+    layerTransform = m_LayerTransform;
+  }
+
+  const plVec2 vAxisScale = layerTransform.m_vScale.Abs().GetAsVec2();
+  const float fScale = 0.5f * (vAxisScale.x + vAxisScale.y);
+
+  for (const auto& clearing : pData->m_Clearings)
+  {
+    out_centers.PushBack(layerTransform.TransformPosition(plVec3(clearing.m_vCenter.x, clearing.m_vCenter.y, 0.0f)));
+    out_radii.PushBack(clearing.m_fRadius * fScale);
   }
 }
 
@@ -349,10 +480,11 @@ void plVegetationPaintEditTool::FillRequest(plVegetationStrokeRequest& out_reque
   out_request.m_fMaxScale = s.m_fMaxScale;
   out_request.m_fSink = s.m_fSink;
   out_request.m_fMinSpacing = s.m_fMinSpacing;
+  out_request.m_bUseTypeRules = !s.m_bOverrideTypeRules;
   s.FillRequestTypes(out_request.m_Types, out_request.m_Weights);
 
-  // Place stamps plants only; Paint needs the grass types to sample, Erase and Thin to mirror the removal.
-  if (mode != plVegetationBrushMode::Place)
+  // Place and Fill stamp plants only; Paint needs the grass types to sample, Erase and Thin to mirror the removal.
+  if (mode != plVegetationBrushMode::Place && mode != plVegetationBrushMode::Fill && mode != plVegetationBrushMode::Clearing)
   {
     s.FillRequestGrassTypes(out_request.m_GrassTypes);
   }
@@ -557,7 +689,7 @@ void plVegetationPaintEditTool::CommitStroke()
     return;
 
   plCommandHistory* pHistory = GetDocument()->GetCommandHistory();
-  pHistory->StartTransaction("Vegetation Stroke");
+  pHistory->StartTransaction(m_StrokeMode == plVegetationBrushMode::Fill ? "Vegetation Fill" : (m_StrokeMode == plVegetationBrushMode::Clearing ? "Vegetation Clearing" : "Vegetation Stroke"));
 
   if (bPlants)
   {

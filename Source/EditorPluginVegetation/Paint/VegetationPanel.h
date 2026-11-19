@@ -47,6 +47,9 @@ public:
   void RefreshTypes() { OnRefreshTypesClicked(); }
   void ResnapCoverage() { OnResnapClicked(); }
   void ClearCoverage() { OnClearCoverageClicked(); }
+
+  /// \brief Fill Layer: activates the tool if needed and lets it fill the target layer's area.
+  void FillLayer();
   bool CanResnap() const;
   bool CanClearCoverage() const;
   plStringView GetStatistics() const { return m_sStatistics; }

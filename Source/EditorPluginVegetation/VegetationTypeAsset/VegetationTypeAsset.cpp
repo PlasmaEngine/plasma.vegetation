@@ -1,6 +1,9 @@
 #include <EditorPluginVegetation/EditorPluginVegetationPCH.h>
 
 #include <EditorEngineProcessFramework/EngineProcess/EngineProcessMessages.h>
+#include <EditorFramework/Assets/AssetCurator.h>
+#include <Foundation/Utilities/ConversionUtils.h>
+#include <ToolsFoundation/Object/DocumentObjectManager.h>
 #include <EditorPluginVegetation/VegetationTypeAsset/VegetationTypeAsset.h>
 #include <Foundation/Utilities/Progress.h>
 #include <VegetationPlugin/Resources/VegetationTypeResource.h>
@@ -13,6 +16,80 @@ PL_END_DYNAMIC_REFLECTED_TYPE;
 plVegetationTypeAssetDocument::plVegetationTypeAssetDocument(plStringView sDocumentPath)
   : plSimpleAssetDocument<plVegetationTypeAssetProperties>(sDocumentPath, plAssetDocEngineConnection::Simple, true)
 {
+  GetObjectManager()->m_PropertyEvents.AddEventHandler(plMakeDelegate(&plVegetationTypeAssetDocument::PropertyEventHandler, this));
+  plAssetCurator::GetSingleton()->m_Events.AddEventHandler(plMakeDelegate(&plVegetationTypeAssetDocument::AssetCuratorEventHandler, this));
+}
+
+plVegetationTypeAssetDocument::~plVegetationTypeAssetDocument()
+{
+  plAssetCurator::GetSingleton()->m_Events.RemoveEventHandler(plMakeDelegate(&plVegetationTypeAssetDocument::AssetCuratorEventHandler, this));
+  GetObjectManager()->m_PropertyEvents.RemoveEventHandler(plMakeDelegate(&plVegetationTypeAssetDocument::PropertyEventHandler, this));
+}
+
+void plVegetationTypeAssetDocument::InitializeAfterLoading(bool bFirstTimeCreation)
+{
+  SUPER::InitializeAfterLoading(bFirstTimeCreation);
+  UpdateCompositeInfo();
+}
+
+void plVegetationTypeAssetDocument::UpdateCompositeInfo()
+{
+  const plDocumentObject* pRoot = GetObjectManager()->GetRootObject();
+  if (pRoot->GetChildren().IsEmpty())
+    return;
+
+  plDocumentObject* pProperties = pRoot->GetChildren()[0];
+
+  // LOD 0 straight from the object model: the native mirror may not have seen the change yet.
+  plString sMesh;
+  if (pProperties->GetTypeAccessor().GetCount("Lods") > 0)
+  {
+    const plVariant lod = pProperties->GetTypeAccessor().GetValue("Lods", plVariant(0u));
+    if (lod.IsA<plUuid>())
+    {
+      if (const plDocumentObject* pLod = GetObjectManager()->GetObject(lod.Get<plUuid>()))
+      {
+        const plVariant mesh = pLod->GetTypeAccessor().GetValue("Mesh");
+        if (mesh.IsA<plString>())
+          sMesh = mesh.Get<plString>();
+      }
+    }
+  }
+
+  const plVariant current = pProperties->GetTypeAccessor().GetValue("Composite");
+  if (sMesh == m_sCompositeMesh && current.IsA<plString>())
+    return;
+
+  m_sCompositeMesh = sMesh;
+
+  const plString sSummary = plVegetationCompositeInfo::Query(sMesh).GetSummary();
+  if (current.IsA<plString>() && current.Get<plString>() == sSummary)
+    return;
+
+  // Outside the command history on purpose: the summary is derived from the mesh asset and never saved.
+  GetObjectManager()->SetValue(pProperties, "Composite", sSummary).IgnoreResult();
+}
+
+void plVegetationTypeAssetDocument::PropertyEventHandler(const plDocumentObjectPropertyEvent& e)
+{
+  if (e.m_sProperty == "Composite")
+    return;
+
+  UpdateCompositeInfo();
+}
+
+void plVegetationTypeAssetDocument::AssetCuratorEventHandler(const plAssetCuratorEvent& e)
+{
+  if (e.m_Type != plAssetCuratorEvent::Type::AssetUpdated || m_sCompositeMesh.IsEmpty())
+    return;
+
+  plUuid guid;
+  if (!plConversionUtils::TryConvertStringToUuid(m_sCompositeMesh, guid) || guid != e.m_AssetGuid)
+    return;
+
+  // the composite was transformed again: its statistics changed
+  m_sCompositeMesh.Clear();
+  UpdateCompositeInfo();
 }
 
 plStatus plVegetationTypeAssetDocument::WriteVegetationType(plStreamWriter& inout_stream) const

@@ -94,6 +94,18 @@ void plVegetationPlacementSettings::Load(plStreamReader& inout_stream)
   inout_stream >> m_fHueVariation;
 }
 
+void plVegetationPlacementSettings::SaveExtra(plStreamWriter& inout_stream) const
+{
+  inout_stream << m_fDensityWeight;
+  inout_stream << m_fClearingAvoidance;
+}
+
+void plVegetationPlacementSettings::LoadExtra(plStreamReader& inout_stream)
+{
+  inout_stream >> m_fDensityWeight;
+  inout_stream >> m_fClearingAvoidance;
+}
+
 void plVegetationRenderSettings::Save(plStreamWriter& inout_stream) const
 {
   inout_stream << m_fCullDistance;
@@ -132,7 +144,7 @@ void plVegetationRayTracingSettings::Load(plStreamReader& inout_stream)
 
 void plVegetationTypeResourceDescriptor::Save(plStreamWriter& inout_stream) const
 {
-  const plUInt8 uiVersion = 2;
+  const plUInt8 uiVersion = 3;
   inout_stream << uiVersion;
 
   inout_stream << m_Lods.GetCount();
@@ -153,6 +165,9 @@ void plVegetationTypeResourceDescriptor::Save(plStreamWriter& inout_stream) cons
   m_Placement.Save(inout_stream);
   m_Render.Save(inout_stream);
   m_RayTracing.Save(inout_stream);
+
+  // version 3
+  m_Placement.SaveExtra(inout_stream);
 }
 
 plResult plVegetationTypeResourceDescriptor::Load(plStreamReader& inout_stream)
@@ -160,7 +175,7 @@ plResult plVegetationTypeResourceDescriptor::Load(plStreamReader& inout_stream)
   plUInt8 uiVersion = 0;
   inout_stream >> uiVersion;
 
-  if (uiVersion < 1 || uiVersion > 2)
+  if (uiVersion < 1 || uiVersion > 3)
   {
     plLog::Error("Unknown vegetation type version {}", uiVersion);
     return PL_FAILURE;
@@ -187,6 +202,10 @@ plResult plVegetationTypeResourceDescriptor::Load(plStreamReader& inout_stream)
 
   m_Wind.Load(inout_stream);
   m_Touch.Load(inout_stream);
+
+  // The version 3 fields of the placement keep their defaults for older files: every type weighs the same and no type
+  // keeps a distance from clearings, which is how placement behaved before they existed.
+  m_Placement = plVegetationPlacementSettings();
   m_Placement.Load(inout_stream);
   m_Render.Load(inout_stream);
 
@@ -194,6 +213,9 @@ plResult plVegetationTypeResourceDescriptor::Load(plStreamReader& inout_stream)
   m_RayTracing = plVegetationRayTracingSettings();
   if (uiVersion >= 2)
     m_RayTracing.Load(inout_stream);
+
+  if (uiVersion >= 3)
+    m_Placement.LoadExtra(inout_stream);
 
   return PL_SUCCESS;
 }

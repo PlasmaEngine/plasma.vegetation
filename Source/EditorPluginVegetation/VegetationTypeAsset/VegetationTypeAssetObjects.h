@@ -7,6 +7,29 @@
 #include <Foundation/Strings/String.h>
 #include <VegetationPlugin/Resources/VegetationTypeResource.h>
 
+struct plPropertyMetaStateEvent;
+struct plContainerElementMetaStateEvent;
+class plDocumentObject;
+
+/// \brief What the editor knows about a foliage composite mesh asset without the engine process: whether the asset is
+/// one (its document type) and the numbers its last transform wrote beside its outputs.
+struct PL_EDITORPLUGINVEGETATION_DLL plVegetationCompositeInfo
+{
+  bool m_bComposite = false;
+  bool m_bHasStats = false; ///< false until the composite has been transformed by this engine version
+  plUInt32 m_uiParts = 0;
+  plUInt32 m_uiPartInstances = 0;
+  plUInt32 m_uiBones = 0;
+  plUInt32 m_uiMergedTriangles = 0;
+  float m_fSwitchError = 0.0f;
+  float m_fRadius = 0.0f;
+
+  /// \brief Looks up the mesh asset (guid string) in the asset curator; reads the build statistics of a composite.
+  static plVegetationCompositeInfo Query(plStringView sMeshGuid);
+
+  /// \brief One line for the property grid.
+  plString GetSummary() const;
+};
 /// One level of detail: a mesh and the screen-height fraction at which it turns on.
 struct plVegetationTypeAssetLod
 {
@@ -51,6 +74,8 @@ struct plVegetationTypeAssetPlacement
   float m_fMinSpacing = 0.4f;
   plString m_sColorGradient;
   float m_fHueVariation = 0.05f;
+  float m_fDensityWeight = 1.0f;
+  float m_fClearingAvoidance = 0.0f;
 };
 
 PL_DECLARE_REFLECTABLE_TYPE(PL_NO_LINKAGE, plVegetationTypeAssetPlacement);
@@ -89,7 +114,13 @@ public:
   /// \brief Copies the document properties into the runtime descriptor written at transform time.
   void FillDescriptor(plVegetationTypeResourceDescriptor& out_desc) const;
 
+  /// \brief Hides what does nothing for a composite tree (LOD 1-3, crossfade, impostor) and shows the composite
+  /// summary instead. Registered with plPropertyMetaState by the plugin.
+  static void PropertyMetaStateEventHandler(plPropertyMetaStateEvent& e);
+  static void ContainerMetaStateEventHandler(plContainerElementMetaStateEvent& e);
+
   plHybridArray<plVegetationTypeAssetLod, 4> m_Lods;
+  plString m_sComposite; ///< Read-only summary of a composite LOD 0; not saved, the document keeps it current.
   plHybridArray<plString, 4> m_Materials;
   plVegetationTypeAssetWind m_Wind;
   plVegetationTypeAssetTouch m_Touch;

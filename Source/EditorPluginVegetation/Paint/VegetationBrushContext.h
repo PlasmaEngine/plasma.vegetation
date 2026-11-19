@@ -35,12 +35,19 @@ private:
   bool UpdateCursor(const plVec2I32& vViewPos);
   void UpdateRing();
 
+  /// \brief Fill and Clearing modes outline the target layer's clearings near the cursor.
+  void UpdateClearingOutlines();
+
   /// \brief Ctrl turns any stroke into Erase: the ring takes the danger colour and the status bar says Erase.
   void SetEraseHeld(bool bHeld);
 
   plVegetationPaintEditTool* m_pTool = nullptr;
   plEngineGizmoHandle m_hRing;
   plEngineGizmoHandle m_hInnerRing;
+  plEngineGizmoHandle m_hClearings;
+
+  bool m_bFillDragging = false; ///< Fill: a rectangle is being dragged from m_vFillStart to the cursor
+  plVec3 m_vFillStart = plVec3::MakeZero();
 
   bool m_bHasSurface = false;
   plVec3 m_vCursor = plVec3::MakeZero();
