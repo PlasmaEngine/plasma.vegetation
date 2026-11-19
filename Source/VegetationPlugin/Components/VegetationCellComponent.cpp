@@ -8,10 +8,13 @@
 #include <RendererCore/Pipeline/View.h>
 #include <RendererCore/RenderWorld/RenderWorld.h>
 #include <RendererCore/Scene/SceneRegistry.h>
+#include <RendererCore/Wind/FoliageBonePool.h>
 #include <RendererFoundation/Device/Device.h>
 #include <RendererFoundation/Resources/DynamicBuffer.h>
 #include <VegetationPlugin/Components/VegetationCellComponent.h>
 #include <VegetationPlugin/World/VegetationWorldModule.h>
+
+#include <Shaders/Vegetation/FoliageBonesData.h>
 
 // clang-format off
 PL_BEGIN_COMPONENT_TYPE(plVegetationCellComponent, 1, plComponentMode::Static)
@@ -71,6 +74,15 @@ namespace
     {
       plLog::Info("Vegetation type '{}' is not in the ray tracing scene (Affects GI: {}, radius {} m, height {} m).", type.GetResourceIdOrDescription(), szMode, plArgF(type.GetBoundingRadius(), 2), plArgF(type.GetBoundingHeight(), 2));
     }
+  }
+
+  /// Vegetation.Composite.SwitchErrorPixels, owned by plFoliageCompositeComponent, so cells switch where it does.
+  float GetCompositeSwitchErrorPixels()
+  {
+    static plCVar* s_pCVar = plCVar::FindCVarByName("Vegetation.Composite.SwitchErrorPixels");
+    if (s_pCVar != nullptr && s_pCVar->GetType() == plCVarType::Float)
+      return static_cast<plCVarFloat*>(s_pCVar)->GetValue();
+    return 1.0f;
   }
 
   /// The instance colour of every colour seed of a type; white without a gradient.
@@ -201,10 +213,36 @@ void plVegetationCellComponent::ReleaseBatches(const plRenderDataManager* pRende
         *pBatch = LodBatch();
       }
     }
+
+    ReleaseCompositeSet(pRenderDataManager, state.m_Composite.m_Main);
+    ReleaseCompositeSet(pRenderDataManager, state.m_Composite.m_Shadow);
   }
 
   m_GroupStates.Clear();
   m_uiSyncedVersion = 0xFFFFFFFF;
+}
+
+void plVegetationCellComponent::ReleaseCompositeBatch(const plRenderDataManager* pRenderDataManager, CompositeBatch& ref_batch) const
+{
+  if (pRenderDataManager != nullptr)
+  {
+    if (!ref_batch.m_Offset.IsInvalidated())
+      pRenderDataManager->DeleteInstanceData(ref_batch.m_Offset);
+
+    if (!ref_batch.m_BonesOffset.IsInvalidated() && m_uiFoliageBonesDataIndex != 0xFFFFFFFF)
+      pRenderDataManager->DeleteCustomInstanceData(m_uiFoliageBonesDataIndex, ref_batch.m_BonesOffset);
+  }
+
+  ref_batch = CompositeBatch();
+}
+
+void plVegetationCellComponent::ReleaseCompositeSet(const plRenderDataManager* pRenderDataManager, CompositeSet& ref_set) const
+{
+  for (CompositeBatch& batch : ref_set.m_Parts)
+    ReleaseCompositeBatch(pRenderDataManager, batch);
+  ReleaseCompositeBatch(pRenderDataManager, ref_set.m_Merged);
+
+  ref_set = CompositeSet();
 }
 
 plResult plVegetationCellComponent::GetLocalBounds(plBoundingBoxSphere& ref_bounds, bool& ref_bAlwaysVisible, plMsgUpdateLocalBounds& ref_msg)
@@ -278,7 +316,7 @@ void plVegetationCellComponent::OnMsgExtractRenderData(plMsgExtractRenderData& m
 
     if (bMain)
     {
-      pModule->ReportMainCamera(vCameraPosition, fTanHalfFov);
+      pModule->ReportMainCamera(vCameraPosition, fTanHalfFov, viewport.height);
     }
   }
 
@@ -286,6 +324,7 @@ void plVegetationCellComponent::OnMsgExtractRenderData(plMsgExtractRenderData& m
   // Keep batch allocation, refill and emitted offsets together so no view observes a
   // partially rebuilt set or races the version synchronization.
   PL_LOCK(m_BatchMutex);
+  m_uiFoliageBonesDataIndex = pModule->GetFoliageBonesDataIndex();
   SyncGroupStates(msg.m_pRenderDataManager);
 
   for (plUInt32 g = 0; g < m_pCell->m_Groups.GetCount(); ++g)
@@ -299,6 +338,15 @@ void plVegetationCellComponent::BuildBatches(const plVegetationCellGroup& group,
   plResourceLock<plVegetationTypeResource> pType(group.m_hType, plResourceAcquireMode::AllowLoadingFallback_NeverFail);
   if (pType.GetAcquireResult() != plResourceAcquireResult::Final || pType->GetLodCount() == 0)
     return;
+
+  // Composites draw their parts and merged mesh; until LOD 0 has loaded the type is drawn as any other.
+  bool bCompositeKnown = false;
+  if (const plVegetationCompositeInfo* pComposite = pType->GetCompositeInfo(bCompositeKnown))
+  {
+    if (const plVegetationWorldModule* pModule = GetWorld()->GetModuleReadOnly<plVegetationWorldModule>())
+      BuildCompositeBatches(group, state.m_Composite, *pType.GetPointer(), *pComposite, bShadow, *pModule, msg);
+    return;
+  }
 
   const auto& render = pType->GetDescriptor().m_Render;
   if (bShadow && !render.m_bCastShadows)
@@ -481,6 +529,341 @@ void plVegetationCellComponent::BuildBatches(const plVegetationCellGroup& group,
   }
 }
 
+void plVegetationCellComponent::BuildCompositeBatches(const plVegetationCellGroup& group, CompositeState& ref_state, const plVegetationTypeResource& type, const plVegetationCompositeInfo& info, bool bShadow, const plVegetationWorldModule& module, plMsgExtractRenderData& msg) const
+{
+  const auto& render = type.GetDescriptor().m_Render;
+  if (bShadow && !render.m_bCastShadows)
+    return;
+
+  // A reloaded type may name other part meshes.
+  if (ref_state.m_uiTypeChangeCounter != type.GetCurrentResourceChangeCounter())
+  {
+    ReleaseCompositeSet(msg.m_pRenderDataManager, ref_state.m_Main);
+    ReleaseCompositeSet(msg.m_pRenderDataManager, ref_state.m_Shadow);
+    ref_state.m_Split.Reset();
+    ref_state.m_uiTypeChangeCounter = type.GetCurrentResourceChangeCounter();
+  }
+
+  // Once per frame, from the main camera, for every view: shadow views and the main view see the same trees as parts.
+  const plUInt64 uiFrame = plRenderWorld::GetFrameCounter();
+  if (ref_state.m_uiFrame != uiFrame)
+  {
+    ref_state.m_uiFrame = uiFrame;
+
+    const float fDistanceScale = plMath::Max(cvar_VegetationDrawDistanceScale.GetValue(), 0.0f);
+
+    plVegetationCompositeThresholds thresholds;
+    thresholds.m_fSwitchDistance = plVegetationCompositeInfo::ComputeSwitchDistance(info.m_fSwitchError, 1.0f, module.GetMainCameraViewportHeight(), module.GetMainCameraTanHalfFov(), GetCompositeSwitchErrorPixels());
+    thresholds.m_fCullDistance = render.m_fCullDistance * fDistanceScale;
+    thresholds.m_fShadowCullDistance = render.m_bCastShadows ? plMath::Min(thresholds.m_fCullDistance, render.m_fShadowCullDistance * fDistanceScale) : -1.0f;
+    thresholds.m_fDensity = plMath::Clamp(cvar_VegetationDensityScale.GetValue(), 0.0f, 1.0f);
+
+    if (ref_state.m_Split.Update(group.m_Instances, module.GetMainCameraPosition(), thresholds))
+    {
+      ref_state.m_Main.m_bDirty = true;
+      ref_state.m_Shadow.m_bDirty = true;
+    }
+  }
+
+  CompositeSet& set = bShadow ? ref_state.m_Shadow : ref_state.m_Main;
+
+  bool bBonesStale = set.m_bBonesPending || set.m_uiBonesGeneration != group.m_uiBonesGeneration;
+  if (set.m_bDirty)
+  {
+    FillCompositeSet(group, set, ref_state.m_Split.GetStates(), type, info, bShadow, msg);
+    bBonesStale = true;
+  }
+
+  if (bBonesStale)
+    WriteCompositeBones(group, set, msg);
+
+  const plBoundingBoxSphere cellBounds = GetOwner()->GetGlobalBounds();
+  const plMeshResourceHandle& hMergedMesh = type.GetLodMesh(0);
+
+  for (plUInt32 p = 0; p < set.m_Parts.GetCount() && p < info.m_PartMeshes.GetCount(); ++p)
+    EmitCompositeBatch(set.m_Parts[p], info.m_PartMeshes[p], type, hMergedMesh, cellBounds, msg);
+
+  EmitCompositeBatch(set.m_Merged, hMergedMesh, type, hMergedMesh, cellBounds, msg);
+}
+
+void plVegetationCellComponent::FillCompositeSet(const plVegetationCellGroup& group, CompositeSet& ref_set, plArrayPtr<const plUInt8> states, const plVegetationTypeResource& type, const plVegetationCompositeInfo& info, bool bShadow, plMsgExtractRenderData& msg) const
+{
+  ref_set.m_bDirty = false;
+
+  const plUInt32 uiPartCount = info.m_PartMeshes.GetCount();
+  ref_set.m_Parts.SetCount(uiPartCount);
+
+  // Part meshes: their reach around the placement origin, and whether they can be drawn yet. Trees whose parts are still
+  // loading show the merged mesh meanwhile, and the set is filled again next frame.
+  plHybridArray<float, 8> partRadius;
+  plHybridArray<plUInt32, 8> partPlacements;
+  partRadius.SetCount(uiPartCount);
+  partPlacements.SetCount(uiPartCount);
+  bool bPartsReady = true;
+  for (plUInt32 p = 0; p < uiPartCount; ++p)
+  {
+    partRadius[p] = 0.0f;
+    partPlacements[p] = 0;
+    if (!info.m_PartMeshes[p].IsValid())
+      continue;
+
+    plResourceLock<plMeshResource> pPart(info.m_PartMeshes[p], plResourceAcquireMode::AllowLoadingFallback_NeverFail);
+    if (pPart.GetAcquireResult() == plResourceAcquireResult::Final)
+    {
+      const plBoundingBoxSphere& bounds = pPart->GetBounds();
+      partRadius[p] = bounds.IsValid() ? bounds.m_vCenter.GetLength() + bounds.m_fSphereRadius : 0.0f;
+    }
+    else if (pPart.GetAcquireResult() == plResourceAcquireResult::LoadingFallback)
+    {
+      bPartsReady = false;
+    }
+  }
+  for (const plFoliageCompositeInstance& placement : info.m_Instances)
+  {
+    if (placement.m_uiPart < uiPartCount)
+      ++partPlacements[placement.m_uiPart];
+  }
+
+  if (!bPartsReady)
+    ref_set.m_bDirty = true;
+
+  // Counts first, so every batch is allocated once.
+  plUInt32 uiPartTrees = 0;
+  plUInt32 uiMergedTrees = 0;
+  for (plUInt32 i = 0; i < states.GetCount(); ++i)
+  {
+    const plUInt8 uiState = states[i];
+    if (bShadow && (uiState & plVegetationCompositeTreeState::CastsShadow) == 0)
+      continue;
+
+    const plUInt8 uiMain = uiState & plVegetationCompositeTreeState::MainMask;
+    if (uiMain == plVegetationCompositeTreeState::Parts && bPartsReady)
+      ++uiPartTrees;
+    else if (uiMain != plVegetationCompositeTreeState::Hidden)
+      ++uiMergedTrees;
+  }
+
+  auto Allocate = [&](CompositeBatch& ref_batch, plUInt32 uiCount) -> plArrayPtr<plPerInstanceData>
+  {
+    ref_batch.m_uiCount = 0;
+    ref_batch.m_Trees.Clear();
+    if (uiCount == 0)
+      return {};
+
+    // Capacity grows to what was needed; the allocation survives smaller counts.
+    const plUInt32 uiCapacity = plMath::Max(uiCount, ref_batch.m_uiCapacity);
+    if (!ref_batch.m_Offset.IsInvalidated() && ref_batch.m_uiCapacity < uiCapacity)
+    {
+      msg.m_pRenderDataManager->DeleteInstanceData(ref_batch.m_Offset);
+      ref_batch.m_Offset = plInstanceDataOffset();
+    }
+
+    plArrayPtr<plPerInstanceData> data = msg.m_pRenderDataManager->GetOrCreateInstanceData(this, true, ref_batch.m_hBuffer, ref_batch.m_Offset, uiCapacity);
+    if (data.GetCount() < uiCount)
+      return {};
+
+    ref_batch.m_uiCapacity = uiCapacity;
+    ref_batch.m_uiCount = uiCount;
+    ref_batch.m_Trees.SetCountUninitialized(uiCount);
+    return data;
+  };
+
+  plHybridArray<plArrayPtr<plPerInstanceData>, 8> partData;
+  partData.SetCount(uiPartCount);
+  for (plUInt32 p = 0; p < uiPartCount; ++p)
+    partData[p] = Allocate(ref_set.m_Parts[p], info.m_PartMeshes[p].IsValid() ? uiPartTrees * partPlacements[p] : 0);
+  plArrayPtr<plPerInstanceData> mergedData = Allocate(ref_set.m_Merged, uiMergedTrees);
+
+  plColor seedColors[256];
+  ResolveSeedColors(type, seedColors);
+
+  const float fMergedRadius = type.GetBoundingRadius();
+  const plUInt32 uiOwnerId = GetUniqueIdForRendering();
+  plHybridArray<plUInt32, 8> partCursor;
+  partCursor.SetCount(uiPartCount);
+  for (plUInt32 p = 0; p < uiPartCount; ++p)
+    partCursor[p] = 0;
+  plUInt32 uiMergedCursor = 0;
+
+  for (plUInt32 i = 0; i < states.GetCount(); ++i)
+  {
+    const plUInt8 uiState = states[i];
+    if (bShadow && (uiState & plVegetationCompositeTreeState::CastsShadow) == 0)
+      continue;
+
+    plUInt8 uiMain = uiState & plVegetationCompositeTreeState::MainMask;
+    if (uiMain == plVegetationCompositeTreeState::Hidden)
+      continue;
+    if (!bPartsReady)
+      uiMain = plVegetationCompositeTreeState::Merged;
+
+    const plVegetationCellInstance& inst = group.m_Instances[i];
+
+    plTransform tree;
+    tree.m_vPosition = inst.m_vPosition;
+    tree.m_qRotation = inst.m_qRotation;
+    tree.m_vScale.Set(inst.m_fScale);
+
+    const plColor color = seedColors[inst.m_uiColorSeed];
+    const plUInt32 uiSeed = plHashingUtils::xxHash32(&inst.m_vPosition, sizeof(plVec3)) ^ inst.m_uiColorSeed;
+
+    if (uiMain == plVegetationCompositeTreeState::Merged)
+    {
+      if (uiMergedCursor >= ref_set.m_Merged.m_uiCount)
+        continue;
+
+      // CustomData as the other types write it, with the LOD crossfade off. The merged mesh's bones come from its
+      // vertices (TexCoord1), so Wind stays zero.
+      const float fRadius = fMergedRadius * inst.m_fScale;
+      plRenderDataManager::FillPerInstanceData(mergedData[uiMergedCursor], nullptr, tree, uiOwnerId, color, plVec4(0.0f, 1.0e9f, fRadius, 0.0f), fRadius, uiSeed);
+      ref_set.m_Merged.m_Trees[uiMergedCursor] = i;
+      ++uiMergedCursor;
+      continue;
+    }
+
+    for (plUInt32 j = 0; j < info.m_Instances.GetCount(); ++j)
+    {
+      const plFoliageCompositeInstance& placement = info.m_Instances[j];
+      const plUInt32 p = placement.m_uiPart;
+      if (p >= uiPartCount || partCursor[p] >= ref_set.m_Parts[p].m_uiCount)
+        continue;
+
+      // The part's reach in the composite's space, grown by how far its bones can carry it.
+      const plVec3 vPlacementScale = placement.m_Transform.m_vScale;
+      const float fLocalRadius = partRadius[p] * plMath::Max(plMath::Abs(vPlacementScale.x), plMath::Abs(vPlacementScale.y), plMath::Abs(vPlacementScale.z));
+      const float fRadius = (fLocalRadius + info.m_InstanceSway[j] + fLocalRadius * info.m_InstanceSwayPerMetre[j]) * inst.m_fScale;
+
+      plPerInstanceData& data = partData[p][partCursor[p]];
+      plRenderDataManager::FillPerInstanceData(data, nullptr, plTransform::MakeGlobalTransform(tree, placement.m_Transform), uiOwnerId, color, plVec4(0.0f, 1.0e9f, fRadius, 0.0f), fRadius, uiSeed);
+      // Parts without a bone of their own keep their vertex bones: an all-zero Wind.
+      data.Wind = placement.EncodeBones();
+
+      ref_set.m_Parts[p].m_Trees[partCursor[p]] = i;
+      ++partCursor[p];
+    }
+  }
+
+  // An allocation that failed draws nothing rather than stale instances.
+  ref_set.m_Merged.m_uiCount = uiMergedCursor;
+  for (plUInt32 p = 0; p < uiPartCount; ++p)
+    ref_set.m_Parts[p].m_uiCount = partCursor[p];
+}
+
+void plVegetationCellComponent::WriteCompositeBones(const plVegetationCellGroup& group, CompositeSet& ref_set, plMsgExtractRenderData& msg) const
+{
+  ref_set.m_uiBonesGeneration = group.m_uiBonesGeneration;
+  ref_set.m_bBonesPending = false;
+
+  if (m_uiFoliageBonesDataIndex == 0xFFFFFFFF)
+  {
+    ref_set.m_bBonesPending = true;
+    return;
+  }
+
+  // Each tree's palette location, read from the pool once however many of its instances are drawn.
+  plDynamicArray<plFoliageInstanceBones> treeBones;
+  plDynamicArray<plUInt8> treeRead;
+  treeBones.SetCount(group.m_Instances.GetCount());
+  treeRead.SetCount(group.m_Instances.GetCount());
+
+  auto Write = [&](CompositeBatch& ref_batch, plUInt32 uiFlags)
+  {
+    if (ref_batch.m_uiCount == 0)
+      return;
+
+    const plUInt32 uiCapacity = plMath::Max(ref_batch.m_uiCount, ref_batch.m_uiBonesCapacity);
+    if (!ref_batch.m_BonesOffset.IsInvalidated() && ref_batch.m_uiBonesCapacity < uiCapacity)
+      msg.m_pRenderDataManager->DeleteCustomInstanceData(m_uiFoliageBonesDataIndex, ref_batch.m_BonesOffset);
+
+    plArrayPtr<plFoliageInstanceBones> slots = msg.m_pRenderDataManager->GetOrCreateCustomInstanceData<plFoliageInstanceBones>(m_uiFoliageBonesDataIndex, this, ref_batch.m_hBonesBuffer, ref_batch.m_BonesOffset, uiCapacity);
+    if (slots.GetCount() < ref_batch.m_uiCount)
+    {
+      ref_set.m_bBonesPending = true;
+      return;
+    }
+    ref_batch.m_uiBonesCapacity = uiCapacity;
+
+    for (plUInt32 k = 0; k < ref_batch.m_uiCount; ++k)
+    {
+      const plUInt32 t = ref_batch.m_Trees[k];
+      if (treeRead[t] == 0)
+      {
+        treeRead[t] = 1;
+        const plUInt32 uiPoolInstance = group.m_Instances[t].m_uiBoneInstance;
+        plFoliageBonePool::GetInstanceBones(uiPoolInstance, treeBones[t]);
+        // Registered but not dispatched yet: the palette holds no pose. Read again next frame.
+        ref_set.m_bBonesPending |= uiPoolInstance != plFoliageBonePool::InvalidInstance && treeBones[t].Valid == 0;
+      }
+
+      slots[k] = treeBones[t];
+      slots[k].Flags |= uiFlags;
+    }
+  };
+
+  for (CompositeBatch& batch : ref_set.m_Parts)
+    Write(batch, 0);
+
+  // The merged mesh gives each vertex the two heaviest bones of its part instance (TexCoord1.x and .y).
+  Write(ref_set.m_Merged, FOLIAGE_BONES_FLAG_VERTEX_WEIGHTS);
+}
+
+void plVegetationCellComponent::EmitCompositeBatch(const CompositeBatch& batch, const plMeshResourceHandle& hMesh, const plVegetationTypeResource& type, const plMeshResourceHandle& hMergedMesh, const plBoundingBoxSphere& cellBounds, plMsgExtractRenderData& msg) const
+{
+  if (batch.m_uiCount == 0 || batch.m_Offset.IsInvalidated() || !hMesh.IsValid())
+    return;
+
+  plResourceLock<plMeshResource> pMesh(hMesh, plResourceAcquireMode::AllowLoadingFallback);
+  if (!pMesh.IsValid())
+    return;
+
+  plArrayPtr<const plMeshResourceDescriptor::SubMesh> subMeshes = pMesh->GetSubMeshes();
+  plArrayPtr<const plMaterialResourceHandle> meshMaterials = pMesh->GetMaterials();
+
+  // Parts use the composite's material slots: the type's override, else the merged mesh's material, else their own.
+  plHybridArray<plMaterialResourceHandle, 8> mergedMaterials;
+  if (hMesh != hMergedMesh)
+  {
+    plResourceLock<plMeshResource> pMerged(hMergedMesh, plResourceAcquireMode::PointerOnly);
+    if (pMerged.IsValid())
+      mergedMaterials = pMerged->GetMaterials();
+  }
+
+  const bool bHasBones = !batch.m_BonesOffset.IsInvalidated();
+
+  for (plUInt32 uiSubMesh = 0; uiSubMesh < subMeshes.GetCount(); ++uiSubMesh)
+  {
+    const plUInt32 uiMaterialIndex = subMeshes[uiSubMesh].m_uiMaterialIndex;
+
+    plMaterialResourceHandle hMaterial = type.GetMaterialOverride(uiMaterialIndex);
+    if (!hMaterial.IsValid() && uiMaterialIndex < mergedMaterials.GetCount())
+      hMaterial = mergedMaterials[uiMaterialIndex];
+    if (!hMaterial.IsValid() && uiMaterialIndex < meshMaterials.GetCount())
+      hMaterial = meshMaterials[uiMaterialIndex];
+
+    if (!hMaterial.IsValid())
+      continue;
+
+    plMeshRenderData* pRenderData = msg.m_pRenderDataManager->CreateRenderDataForThisFrame<plMeshRenderData>(GetOwner());
+    pRenderData->m_Flags.Add(plRenderData::Flags::Dynamic);
+    // The ray tracing scene gets the cell's rest-pose snapshot of the merged mesh instead (GetRTChunks).
+    pRenderData->m_Flags.Add(plRenderData::Flags::SkipGI);
+    pRenderData->m_vGlobalPosition = cellBounds.IsValid() ? cellBounds.m_vCenter : m_pCell->m_vOrigin;
+    pRenderData->SetFallbackGlobalBounds(cellBounds);
+    pRenderData->Fill(batch.m_Offset, batch.m_hBuffer, hMaterial, hMesh, uiMaterialIndex, uiSubMesh, batch.m_uiCount);
+
+    // Instance k reads its bones at the batch's slot + k.
+    if (bHasBones)
+    {
+      pRenderData->m_DataOffsets.m_uiCustomInstance = batch.m_BonesOffset.m_uiOffset;
+      pRenderData->m_hCustomInstanceDataBuffer = batch.m_hBonesBuffer;
+    }
+
+    bool bDontCacheYet = false;
+    const plRenderData::Category category = plMaterialResource::GetRenderDataCategory(hMaterial, &bDontCacheYet);
+    msg.AddRenderData(pRenderData, category, plRenderData::Caching::Never);
+  }
+}
+
 void plVegetationCellComponent::GetRTChunks(const plRenderDataManager* pRenderDataManager, const plVec3& vCenter, float fRangeCap, plDynamicArray<plSharedPtr<plRefCounted>>& out_chunks) const
 {
   if (m_pCell == nullptr || pRenderDataManager == nullptr)
@@ -558,6 +941,12 @@ void plVegetationCellComponent::BuildRTGroup(const plVegetationCellGroup& group,
   bool bKnown = false;
   const bool bIncluded = pType->IsInRayTracingScene(bKnown);
   if (!bKnown)
+    return;
+
+  // A composite traces its merged mesh at rest pose (no bone data, no parts); which LOD that is shows once LOD 0 loaded.
+  bool bCompositeKnown = false;
+  pType->GetCompositeInfo(bCompositeKnown);
+  if (!bCompositeKnown)
     return;
 
   if (cvar_VegetationRayTracingLogTypes)

@@ -29,6 +29,7 @@ struct plVegetationCellInstance
   plBitflags<plVegetationInstanceFlags> m_Flags;
   plVegetationTileId m_TileId;
   plUInt32 m_uiIndexInTile;
+  plUInt32 m_uiBoneInstance; ///< plFoliageBonePool instance of a foliage composite tree, 0xFFFFFFFF while it has none.
 };
 
 /// \brief All instances of one type inside one cell.
@@ -36,6 +37,12 @@ struct plVegetationCellGroup
 {
   plVegetationTypeResourceHandle m_hType;
   plDynamicArray<plVegetationCellInstance> m_Instances;
+
+  /// Bumped whenever a tree of the group registers with or leaves plFoliageBonePool: the cell rewrites the bone data of
+  /// its batches.
+  plUInt32 m_uiBonesGeneration = 0;
+  plUInt32 m_uiBoneInstances = 0; ///< instances with a plFoliageBonePool registration
+  plUInt32 m_uiBonesTypeChangeCounter = 0xFFFFFFFF; ///< type change counter the registrations were made for
 };
 
 /// \brief A 32 m square column of the world holding every vegetation instance inside it, rendered by one
@@ -87,9 +94,17 @@ public:
 
   /// \brief Position and projection scale of the last main or editor view that extracted a cell; shadow views use it
   /// for LOD selection because their own cameras are orthographic.
-  void ReportMainCamera(const plVec3& vPosition, float fTanHalfFovY) const;
+  void ReportMainCamera(const plVec3& vPosition, float fTanHalfFovY, float fViewportHeight) const;
   plVec3 GetMainCameraPosition() const { return m_vMainCameraPosition; }
   float GetMainCameraTanHalfFov() const { return m_fMainCameraTanHalfFov; }
+  float GetMainCameraViewportHeight() const { return m_fMainCameraViewportHeight; }
+
+  /// \brief The render data manager's custom instance data index of plFoliageInstanceBones, shared with
+  /// plFoliageBonesComponent; 0xFFFFFFFF before the first update.
+  plUInt32 GetFoliageBonesDataIndex() const { return m_uiFoliageBonesDataIndex; }
+
+  /// \brief Foliage composite trees kept registered and animated by plFoliageBonePool at the last update. For stats.
+  plUInt32 GetAnimatedCompositeTreeCount() const { return m_uiAnimatedCompositeTrees; }
 
   /// \brief Touch sources registered this frame, consumed by the touch map.
   struct TouchSource
@@ -201,6 +216,12 @@ private:
   void RemoveTileFromCell(plVegetationCell& cell, plVegetationTileId tileId);
   void NotifyCellChanged(plVegetationCell& cell);
   void BeginFrame(const plWorldModule::UpdateContext& context);
+
+  /// Registers the foliage composite trees near the main camera with plFoliageBonePool and keeps their pool transforms
+  /// current, so the pool animates or freezes them (Vegetation.Bones.AnimationDistance).
+  void UpdateCompositeBones();
+  static void UnregisterBones(plVegetationCellGroup& ref_group, plVegetationCellInstance& ref_instance);
+  static void UnregisterBones(plVegetationCellGroup& ref_group);
   void PublishTouchMap(const plWorldModule::UpdateContext& context);
 
   /// Registers a touch source for every dynamic or character physics actor inside the touch map around vFocus, nearest
@@ -222,6 +243,10 @@ private:
 
   mutable plVec3 m_vMainCameraPosition = plVec3::MakeZero();
   mutable float m_fMainCameraTanHalfFov = 0.5f;
+  mutable float m_fMainCameraViewportHeight = 1080.0f;
+
+  plUInt32 m_uiFoliageBonesDataIndex = 0xFFFFFFFF;
+  plUInt32 m_uiAnimatedCompositeTrees = 0;
 
   plHybridArray<TouchSource, 32> m_TouchSources;
 };

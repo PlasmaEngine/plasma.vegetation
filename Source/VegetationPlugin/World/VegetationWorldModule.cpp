@@ -14,6 +14,7 @@
 #include <RendererCore/Components/RenderComponent.h>
 #include <RendererCore/Lights/Implementation/VirtualShadowPool.h>
 #include <RendererCore/Textures/Texture2DResource.h>
+#include <RendererCore/Wind/FoliageBonePool.h>
 #include <RendererCore/Wind/TouchMapManager.h>
 #include <VegetationPlugin/Components/VegetationCellComponent.h>
 #include <VegetationPlugin/Components/VegetationLayerComponent.h>
@@ -24,6 +25,7 @@
 
 #include <Shaders/Vegetation/Grass/GrassGpuData.h>
 #include <Shaders/Vegetation/Grass/GrassConstants.h>
+#include <Shaders/Vegetation/FoliageBonesData.h>
 
 plCVarInt cvar_VegetationGrassUploadBudgetKB("Vegetation.Grass.UploadBudgetKB", 512, plCVarFlags::Default, "Painted grass coverage each world uploads per frame, nearest tiles first. At least one tile is grown per frame");
 plCVarBool cvar_VegetationTouchPhysics("Vegetation.Touch.Physics", true, plCVarFlags::Default, "Dynamic physics bodies and characters inside the touch map bend vegetation and grass without a Vegetation Touch component");
@@ -32,6 +34,7 @@ plCVarInt cvar_VegetationTouchMaxPhysicsSources("Vegetation.Touch.MaxPhysicsSour
 
 extern plCVarBool cvar_VegetationEnabled;
 extern plCVarFloat cvar_VegetationRayTracingRange;
+extern plCVarFloat cvar_VegetationDrawDistanceScale;
 
 // clang-format off
 PL_IMPLEMENT_WORLD_MODULE(plVegetationWorldModule);
@@ -257,6 +260,9 @@ void plVegetationWorldModule::WorldClear()
   {
     plVegetationCell& cell = *it.Value();
 
+    for (plVegetationCellGroup& group : cell.m_Groups)
+      UnregisterBones(group);
+
     plVegetationCellComponent* pComponent = nullptr;
     if (GetWorld()->TryGetComponent(cell.m_hComponent, pComponent))
     {
@@ -288,6 +294,8 @@ void plVegetationWorldModule::BeginFrame(const plWorldModule::UpdateContext& con
   plStats::SetStat("Vegetation/Instances", m_uiTotalInstances);
   plStats::SetStat("Vegetation/Cells", m_Cells.GetCount());
   plStats::SetStat("Vegetation/Tiles", m_Tiles.GetCount());
+
+  UpdateCompositeBones();
 }
 
 plUInt64 plVegetationWorldModule::MakeCellKey(plInt32 iX, plInt32 iY)
@@ -345,6 +353,9 @@ void plVegetationWorldModule::DestroyCell(plUInt64 uiKey)
     return;
 
   plVegetationCell& cell = *it.Value();
+
+  for (plVegetationCellGroup& group : cell.m_Groups)
+    UnregisterBones(group);
 
   plVegetationCellComponent* pComponent = nullptr;
   if (GetWorld()->TryGetComponent(cell.m_hComponent, pComponent))
@@ -426,6 +437,7 @@ plVegetationTileHandle plVegetationWorldModule::AddInstances(const plVegetationT
     inst.m_Flags = desc.m_Flags;
     inst.m_TileId = tileId;
     inst.m_uiIndexInTile = i;
+    inst.m_uiBoneInstance = plFoliageBonePool::InvalidInstance;
 
     const plUInt64 uiKey = MakeCellKey(iX, iY);
     if (!storedTile.m_Cells.Contains(uiKey))
@@ -454,6 +466,8 @@ void plVegetationWorldModule::RemoveTileFromCell(plVegetationCell& cell, plVeget
     {
       if (group.m_Instances[i - 1].m_TileId == tileId)
       {
+        // The pool id travels with the instance through the swap, so only the removed tree leaves the pool.
+        UnregisterBones(group, group.m_Instances[i - 1]);
         group.m_Instances.RemoveAtAndSwap(i - 1);
       }
     }
@@ -549,6 +563,7 @@ void plVegetationWorldModule::RemoveInstances(plArrayPtr<const plVegetationInsta
         const auto& inst = group.m_Instances[i];
         if (inst.m_TileId == ref.m_hTile.GetInternalID() && inst.m_uiIndexInTile == ref.m_uiIndexInTile)
         {
+          UnregisterBones(group, group.m_Instances[i]);
           group.m_Instances.RemoveAtAndSwap(i);
           bRemoved = true;
           break;
@@ -1395,10 +1410,161 @@ void plVegetationWorldModule::DestroyGrassSource(GrassLayerSource& ref_source, b
   ref_source.m_hRenderComponent.Invalidate();
 }
 
-void plVegetationWorldModule::ReportMainCamera(const plVec3& vPosition, float fTanHalfFovY) const
+void plVegetationWorldModule::ReportMainCamera(const plVec3& vPosition, float fTanHalfFovY, float fViewportHeight) const
 {
   m_vMainCameraPosition = vPosition;
   m_fMainCameraTanHalfFov = plMath::Max(fTanHalfFovY, 0.01f);
+  m_fMainCameraViewportHeight = plMath::Max(fViewportHeight, 1.0f);
+}
+
+void plVegetationWorldModule::UnregisterBones(plVegetationCellGroup& ref_group, plVegetationCellInstance& ref_instance)
+{
+  if (ref_instance.m_uiBoneInstance == plFoliageBonePool::InvalidInstance)
+    return;
+
+  plFoliageBonePool::UnregisterInstance(ref_instance.m_uiBoneInstance);
+  ref_group.m_uiBoneInstances -= plMath::Min(ref_group.m_uiBoneInstances, 1u);
+  ++ref_group.m_uiBonesGeneration;
+}
+
+void plVegetationWorldModule::UnregisterBones(plVegetationCellGroup& ref_group)
+{
+  if (ref_group.m_uiBoneInstances == 0)
+    return;
+
+  for (plVegetationCellInstance& inst : ref_group.m_Instances)
+    UnregisterBones(ref_group, inst);
+
+  ref_group.m_uiBoneInstances = 0;
+}
+
+void plVegetationWorldModule::UpdateCompositeBones()
+{
+  m_uiAnimatedCompositeTrees = 0;
+  if (m_Cells.IsEmpty())
+    return;
+
+  PL_PROFILE_SCOPE("Vegetation Composite Bones");
+
+  if (m_uiFoliageBonesDataIndex == 0xFFFFFFFF)
+  {
+    // The same description and name as plFoliageBonesComponent, so both share one buffer.
+    plGALBufferCreationDescription desc;
+    desc.m_uiStructSize = sizeof(plFoliageInstanceBones);
+    desc.m_uiTotalSize = 1024 * desc.m_uiStructSize;
+    desc.m_BufferFlags = plGALBufferUsageFlags::StructuredBuffer | plGALBufferUsageFlags::ShaderResource;
+    m_uiFoliageBonesDataIndex = GetWorld()->GetOrCreateModule<plRenderDataManager>()->RegisterCustomInstanceData(desc, "Foliage Instance Bones");
+  }
+
+  // What each type needs, resolved once per frame however many cells hold it.
+  struct TypeInfo
+  {
+    bool m_bComposite = false;       ///< LOD 0 is a loaded composite whose merged mesh has a skeleton
+    bool m_bLoading = false;         ///< the type resource is not loaded yet
+    plUInt32 m_uiChangeCounter = 0;
+    plMeshResourceHandle m_hMergedMesh;
+    float m_fRange = 0.0f;           ///< trees nearer the main camera than this are drawn and animated
+    float m_fRadius = 1.0f;
+  };
+  plHashTable<plUInt64, TypeInfo> types;
+
+  const float fDistanceScale = plMath::Max(cvar_VegetationDrawDistanceScale.GetValue(), 0.0f);
+  const plVec3 vCamera = m_vMainCameraPosition;
+  const plUInt32 uiWorldIndex = GetWorld()->GetIndex();
+
+  for (auto it = m_Cells.GetIterator(); it.IsValid(); ++it)
+  {
+    plVegetationCell& cell = *it.Value();
+
+    for (plVegetationCellGroup& group : cell.m_Groups)
+    {
+      TypeInfo* pInfo = nullptr;
+      if (!types.TryGetValue(group.m_hType.GetResourceIDHash(), pInfo))
+      {
+        TypeInfo info;
+        plResourceLock<plVegetationTypeResource> pType(group.m_hType, plResourceAcquireMode::AllowLoadingFallback_NeverFail);
+        if (pType.GetAcquireResult() == plResourceAcquireResult::Final)
+        {
+          info.m_uiChangeCounter = pType->GetCurrentResourceChangeCounter();
+          bool bKnown = false;
+          const plVegetationCompositeInfo* pComposite = pType->GetCompositeInfo(bKnown);
+          if (pComposite != nullptr && pComposite->m_bHasSkeleton)
+          {
+            info.m_bComposite = true;
+            info.m_hMergedMesh = pType->GetLodMesh(0);
+            info.m_fRadius = pType->GetBoundingRadius();
+            info.m_fRange = pType->GetDescriptor().m_Render.m_fCullDistance * fDistanceScale;
+          }
+        }
+        else
+        {
+          // Still loading: what is registered stays.
+          info.m_bLoading = true;
+        }
+        types.Insert(group.m_hType.GetResourceIDHash(), info);
+        types.TryGetValue(group.m_hType.GetResourceIDHash(), pInfo);
+      }
+
+      if (pInfo->m_bLoading)
+        continue;
+
+      // A reloaded type may have another merged mesh and skeleton, or none: registrations are made again.
+      if (group.m_uiBonesTypeChangeCounter != pInfo->m_uiChangeCounter)
+      {
+        UnregisterBones(group);
+        group.m_uiBonesTypeChangeCounter = pInfo->m_uiChangeCounter;
+      }
+
+      if (!pInfo->m_bComposite)
+        continue;
+
+      // Whole cell out of range and nothing registered: its trees are not drawn, and there is nothing to release.
+      const plVec2 vCellMin = cell.m_vOrigin.GetAsVec2();
+      const plVec2 vNearest(plMath::Clamp(vCamera.x, vCellMin.x, vCellMin.x + plVegetationCellSize), plMath::Clamp(vCamera.y, vCellMin.y, vCellMin.y + plVegetationCellSize));
+      const float fCellReach = pInfo->m_fRange + pInfo->m_fRadius * 4.0f;
+      if (group.m_uiBoneInstances == 0 && (vNearest - vCamera.GetAsVec2()).GetLengthSquared() > fCellReach * fCellReach)
+        continue;
+
+      bool bRegisterFailed = false;
+      for (plVegetationCellInstance& inst : group.m_Instances)
+      {
+        const float fReach = pInfo->m_fRange + pInfo->m_fRadius * inst.m_fScale;
+        const float fDistanceSq = (inst.m_vPosition - vCamera).GetLengthSquared();
+        if (fDistanceSq > fReach * fReach)
+        {
+          // Not drawn. Far enough past the range to not flicker in and out, the tree gives its palette back.
+          const float fRelease = fReach * 1.25f + plVegetationCellSize;
+          if (fDistanceSq > fRelease * fRelease)
+            UnregisterBones(group, inst);
+          continue;
+        }
+
+        if (inst.m_uiBoneInstance == plFoliageBonePool::InvalidInstance)
+        {
+          // A failure means the merged mesh is not ready; the other trees would fail too.
+          if (bRegisterFailed)
+            continue;
+          inst.m_uiBoneInstance = plFoliageBonePool::RegisterInstance(uiWorldIndex, pInfo->m_hMergedMesh);
+          if (inst.m_uiBoneInstance == plFoliageBonePool::InvalidInstance)
+          {
+            bRegisterFailed = true;
+            continue;
+          }
+          ++group.m_uiBoneInstances;
+          ++group.m_uiBonesGeneration;
+        }
+
+        plTransform transform;
+        transform.m_vPosition = inst.m_vPosition;
+        transform.m_qRotation = inst.m_qRotation;
+        transform.m_vScale.Set(inst.m_fScale);
+        plFoliageBonePool::UpdateInstance(inst.m_uiBoneInstance, transform);
+        ++m_uiAnimatedCompositeTrees;
+      }
+    }
+  }
+
+  plStats::SetStat("Vegetation/CompositeTreesAnimated", m_uiAnimatedCompositeTrees);
 }
 
 void plVegetationWorldModule::GetRTChunks(const plView& view, const plBoundingBox& box, plDynamicArray<plSharedPtr<plRefCounted>>& out_chunks) const
