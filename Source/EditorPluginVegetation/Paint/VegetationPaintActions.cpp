@@ -36,7 +36,12 @@ void plVegetationPaintActions::MapActions()
   for (const char* szMapping : szMenuBars)
   {
     if (plActionMap* pMap = plActionMapManager::GetActionMap(szMapping))
+    {
       pMap->MapAction(s_hPaintTool, "G.Gizmos", 5.6f);
+      // Mapped so every scene document instantiates it: an unmapped document action cannot run, not even from
+      // action_execute. Scene > Fill Vegetation Layer repeats the selected layers' last fill.
+      pMap->MapAction(s_hLayerFill, "G.Scene", 4.5f);
+    }
     else
       plLog::Warning("Action map '{0}' not found - the Vegetation tool will not appear in that menu.", szMapping);
   }
