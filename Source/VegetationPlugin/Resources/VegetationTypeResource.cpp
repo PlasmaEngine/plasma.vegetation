@@ -227,6 +227,7 @@ plResourceLoadDesc plVegetationTypeResource::UnloadData(Unload WhatToUnload)
   m_MaterialOverrides.Clear();
   m_hColorGradient.Invalidate();
   m_fBoundingRadius = 0.0f;
+  ResetCompositeInfo();
 
   plResourceLoadDesc res;
   res.m_uiQualityLevelsDiscardable = 0;
@@ -302,6 +303,157 @@ void plVegetationTypeResource::ResolveHandles()
   }
 
   m_fBoundingRadius = 0.0f;
+  ResetCompositeInfo();
+}
+
+void plVegetationTypeResource::ResetCompositeInfo()
+{
+  PL_LOCK(m_CompositeMutex);
+  m_iCompositeState = -1;
+  m_pComposite.Clear();
+}
+
+const plVegetationCompositeInfo* plVegetationTypeResource::GetCompositeInfo(bool& out_bKnown) const
+{
+  out_bKnown = true;
+
+  const plInt32 iState = m_iCompositeState;
+  if (iState == 0)
+    return nullptr;
+  if (iState == 1)
+    return m_pComposite.Borrow();
+
+  PL_LOCK(m_CompositeMutex);
+  if (m_iCompositeState >= 0)
+    return m_iCompositeState == 1 ? m_pComposite.Borrow() : nullptr;
+
+  if (m_LodMeshes.IsEmpty())
+  {
+    m_iCompositeState = 0;
+    return nullptr;
+  }
+
+  plResourceLock<plMeshResource> pMesh(m_LodMeshes[0], plResourceAcquireMode::AllowLoadingFallback_NeverFail);
+  if (pMesh.GetAcquireResult() != plResourceAcquireResult::Final)
+  {
+    out_bKnown = false;
+    return nullptr;
+  }
+
+  const plFoliageComposite* pComposite = pMesh->GetFoliageComposite();
+  if (pComposite == nullptr || pComposite->IsEmpty() || pComposite->m_Parts.IsEmpty())
+  {
+    m_iCompositeState = 0;
+    return nullptr;
+  }
+
+  m_pComposite = PL_DEFAULT_NEW(plVegetationCompositeInfo);
+  m_pComposite->m_fSwitchError = pComposite->m_fSwitchError;
+  m_pComposite->m_Instances = pComposite->m_Instances;
+  for (const plString& sPart : pComposite->m_Parts)
+    m_pComposite->m_PartMeshes.PushBack(sPart.IsEmpty() ? plMeshResourceHandle() : plResourceManager::LoadResource<plMeshResource>(sPart));
+
+  const plFoliageSkeleton* pSkeleton = pMesh->GetFoliageSkeleton();
+  m_pComposite->m_bHasSkeleton = pSkeleton != nullptr && !pSkeleton->IsEmpty();
+  m_pComposite->ComputeSway(pSkeleton);
+
+  // Published last: readers that see 1 find the info complete.
+  m_iCompositeState = 1;
+  return m_pComposite.Borrow();
+}
+
+float plVegetationCompositeInfo::ComputeSwitchDistance(float fSwitchError, float fScale, float fViewportHeight, float fTanHalfFovY, float fErrorPixels)
+{
+  // The merged mesh's finest error, at this distance, projects to fErrorPixels on a viewport fViewportHeight tall: the
+  // same switch plFoliageCompositeComponent makes.
+  if (fSwitchError <= 0.0f || fViewportHeight <= 0.0f || fTanHalfFovY <= 0.0f)
+    return 0.0f;
+
+  return fSwitchError * fScale * fViewportHeight / (2.0f * fTanHalfFovY * plMath::Max(fErrorPixels, 0.01f));
+}
+
+void plVegetationCompositeInfo::ComputeSway(const plFoliageSkeleton* pSkeleton)
+{
+  m_InstanceSway.SetCount(m_Instances.GetCount());
+  m_InstanceSwayPerMetre.SetCount(m_Instances.GetCount());
+
+  if (pSkeleton == nullptr || pSkeleton->IsEmpty())
+  {
+    for (plUInt32 i = 0; i < m_Instances.GetCount(); ++i)
+    {
+      m_InstanceSway[i] = 0.0f;
+      m_InstanceSwayPerMetre[i] = 0.0f;
+    }
+    return;
+  }
+
+  const plUInt32 uiBoneCount = pSkeleton->m_Bones.GetCount();
+
+  // Per bone: the sum of the chords of the maximum bends up its chain. ComputeDisplacementBound adds chord * path length
+  // per bone; a point r further from the origin lengthens every path by at most r.
+  auto Chord = [](float fAngle) { return 2.0f * plMath::Sin(plAngle::MakeFromRadian(plMath::Min(fAngle, plMath::Pi<float>()) * 0.5f)); };
+  plDynamicArray<float> chainChords;
+  chainChords.SetCount(uiBoneCount);
+  float fMaxChainChord = 0.0f;
+  for (plUInt32 b = 0; b < uiBoneCount; ++b)
+  {
+    // Parents come before their children (plFoliageSkeleton::Finalize).
+    const plUInt16 uiParent = pSkeleton->m_Bones[b].m_uiParent;
+    const float fParent = (uiParent != plFoliageBone::InvalidParent && uiParent < b) ? chainChords[uiParent] : 0.0f;
+    chainChords[b] = fParent + Chord(pSkeleton->m_Bones[b].m_fMaxBend);
+    fMaxChainChord = plMath::Max(fMaxChainChord, chainChords[b]);
+  }
+
+  // The path form of plFoliageSkeleton::ComputeDisplacementBound: each bone up the chain moves the point by at most the
+  // chord of its maximum bend times the longest path from its pivot to the point. Unlike the tighter of the two bounds that
+  // function returns, it grows by exactly r times the chain's chords when the point is r further away.
+  auto PathBound = [&](const plVec3& vPoint, plUInt32 uiBone)
+  {
+    float fBound = 0.0f;
+    float fPath = (vPoint - pSkeleton->m_Bones[uiBone].m_vPivot).GetLength();
+    plUInt32 b = uiBone;
+    for (plUInt32 uiGuard = 0; uiGuard < uiBoneCount; ++uiGuard)
+    {
+      fBound += Chord(pSkeleton->m_Bones[b].m_fMaxBend) * fPath;
+      const plUInt16 uiParent = pSkeleton->m_Bones[b].m_uiParent;
+      if (uiParent == plFoliageBone::InvalidParent || uiParent >= uiBoneCount)
+        break;
+      fPath += (pSkeleton->m_Bones[b].m_vPivot - pSkeleton->m_Bones[uiParent].m_vPivot).GetLength();
+      b = uiParent;
+    }
+    return fBound;
+  };
+
+  for (plUInt32 i = 0; i < m_Instances.GetCount(); ++i)
+  {
+    const plFoliageCompositeInstance& inst = m_Instances[i];
+    const plVec3 vOrigin = inst.m_Transform.m_vPosition;
+
+    float fSway = 0.0f;
+    float fPerMetre = 0.0f;
+    if (inst.GetDominantBone() == plFoliageCompositeInstance::InvalidBone)
+    {
+      // Every vertex follows its own vertex bone: any bone of the skeleton.
+      for (plUInt32 b = 0; b < uiBoneCount; ++b)
+        fSway = plMath::Max(fSway, PathBound(vOrigin, b));
+      fPerMetre = fMaxChainChord;
+    }
+    else
+    {
+      // A rigid blend of its bones never moves further than the furthest of them.
+      for (plUInt32 k = 0; k < plFoliageCompositeInstance::MaxBones; ++k)
+      {
+        const plUInt16 uiBone = inst.m_Bones[k];
+        if (uiBone == plFoliageCompositeInstance::InvalidBone || uiBone >= uiBoneCount)
+          continue;
+        fSway = plMath::Max(fSway, PathBound(vOrigin, uiBone));
+        fPerMetre = plMath::Max(fPerMetre, chainChords[uiBone]);
+      }
+    }
+
+    m_InstanceSway[i] = fSway;
+    m_InstanceSwayPerMetre[i] = fPerMetre;
+  }
 }
 
 plMaterialResourceHandle plVegetationTypeResource::GetMaterialOverride(plUInt32 uiSlot) const
@@ -376,6 +528,10 @@ plUInt32 plVegetationTypeResource::GetRayTracingLod() const
 {
   const plUInt32 uiCount = m_LodMeshes.GetCount();
   if (uiCount == 0)
+    return 0;
+
+  // A composite traces its merged mesh; the other LODs are not drawn.
+  if (IsFoliageComposite())
     return 0;
 
   if (const plInt32 iOverride = cvar_VegetationRayTracingLodOverride; iOverride >= 0)

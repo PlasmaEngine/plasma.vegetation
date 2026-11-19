@@ -5,6 +5,9 @@
 #include <Foundation/Containers/HybridArray.h>
 #include <Foundation/Math/Angle.h>
 #include <Foundation/Strings/String.h>
+#include <Foundation/Threading/AtomicInteger.h>
+#include <Foundation/Threading/Mutex.h>
+#include <Foundation/Types/UniquePtr.h>
 #include <RendererCore/Material/MaterialResource.h>
 #include <RendererCore/Meshes/MeshResource.h>
 #include <VegetationPlugin/VegetationDeclarations.h>
@@ -119,6 +122,33 @@ struct PL_VEGETATIONPLUGIN_DLL plVegetationTypeResourceDescriptor
   plResult Load(plStreamReader& inout_stream);
 };
 
+/// \brief What the cells need of a type whose first LOD mesh is a foliage composite (plFoliageComposite), copied from the
+/// mesh once it has loaded.
+///
+/// Cells draw such a type natively: per tree either the composite's parts (one instanced draw per part mesh for the whole
+/// cell) or its merged mesh, switched at the distance where the merged mesh's error reaches
+/// Vegetation.Composite.SwitchErrorPixels. LOD 1-3, the crossfade and the per-vertex wind are not used.
+struct PL_VEGETATIONPLUGIN_DLL plVegetationCompositeInfo
+{
+  plHybridArray<plMeshResourceHandle, 8> m_PartMeshes;    ///< By composite part index.
+  plDynamicArray<plFoliageCompositeInstance> m_Instances; ///< Part placements in the composite's object space.
+
+  /// Per placement: how far its origin can move with its bones (the path bound of plFoliageSkeleton), and how
+  /// much more per metre of distance from the origin. A point of the part at distance r moves at most
+  /// m_InstanceSway + r * m_InstanceSwayPerMetre. Zero without a skeleton.
+  plDynamicArray<float> m_InstanceSway;
+  plDynamicArray<float> m_InstanceSwayPerMetre;
+
+  float m_fSwitchError = 0.0f; ///< Object-space error of the merged mesh's finest level.
+  bool m_bHasSkeleton = false; ///< The merged mesh carries a foliage skeleton: trees register with plFoliageBonePool.
+
+  /// The camera distance below which a tree of the given scale shows its parts; 0 when the error or projection is unknown.
+  static float ComputeSwitchDistance(float fSwitchError, float fScale, float fViewportHeight, float fTanHalfFovY, float fErrorPixels);
+
+  /// Fills the sway arrays from the merged mesh's skeleton.
+  void ComputeSway(const plFoliageSkeleton* pSkeleton);
+};
+
 /// \brief One plant type: LOD meshes, material overrides, wind, touch, placement and render settings.
 class PL_VEGETATIONPLUGIN_DLL plVegetationTypeResource : public plResource
 {
@@ -140,7 +170,8 @@ public:
 
   const plColorGradientResourceHandle& GetColorGradient() const { return m_hColorGradient; }
 
-  /// \brief Radius of LOD0's bounding sphere at scale 1; 1 until the mesh has loaded.
+  /// \brief Radius of LOD0's bounding sphere at scale 1; 1 until the mesh has loaded. A composite's merged mesh has its
+  /// bounds grown by the furthest its bones can sway (plFoliageSkeleton::InflateBounds), so this includes the sway.
   float GetBoundingRadius() const;
 
   /// \brief How far LOD0's bounding box reaches above the pivot at scale 1; 1 until the mesh has loaded.
@@ -155,7 +186,19 @@ public:
   /// result is false then.
   bool IsInRayTracingScene(bool& out_bKnown) const;
 
-  /// \brief The LOD whose mesh the ray tracing scene traces.
+  /// \brief The composite data when LOD 0 is a foliage composite, else nullptr.
+  ///
+  /// out_bKnown is false while LOD 0 is still loading; the result is nullptr then. Thread-safe.
+  const plVegetationCompositeInfo* GetCompositeInfo(bool& out_bKnown) const;
+
+  /// \brief Whether LOD 0 is a foliage composite; false while it is loading.
+  bool IsFoliageComposite() const
+  {
+    bool bKnown = false;
+    return GetCompositeInfo(bKnown) != nullptr;
+  }
+
+  /// \brief The LOD whose mesh the ray tracing scene traces. Always 0, the merged mesh, for a composite.
   plUInt32 GetRayTracingLod() const;
 
   /// \brief Distance up to which instances are part of the ray tracing scene, before any quality cap.
@@ -167,6 +210,7 @@ private:
   virtual void UpdateMemoryUsage(MemoryUsage& out_NewMemoryUsage) override;
 
   void ResolveHandles();
+  void ResetCompositeInfo();
 
   plVegetationTypeResourceDescriptor m_Descriptor;
   plHybridArray<plMeshResourceHandle, plVegetationMaxLods> m_LodMeshes;
@@ -174,4 +218,9 @@ private:
   plColorGradientResourceHandle m_hColorGradient;
   mutable float m_fBoundingRadius = 0.0f;
   mutable float m_fBoundingHeight = 1.0f;
+
+  /// Resolved once from LOD 0 on first request: -1 not yet, 0 not a composite, 1 m_pComposite holds it.
+  mutable plAtomicInteger32 m_iCompositeState = -1;
+  mutable plMutex m_CompositeMutex;
+  mutable plUniquePtr<plVegetationCompositeInfo> m_pComposite;
 };
