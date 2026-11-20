@@ -47,6 +47,9 @@ plCVarBool cvar_VegetationRayTracingLogTypes("Vegetation.RayTracing.LogTypes", f
 
 namespace
 {
+  /// Marks a LOD batch entry whose instance dithers between two levels (the rest of the entry is the instance index).
+  constexpr plUInt32 s_uiCrossfadeEntry = PL_BIT(31);
+
   /// Frames a replaced ray tracing snapshot's instance data stays allocated: a frame in flight may still read it.
   constexpr plUInt64 c_uiRTRetireFrames = 8;
 
@@ -419,24 +422,32 @@ void plVegetationCellComponent::BuildBatches(const plVegetationCellGroup& group,
         ++uiLod;
       uiLod = plMath::Min(uiLod, uiLodCount - 1);
 
-      visible[uiLod].PushBack(i);
-
-      // Crossfade bands around the thresholds this instance is next to (main views only; shadows pop).
+      // Crossfade bands around the thresholds this instance is next to (main views only; shadows pop). Entries of an
+      // instance that crossfades carry s_uiCrossfadeEntry, in both of its levels.
+      plUInt32 uiEntry = i;
       if (!bShadow && fCrossfade > 0.0f)
       {
         if (uiLod > 0)
         {
           const float fUpper = pType->GetLodScreenSize(uiLod - 1);
           if (fScreenSize >= fUpper * (1.0f - fCrossfade))
-            visible[uiLod - 1].PushBack(i);
+          {
+            visible[uiLod - 1].PushBack(i | s_uiCrossfadeEntry);
+            uiEntry |= s_uiCrossfadeEntry;
+          }
         }
         if (uiLod + 1 < uiLodCount)
         {
           const float fLower = pType->GetLodScreenSize(uiLod);
           if (fScreenSize <= fLower * (1.0f + fCrossfade))
-            visible[uiLod + 1].PushBack(i);
+          {
+            visible[uiLod + 1].PushBack(i | s_uiCrossfadeEntry);
+            uiEntry |= s_uiCrossfadeEntry;
+          }
         }
       }
+
+      visible[uiLod].PushBack(uiEntry);
     }
 
     // Colour per seed, resolved once per refill.
@@ -449,6 +460,7 @@ void plVegetationCellComponent::BuildBatches(const plVegetationCellGroup& group,
     {
       LodBatch& batch = pBatches[lod];
       batch.m_uiVisible = visible[lod].GetCount();
+      batch.m_uiCrossfading = 0;
 
       if (batch.m_uiVisible == 0)
         continue;
@@ -474,11 +486,22 @@ void plVegetationCellComponent::BuildBatches(const plVegetationCellGroup& group,
       // z = bounding radius at instance scale, w = crossfade band fraction. Zero w disables the dither.
       const float fLower = lod + 1 < uiLodCount ? pType->GetLodScreenSize(lod) : 0.0f;
       const float fUpper = lod > 0 ? pType->GetLodScreenSize(lod - 1) : 1.0e9f;
-      const float fBand = bShadow ? 0.0f : fCrossfade;
+      // Steady instances first, crossfading ones last: they are drawn as a second render data flagged LodCrossfade, the
+      // only draws whose opaque materials compile the dither discard. Steady instances get a zero band.
+      plHybridArray<plUInt32, 256>& entries = visible[lod];
+      plUInt32 uiSteady = 0;
+      for (plUInt32 k = 0; k < entries.GetCount(); ++k)
+      {
+        if ((entries[k] & s_uiCrossfadeEntry) == 0)
+          plMath::Swap(entries[uiSteady++], entries[k]);
+      }
+      batch.m_uiCrossfading = batch.m_uiVisible - uiSteady;
 
       for (plUInt32 k = 0; k < batch.m_uiVisible; ++k)
       {
-        const plVegetationCellInstance& inst = group.m_Instances[visible[lod][k]];
+        const bool bCrossfading = (entries[k] & s_uiCrossfadeEntry) != 0;
+        const float fBand = bCrossfading ? fCrossfade : 0.0f;
+        const plVegetationCellInstance& inst = group.m_Instances[entries[k] & ~s_uiCrossfadeEntry];
 
         plTransform transform;
         transform.m_vPosition = inst.m_vPosition;
@@ -518,19 +541,34 @@ void plVegetationCellComponent::BuildBatches(const plVegetationCellGroup& group,
       if (!hMaterial.IsValid())
         continue;
 
-      plMeshRenderData* pRenderData = msg.m_pRenderDataManager->CreateRenderDataForThisFrame<plMeshRenderData>(GetOwner());
-      pRenderData->m_Flags.Add(plRenderData::Flags::Dynamic);
-      // These batches follow the view. The ray tracing scene gets the cell's snapshots instead (GetRTChunks).
-      pRenderData->m_Flags.Add(plRenderData::Flags::SkipGI);
-      // Editor clicks go through vegetation to what lies beneath: a pick would redraw the whole batch.
-      pRenderData->m_Flags.Add(plRenderData::Flags::NotPickable);
-      pRenderData->m_vGlobalPosition = cellBounds.IsValid() ? cellBounds.m_vCenter : m_pCell->m_vOrigin;
-      pRenderData->SetFallbackGlobalBounds(cellBounds);
-      pRenderData->Fill(batch.m_Offset, batch.m_hBuffer, hMaterial, hMesh, uiMaterialIndex, uiPart, batch.m_uiVisible);
-
       bool bDontCacheYet = false;
       const plRenderData::Category category = plMaterialResource::GetRenderDataCategory(hMaterial, &bDontCacheYet);
-      msg.AddRenderData(pRenderData, category, plRenderData::Caching::Never);
+
+      // The steady instances, then the crossfading ones at the end of the same allocation.
+      const plUInt32 uiSteady = batch.m_uiVisible - batch.m_uiCrossfading;
+      for (plUInt32 uiSplit = 0; uiSplit < 2; ++uiSplit)
+      {
+        const plUInt32 uiCount = uiSplit == 0 ? uiSteady : batch.m_uiCrossfading;
+        if (uiCount == 0)
+          continue;
+
+        plInstanceDataOffset offset = batch.m_Offset;
+        offset.m_uiOffset += uiSplit == 0 ? 0 : uiSteady;
+
+        plMeshRenderData* pRenderData = msg.m_pRenderDataManager->CreateRenderDataForThisFrame<plMeshRenderData>(GetOwner());
+        pRenderData->m_Flags.Add(plRenderData::Flags::Dynamic);
+        // These batches follow the view. The ray tracing scene gets the cell's snapshots instead (GetRTChunks).
+        pRenderData->m_Flags.Add(plRenderData::Flags::SkipGI);
+        // Editor clicks go through vegetation to what lies beneath: a pick would redraw the whole batch.
+        pRenderData->m_Flags.Add(plRenderData::Flags::NotPickable);
+        if (uiSplit == 1)
+          pRenderData->m_Flags.Add(plRenderData::Flags::LodCrossfade);
+        pRenderData->m_vGlobalPosition = cellBounds.IsValid() ? cellBounds.m_vCenter : m_pCell->m_vOrigin;
+        pRenderData->SetFallbackGlobalBounds(cellBounds);
+        pRenderData->Fill(offset, batch.m_hBuffer, hMaterial, hMesh, uiMaterialIndex, uiPart, uiCount);
+
+        msg.AddRenderData(pRenderData, category, plRenderData::Caching::Never);
+      }
     }
   }
 }

@@ -67,6 +67,7 @@ private:
     plGALDynamicBufferHandle m_hBuffer;
     plUInt32 m_uiCapacity = 0;
     plUInt32 m_uiVisible = 0;
+    plUInt32 m_uiCrossfading = 0; ///< the last m_uiCrossfading of m_uiVisible instances dither between two LODs
   };
 
   struct SetState

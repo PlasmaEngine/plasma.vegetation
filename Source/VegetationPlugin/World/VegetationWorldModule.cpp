@@ -29,8 +29,8 @@
 #include <Shaders/Vegetation/FoliageBonesData.h>
 
 plCVarInt cvar_VegetationGrassUploadBudgetKB("Vegetation.Grass.UploadBudgetKB", 512, plCVarFlags::Default, "Painted grass coverage each world uploads per frame, nearest tiles first. At least one tile is grown per frame");
-plCVarInt cvar_VegetationGrassDebugStreamMode("Vegetation.Grass.Debug.StreamMode", 0, plCVarFlags::Default,
-  "Performance experiment for grass tile streaming: 0 = normal, 1 = each tile's full strand count is cached per content hash, density and seed instead of recounted every frame, 2 = no streaming at all (the resident tiles stay as they are)");
+plCVarBool cvar_VegetationGrassCacheStrandCounts("Vegetation.Grass.CacheStrandCounts", true, plCVarFlags::Default,
+  "Grass streaming keeps each tile's full strand count until its coverage, density or seed changes, instead of recounting every texel of every in-range tile each frame");
 plCVarBool cvar_VegetationTouchPhysics("Vegetation.Touch.Physics", true, plCVarFlags::Default, "Dynamic physics bodies and characters inside the touch map bend vegetation and grass without a Vegetation Touch component");
 plCVarInt cvar_VegetationTouchPhysicsCollisionLayer("Vegetation.Touch.PhysicsCollisionLayer", -1, plCVarFlags::Default, "Collision layer of the physics touch query: bodies whose layer collides with it bend vegetation. -1 queries with layer 0");
 plCVarFloat cvar_VegetationCompositeWindTileSize("Vegetation.Composite.WindTileSize", 256.0f, plCVarFlags::Default,
@@ -836,8 +836,7 @@ void plVegetationWorldModule::UpdateGrass(const plWorldModule::UpdateContext& co
   if (!m_GrassSources.IsEmpty())
   {
     UpdateGrassCameras();
-    if (cvar_VegetationGrassDebugStreamMode != 2)
-      StreamGrassTiles();
+    StreamGrassTiles();
     UpdateGrassBudgetThinning();
 
     for (GrassLayerSource* pSource : m_GrassSources)
@@ -1006,6 +1005,7 @@ void plVegetationWorldModule::IndexGrassTile(GrassLayerSource& ref_source, const
 
   state.m_uiContentHash = uiHash;
   state.m_bDirty = true;
+  state.m_bFullCountValid = false;
 
   float fMinHeight = plMath::MaxValue<float>();
   float fMaxHeight = -plMath::MaxValue<float>();
@@ -1169,23 +1169,25 @@ void plVegetationWorldModule::StreamGrassTiles()
   // pool and evict the roots that the far-cover shader needs. Keep headroom for replacing an existing tile's range.
   {
     PL_PROFILE_SCOPE("Vegetation.StreamGrass.FullCount");
-    const bool bCacheFullCount = cvar_VegetationGrassDebugStreamMode == 1;
+    const bool bCache = cvar_VegetationGrassCacheStrandCounts;
     for (Candidate& candidate : candidates)
     {
       auto& source = *candidate.m_pSource;
       const auto& coverage = *source.m_pEntry->m_Tiles.GetValue(candidate.m_uiTileKey);
       const plUInt32 perTexel = GrassStrandsPerTexelQ8(source.m_Settings.m_fStrandsPerSquareMeter, source.m_fTexelSize);
       GrassTileState& tile = source.m_Tiles[candidate.m_uiTileKey];
-      const plUInt64 uiKey = tile.m_uiContentHash ^ (plUInt64(perTexel) << 32) ^ source.m_uiTypeSeed ^ 1u;
-      if (bCacheFullCount && tile.m_uiFullCountKey == uiKey)
+      // IndexGrassTile clears m_bFullCountValid when the coverage changes; density and seed are compared here.
+      if (bCache && tile.m_bFullCountValid && tile.m_uiFullCountPerTexel == perTexel && tile.m_uiFullCountSeed == source.m_uiTypeSeed)
       {
         candidate.m_uiFullCount = tile.m_uiFullCount;
         continue;
       }
       for (plUInt32 i = 0; i < plGrassCoverageTile::TexelCount; ++i)
         candidate.m_uiFullCount += GrassStrandCountForTexelQ8(coverage.m_Texels[i].m_uiDensity, perTexel, GrassHash(coverage.m_iX, coverage.m_iY, i, source.m_uiTypeSeed));
-      tile.m_uiFullCountKey = uiKey;
       tile.m_uiFullCount = candidate.m_uiFullCount;
+      tile.m_uiFullCountPerTexel = perTexel;
+      tile.m_uiFullCountSeed = source.m_uiTypeSeed;
+      tile.m_bFullCountValid = true;
     }
   }
   const plUInt64 targetRoots = plUInt64(uiBudgetPages) * GRASS_PAGE_SIZE * 4 / 5;
