@@ -45,7 +45,13 @@ plUInt8 plVegetationCompositeSplit::ClassifyTree(const plVegetationCellInstance&
 
   plUInt8 uiState = fDistance < thresholds.m_fSwitchDistance * inst.m_fScale ? plVegetationCompositeTreeState::Parts : plVegetationCompositeTreeState::Merged;
   if (fDistance <= thresholds.m_fShadowCullDistance && !inst.m_Flags.IsSet(plVegetationInstanceFlags::NoShadow))
+  {
     uiState |= plVegetationCompositeTreeState::CastsShadow;
+    // Every shadow view gets the cell's shadow batches, so a part instance there costs as many times as there are
+    // shadow views: beyond a short distance the merged mesh casts the shadow, a difference no shadow texel shows.
+    if (uiState & plVegetationCompositeTreeState::Parts && fDistance < thresholds.m_fShadowPartsDistance * inst.m_fScale)
+      uiState |= plVegetationCompositeTreeState::ShadowParts;
+  }
 
   return uiState;
 }
@@ -64,8 +70,9 @@ plUInt32 plVegetationCompositeSplit::ComputeBandKey(const plVec3& vCamera, const
   const Band switchBand = ClassifyBand(fMinDistance, fMaxDistance, thresholds.m_fSwitchDistance * m_fMinScale, thresholds.m_fSwitchDistance * m_fMaxScale, false);
   const Band cullBand = ClassifyBand(fMinDistance, fMaxDistance, thresholds.m_fCullDistance, thresholds.m_fCullDistance, true);
   const Band shadowBand = ClassifyBand(fMinDistance, fMaxDistance, thresholds.m_fShadowCullDistance, thresholds.m_fShadowCullDistance, true);
+  const Band shadowPartsBand = ClassifyBand(fMinDistance, fMaxDistance, thresholds.m_fShadowPartsDistance * m_fMinScale, thresholds.m_fShadowPartsDistance * m_fMaxScale, false);
 
-  return switchBand | (cullBand << 2) | (shadowBand << 4);
+  return switchBand | (cullBand << 2) | (shadowBand << 4) | (shadowPartsBand << 6);
 }
 
 bool plVegetationCompositeSplit::Update(plArrayPtr<const plVegetationCellInstance> instances, const plVec3& vCamera, const plVegetationCompositeThresholds& thresholds)
@@ -100,7 +107,7 @@ bool plVegetationCompositeSplit::Update(plArrayPtr<const plVegetationCellInstanc
   m_vCamera = vCamera;
 
   // Every threshold lies on the same side of the whole cell as before: no tree crossed one.
-  const bool bStraddles = (uiBandKey & 0x3) == Mixed || ((uiBandKey >> 2) & 0x3) == Mixed || ((uiBandKey >> 4) & 0x3) == Mixed;
+  const bool bStraddles = (uiBandKey & 0x3) == Mixed || ((uiBandKey >> 2) & 0x3) == Mixed || ((uiBandKey >> 4) & 0x3) == Mixed || ((uiBandKey >> 6) & 0x3) == Mixed;
   if (!bInputsChanged && !bStraddles && uiBandKey == m_uiBandKey)
     return false;
 

@@ -56,6 +56,7 @@ struct plVegetationCell
   plComponentHandle m_hComponent;
   plHybridArray<plVegetationCellGroup, 4> m_Groups;
   plUInt32 m_uiVersion = 0; ///< Bumped whenever groups or instances change; the renderer rebuilds its state on mismatch.
+  bool m_bContinuousShadow = true; ///< The cell object carries VSMContinuousShadow (any non-composite type in it).
 
   plUInt32 GetInstanceCount() const;
 };

@@ -17,7 +17,8 @@ struct plVegetationCompositeTreeState
     Parts = 2,  ///< The composite's parts, each an instance of its part mesh.
 
     MainMask = 3,
-    CastsShadow = 4, ///< Within the shadow cull distance and not flagged NoShadow: drawn into shadows as in the main view.
+    CastsShadow = 4, ///< Within the shadow cull distance and not flagged NoShadow.
+    ShadowParts = 8, ///< Parts in the main view and near enough to cast its shadow with parts too; else the merged mesh.
   };
 };
 
@@ -27,6 +28,7 @@ struct plVegetationCompositeThresholds
   float m_fSwitchDistance = 0.0f;     ///< At instance scale 1: parts closer than this times the scale, merged beyond.
   float m_fCullDistance = 0.0f;       ///< Trees further away are hidden.
   float m_fShadowCullDistance = 0.0f; ///< Trees further away cast no shadow; at most m_fCullDistance.
+  float m_fShadowPartsDistance = 0.0f; ///< At instance scale 1: shadows use parts closer than this, the merged mesh beyond.
   float m_fDensity = 1.0f;            ///< Vegetation.DensityScale: fraction of the non-hero trees kept, by colour seed.
 
   bool operator==(const plVegetationCompositeThresholds& other) const = default;

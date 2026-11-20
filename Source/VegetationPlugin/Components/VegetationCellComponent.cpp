@@ -35,6 +35,10 @@ PL_END_DYNAMIC_REFLECTED_TYPE;
 
 plCVarBool cvar_VegetationEnabled("Vegetation.Enabled", true, plCVarFlags::Save, "Renders vegetation instances");
 plCVarFloat cvar_VegetationDrawDistanceScale("Vegetation.DrawDistanceScale", 1.0f, plCVarFlags::Save, "Scales every vegetation type's cull and shadow distance");
+plCVarFloat cvar_VegetationCompositeMaxPartsDistance("Vegetation.Composite.MaxPartsDistance", 60.0f, plCVarFlags::Default,
+  "Foliage composite trees in vegetation layers show their parts at most this close (metres, at instance scale 1), whatever their switch error asks; the merged mesh beyond. 0 = no cap");
+plCVarFloat cvar_VegetationCompositeShadowPartsDistance("Vegetation.Composite.ShadowPartsDistance", 20.0f, plCVarFlags::Default,
+  "Foliage composite trees in vegetation layers cast their shadow with their parts only this close (metres, at instance scale 1); beyond, the merged mesh casts it");
 plCVarFloat cvar_VegetationDensityScale("Vegetation.DensityScale", 1.0f, plCVarFlags::Save, "Fraction of instances kept by distance thinning, 0..1");
 plCVarFloat cvar_VegetationRayTracingRange("Vegetation.RayTracing.Range", 128.0f, plCVarFlags::Default, "Largest distance in metres up to which vegetation is part of the ray tracing scene, whatever a type asks for. 0 keeps vegetation out of it.");
 
@@ -554,6 +558,11 @@ void plVegetationCellComponent::BuildCompositeBatches(const plVegetationCellGrou
 
     plVegetationCompositeThresholds thresholds;
     thresholds.m_fSwitchDistance = plVegetationCompositeInfo::ComputeSwitchDistance(info.m_fSwitchError, 1.0f, module.GetMainCameraViewportHeight(), module.GetMainCameraTanHalfFov(), GetCompositeSwitchErrorPixels());
+    // A coarse switch error would keep a tree in parts far out (a 0.2 m error at 1 px is ~190 m), and parts multiply
+    // the instance count by the placements per tree: cap it. The merged mesh keeps the detail out there.
+    if (cvar_VegetationCompositeMaxPartsDistance.GetValue() > 0.0f)
+      thresholds.m_fSwitchDistance = plMath::Min(thresholds.m_fSwitchDistance, cvar_VegetationCompositeMaxPartsDistance.GetValue());
+    thresholds.m_fShadowPartsDistance = plMath::Min(thresholds.m_fSwitchDistance, plMath::Max(cvar_VegetationCompositeShadowPartsDistance.GetValue(), 0.0f));
     thresholds.m_fCullDistance = render.m_fCullDistance * fDistanceScale;
     thresholds.m_fShadowCullDistance = render.m_bCastShadows ? plMath::Min(thresholds.m_fCullDistance, render.m_fShadowCullDistance * fDistanceScale) : -1.0f;
     thresholds.m_fDensity = plMath::Clamp(cvar_VegetationDensityScale.GetValue(), 0.0f, 1.0f);
@@ -627,6 +636,15 @@ void plVegetationCellComponent::FillCompositeSet(const plVegetationCellGroup& gr
   if (!bPartsReady)
     ref_set.m_bDirty = true;
 
+  // What a tree draws in this set: shadows keep parts only for the trees near enough (ShadowParts).
+  auto DrawnState = [bShadow](plUInt8 uiState) -> plUInt8
+  {
+    const plUInt8 uiMain = uiState & plVegetationCompositeTreeState::MainMask;
+    if (bShadow && uiMain == plVegetationCompositeTreeState::Parts && (uiState & plVegetationCompositeTreeState::ShadowParts) == 0)
+      return plVegetationCompositeTreeState::Merged;
+    return uiMain;
+  };
+
   // Counts first, so every batch is allocated once.
   plUInt32 uiPartTrees = 0;
   plUInt32 uiMergedTrees = 0;
@@ -636,7 +654,7 @@ void plVegetationCellComponent::FillCompositeSet(const plVegetationCellGroup& gr
     if (bShadow && (uiState & plVegetationCompositeTreeState::CastsShadow) == 0)
       continue;
 
-    const plUInt8 uiMain = uiState & plVegetationCompositeTreeState::MainMask;
+    const plUInt8 uiMain = DrawnState(uiState);
     if (uiMain == plVegetationCompositeTreeState::Parts && bPartsReady)
       ++uiPartTrees;
     else if (uiMain != plVegetationCompositeTreeState::Hidden)
@@ -691,7 +709,7 @@ void plVegetationCellComponent::FillCompositeSet(const plVegetationCellGroup& gr
     if (bShadow && (uiState & plVegetationCompositeTreeState::CastsShadow) == 0)
       continue;
 
-    plUInt8 uiMain = uiState & plVegetationCompositeTreeState::MainMask;
+    plUInt8 uiMain = DrawnState(uiState);
     if (uiMain == plVegetationCompositeTreeState::Hidden)
       continue;
     if (!bPartsReady)
@@ -844,7 +862,8 @@ void plVegetationCellComponent::EmitCompositeBatch(const CompositeBatch& batch, 
       continue;
 
     plMeshRenderData* pRenderData = msg.m_pRenderDataManager->CreateRenderDataForThisFrame<plMeshRenderData>(GetOwner());
-    pRenderData->m_Flags.Add(plRenderData::Flags::Dynamic);
+    // Not Dynamic: the trees stand still and only the bone shader moves them, so they keep the static categories and
+    // the virtual shadow map caches their shadows instead of redrawing every clipmap level each frame.
     // The ray tracing scene gets the cell's rest-pose snapshot of the merged mesh instead (GetRTChunks).
     pRenderData->m_Flags.Add(plRenderData::Flags::SkipGI);
     pRenderData->m_vGlobalPosition = cellBounds.IsValid() ? cellBounds.m_vCenter : m_pCell->m_vOrigin;

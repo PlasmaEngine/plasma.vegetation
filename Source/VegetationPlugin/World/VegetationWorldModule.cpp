@@ -30,6 +30,8 @@
 plCVarInt cvar_VegetationGrassUploadBudgetKB("Vegetation.Grass.UploadBudgetKB", 512, plCVarFlags::Default, "Painted grass coverage each world uploads per frame, nearest tiles first. At least one tile is grown per frame");
 plCVarBool cvar_VegetationTouchPhysics("Vegetation.Touch.Physics", true, plCVarFlags::Default, "Dynamic physics bodies and characters inside the touch map bend vegetation and grass without a Vegetation Touch component");
 plCVarInt cvar_VegetationTouchPhysicsCollisionLayer("Vegetation.Touch.PhysicsCollisionLayer", -1, plCVarFlags::Default, "Collision layer of the physics touch query: bodies whose layer collides with it bend vegetation. -1 queries with layer 0");
+plCVarFloat cvar_VegetationCompositeBoneRadius("Vegetation.Composite.BoneRadius", 120.0f, plCVarFlags::Default,
+  "Foliage composite trees in vegetation layers animate their bones only this close to the main camera (metres; 0 = their whole cull distance). Further trees stand in their rest pose without a bone palette");
 plCVarInt cvar_VegetationTouchMaxPhysicsSources("Vegetation.Touch.MaxPhysicsSources", 32, plCVarFlags::Default, "Most physics bodies that bend vegetation per frame, nearest to the camera first");
 
 extern plCVarBool cvar_VegetationEnabled;
@@ -1472,9 +1474,29 @@ void plVegetationWorldModule::UpdateCompositeBones()
   const plVec3 vCamera = m_vMainCameraPosition;
   const plUInt32 uiWorldIndex = GetWorld()->GetIndex();
 
+  const plTag& tagContinuous = plTagRegistry::GetGlobalRegistry().RegisterTag("VSMContinuousShadow");
+
   for (auto it = m_Cells.GetIterator(); it.IsValid(); ++it)
   {
     plVegetationCell& cell = *it.Value();
+
+    // A cell of composite trees only draws through static meshlet batches whose shadows the virtual shadow map caches,
+    // like the per-object composite component: continuous shadows would re-render every tree in every finest clipmap
+    // level each frame at full detail. Any other type keeps the tag, because its per-vertex wind moves its casters.
+    bool bAllComposite = !cell.m_Groups.IsEmpty();
+    auto updateShadowTag = plMakeScopeExit([&]() {
+      if (bAllComposite != cell.m_bContinuousShadow)
+        return;
+      plGameObject* pObject = nullptr;
+      if (GetWorld()->TryGetObject(cell.m_hObject, pObject))
+      {
+        if (bAllComposite)
+          pObject->RemoveTag(tagContinuous);
+        else
+          pObject->SetTag(tagContinuous);
+        cell.m_bContinuousShadow = !bAllComposite;
+      }
+    });
 
     for (plVegetationCellGroup& group : cell.m_Groups)
     {
@@ -1494,6 +1516,9 @@ void plVegetationWorldModule::UpdateCompositeBones()
             info.m_hMergedMesh = pType->GetLodMesh(0);
             info.m_fRadius = pType->GetBoundingRadius();
             info.m_fRange = pType->GetDescriptor().m_Render.m_fCullDistance * fDistanceScale;
+            // Wind on a tree too far to tell is pure cost: a pool slot, an update and a bone upload per tree and frame.
+            if (cvar_VegetationCompositeBoneRadius.GetValue() > 0.0f)
+              info.m_fRange = plMath::Min(info.m_fRange, cvar_VegetationCompositeBoneRadius.GetValue());
           }
         }
         else
@@ -1504,6 +1529,9 @@ void plVegetationWorldModule::UpdateCompositeBones()
         types.Insert(group.m_hType.GetResourceIDHash(), info);
         types.TryGetValue(group.m_hType.GetResourceIDHash(), pInfo);
       }
+
+      if (pInfo->m_bLoading || !pInfo->m_bComposite)
+        bAllComposite = false;
 
       if (pInfo->m_bLoading)
         continue;
