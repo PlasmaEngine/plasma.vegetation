@@ -284,7 +284,7 @@ private:
   plUInt32 m_uiBlendingCompositeTrees = 0;
 
   plVegetationCompositeWindTiles m_WindTiles;
-  float m_fWindTileSize = 64.0f; ///< Vegetation.Composite.WindTileSize at the last update; tree lookups use the same
+  float m_fWindTileSize = 256.0f; ///< Vegetation.Composite.WindTileSize at the last update; tree lookups use the same
 
   plHybridArray<TouchSource, 32> m_TouchSources;
   plHybridArray<TouchSource, 32> m_LastTouchSources; ///< Last frame's full set (components and physics), for promotion.

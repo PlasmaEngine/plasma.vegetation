@@ -16,7 +16,7 @@ struct plVegetationCellGroup;
 /// plFoliageBonePool instance and blends into it, and blends back once nothing has needed it for a while.
 struct plVegetationCompositeWindSettings
 {
-  float m_fTileSize = 64.0f;       ///< Vegetation.Composite.WindTileSize: metres per wind tile side.
+  float m_fTileSize = 256.0f;      ///< Vegetation.Composite.WindTileSize: metres per wind tile side.
   plUInt32 m_uiVariants = 8;       ///< Vegetation.Composite.WindVariants: shared variants per type and tile.
   float m_fPromoteRadius = 25.0f;  ///< Vegetation.Composite.PromoteRadius: trees this close to the main camera stand alone.
   float m_fTouchMargin = 1.0f;     ///< Metres a touch source may stay outside a tree's radius and still promote it.

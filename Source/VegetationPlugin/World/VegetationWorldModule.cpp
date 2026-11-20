@@ -31,7 +31,7 @@
 plCVarInt cvar_VegetationGrassUploadBudgetKB("Vegetation.Grass.UploadBudgetKB", 512, plCVarFlags::Default, "Painted grass coverage each world uploads per frame, nearest tiles first. At least one tile is grown per frame");
 plCVarBool cvar_VegetationTouchPhysics("Vegetation.Touch.Physics", true, plCVarFlags::Default, "Dynamic physics bodies and characters inside the touch map bend vegetation and grass without a Vegetation Touch component");
 plCVarInt cvar_VegetationTouchPhysicsCollisionLayer("Vegetation.Touch.PhysicsCollisionLayer", -1, plCVarFlags::Default, "Collision layer of the physics touch query: bodies whose layer collides with it bend vegetation. -1 queries with layer 0");
-plCVarFloat cvar_VegetationCompositeWindTileSize("Vegetation.Composite.WindTileSize", 64.0f, plCVarFlags::Default,
+plCVarFloat cvar_VegetationCompositeWindTileSize("Vegetation.Composite.WindTileSize", 256.0f, plCVarFlags::Default,
   "Side of the square tiles (metres) whose foliage composite trees of one type share a few wind-animated bone variants (Vegetation.Composite.WindVariants)");
 plCVarInt cvar_VegetationCompositeWindVariants("Vegetation.Composite.WindVariants", 8, plCVarFlags::Default,
   "Shared bone wind variants per foliage composite type and wind tile, differing in phase and stiffness; every drawn tree borrows one (1..32)");

@@ -451,6 +451,7 @@ PL_CREATE_SIMPLE_TEST(ForestCells, WindTileLifetime)
   plVegetationCompositeWindTiles tiles;
   plVegetationCompositeWindSettings settings;
   plDynamicArray<plVegetationCompositeWindTiles::Change> changes;
+  settings.m_fTileSize = 64.0f; // the tile coordinates and centres below are picked for 64 m tiles
   const float dt = 0.1f;
 
   auto Frame = [&](bool bUsed) {
