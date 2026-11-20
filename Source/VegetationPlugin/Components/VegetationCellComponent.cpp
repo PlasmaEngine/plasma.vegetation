@@ -522,6 +522,8 @@ void plVegetationCellComponent::BuildBatches(const plVegetationCellGroup& group,
       pRenderData->m_Flags.Add(plRenderData::Flags::Dynamic);
       // These batches follow the view. The ray tracing scene gets the cell's snapshots instead (GetRTChunks).
       pRenderData->m_Flags.Add(plRenderData::Flags::SkipGI);
+      // Editor clicks go through vegetation to what lies beneath: a pick would redraw the whole batch.
+      pRenderData->m_Flags.Add(plRenderData::Flags::NotPickable);
       pRenderData->m_vGlobalPosition = cellBounds.IsValid() ? cellBounds.m_vCenter : m_pCell->m_vOrigin;
       pRenderData->SetFallbackGlobalBounds(cellBounds);
       pRenderData->Fill(batch.m_Offset, batch.m_hBuffer, hMaterial, hMesh, uiMaterialIndex, uiPart, batch.m_uiVisible);
@@ -907,6 +909,8 @@ void plVegetationCellComponent::EmitCompositeBatch(const CompositeBatch& batch, 
     // the virtual shadow map caches their shadows instead of redrawing every clipmap level each frame.
     // The ray tracing scene gets the cell's rest-pose snapshot of the merged mesh instead (GetRTChunks).
     pRenderData->m_Flags.Add(plRenderData::Flags::SkipGI);
+    // Editor clicks go through vegetation to what lies beneath: a pick would redraw every part instance of the batch.
+    pRenderData->m_Flags.Add(plRenderData::Flags::NotPickable);
     pRenderData->m_vGlobalPosition = cellBounds.IsValid() ? cellBounds.m_vCenter : m_pCell->m_vOrigin;
     pRenderData->SetFallbackGlobalBounds(cellBounds);
     pRenderData->Fill(batch.m_Offset, batch.m_hBuffer, hMaterial, hMesh, uiMaterialIndex, uiSubMesh, batch.m_uiCount);
