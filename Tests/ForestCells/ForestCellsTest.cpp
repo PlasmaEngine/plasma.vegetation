@@ -4,6 +4,7 @@
 #include <TestFramework/Utilities/TestSetup.h>
 #include <VegetationPlugin/Resources/VegetationTypeResource.h>
 #include <VegetationPlugin/World/VegetationCompositeSplit.h>
+#include <VegetationPlugin/World/VegetationCompositeWind.h>
 #include <VegetationPlugin/World/VegetationWorldModule.h>
 
 // CPU checks of how vegetation cells draw foliage composites: the per-tree parts/merged split and when it reports a
@@ -286,4 +287,413 @@ PL_CREATE_SIMPLE_TEST(ForestCells, BonePoolIdTravelsWithSwap)
   PL_TEST_INT(trees.GetCount(), 3);
   PL_TEST_INT(trees[1].m_uiBoneInstance, 103);
   PL_TEST_FLOAT(trees[1].m_vPosition.x, 3.0f, 0.0f);
+}
+
+namespace
+{
+  /// Stands in for plFoliageBonePool: ids in registration order, a pose after m_uiPoseFrames ticks.
+  class FakeWindBackend : public plVegetationCompositeWindBackend
+  {
+  public:
+    struct Entry
+    {
+      bool m_bAlive = false;
+      bool m_bShared = false;
+      plVec3 m_vSample = plVec3::MakeZero();
+      float m_fPhase = 0.0f;
+      float m_fStiffness = 1.0f;
+      plUInt32 m_uiAge = 0;
+    };
+
+    virtual plUInt32 RegisterVariant(plUInt64 uiTypeKey, const plVec3& vWindSample, float fPhase, float fStiffnessScale) override
+    {
+      PL_IGNORE_UNUSED(uiTypeKey);
+      if (!m_bMeshReady)
+        return InvalidInstance;
+      Entry& e = m_Entries.ExpandAndGetRef();
+      e.m_bAlive = true;
+      e.m_bShared = true;
+      e.m_vSample = vWindSample;
+      e.m_fPhase = fPhase;
+      e.m_fStiffness = fStiffnessScale;
+      ++m_uiRegistrations;
+      return m_Entries.GetCount() - 1;
+    }
+
+    virtual plUInt32 RegisterTree(plUInt64 uiTypeKey, const plVegetationCellInstance& tree) override
+    {
+      PL_IGNORE_UNUSED(uiTypeKey);
+      PL_IGNORE_UNUSED(tree);
+      if (!m_bMeshReady)
+        return InvalidInstance;
+      m_Entries.ExpandAndGetRef().m_bAlive = true;
+      ++m_uiRegistrations;
+      return m_Entries.GetCount() - 1;
+    }
+
+    virtual void UpdateTree(plUInt32 uiInstance, const plVegetationCellInstance& tree) override
+    {
+      PL_IGNORE_UNUSED(uiInstance);
+      PL_IGNORE_UNUSED(tree);
+      ++m_uiTreeUpdates;
+    }
+
+    virtual void Unregister(plUInt32& inout_uiInstance) override
+    {
+      if (inout_uiInstance < m_Entries.GetCount())
+        m_Entries[inout_uiInstance].m_bAlive = false;
+      inout_uiInstance = InvalidInstance;
+      ++m_uiUnregistrations;
+    }
+
+    virtual bool GetPose(plUInt32 uiInstance, plUInt32& out_uiPaletteOffset, plUInt32& out_uiBoneCount) override
+    {
+      if (uiInstance >= m_Entries.GetCount() || !m_Entries[uiInstance].m_bAlive)
+        return false;
+      out_uiPaletteOffset = uiInstance * 100;
+      out_uiBoneCount = 50;
+      return m_Entries[uiInstance].m_uiAge >= m_uiPoseFrames;
+    }
+
+    /// The pool's dispatch at the next BeginRender.
+    void Tick()
+    {
+      for (Entry& e : m_Entries)
+        e.m_uiAge += e.m_bAlive ? 1 : 0;
+    }
+
+    plUInt32 GetAlive(bool bShared) const
+    {
+      plUInt32 uiCount = 0;
+      for (const Entry& e : m_Entries)
+        uiCount += (e.m_bAlive && e.m_bShared == bShared) ? 1 : 0;
+      return uiCount;
+    }
+
+    plDynamicArray<Entry> m_Entries;
+    bool m_bMeshReady = true;
+    plUInt32 m_uiPoseFrames = 1;
+    plUInt32 m_uiRegistrations = 0;
+    plUInt32 m_uiUnregistrations = 0;
+    plUInt32 m_uiTreeUpdates = 0;
+  };
+
+  plVegetationCompositeTreeWind::GroupInputs MakeGroupInputs(const plVec3& vCamera)
+  {
+    plVegetationCompositeTreeWind::GroupInputs inputs;
+    inputs.m_uiTypeKey = 42;
+    inputs.m_vCamera = vCamera;
+    inputs.m_vCellMin = plVec2(0, 0);
+    inputs.m_fCellSize = 32.0f;
+    inputs.m_fDrawRange = 400.0f;
+    inputs.m_fTypeRadius = 3.0f;
+    return inputs;
+  }
+} // namespace
+
+PL_CREATE_SIMPLE_TEST(ForestCells, WindVariantAssignment)
+{
+  PL_TEST_BLOCK(plTestBlock::Enabled, "Same tree, same variant; every variant used")
+  {
+    plUInt32 uiUsed[8] = {};
+    for (plUInt32 i = 0; i < 1000; ++i)
+    {
+      const plVec3 vPosition(i * 1.37f, (i % 31) * 2.11f, 5.0f);
+      const plUInt32 v = plVegetationCompositeWindTiles::ChooseVariant(vPosition, static_cast<plUInt8>(i), 8);
+      PL_TEST_BOOL(v < 8);
+      PL_TEST_INT(plVegetationCompositeWindTiles::ChooseVariant(vPosition, static_cast<plUInt8>(i), 8), v);
+      ++uiUsed[v];
+    }
+    for (plUInt32 v = 0; v < 8; ++v)
+      PL_TEST_BOOL(uiUsed[v] > 60); // ~125 each
+
+    PL_TEST_INT(plVegetationCompositeWindTiles::ChooseVariant(plVec3(1, 2, 3), 7, 1), 0);
+  }
+
+  PL_TEST_BLOCK(plTestBlock::Enabled, "Variant parameters are deterministic and spread")
+  {
+    const plUInt64 uiTile = plVegetationCompositeWindTiles::MakeKey(42, -3, 5);
+    PL_TEST_BOOL(uiTile != plVegetationCompositeWindTiles::MakeKey(42, 5, -3));
+    PL_TEST_BOOL(uiTile != plVegetationCompositeWindTiles::MakeKey(43, -3, 5));
+
+    float phases[8];
+    for (plUInt32 v = 0; v < 8; ++v)
+    {
+      float fPhase = 0.0f, fStiffness = 0.0f, fPhase2 = 0.0f, fStiffness2 = 0.0f;
+      plVegetationCompositeWindTiles::ComputeVariantParams(uiTile, v, 8, fPhase, fStiffness);
+      plVegetationCompositeWindTiles::ComputeVariantParams(uiTile, v, 8, fPhase2, fStiffness2);
+      PL_TEST_FLOAT(fPhase, fPhase2, 0.0f);
+      PL_TEST_FLOAT(fStiffness, fStiffness2, 0.0f);
+      PL_TEST_BOOL(fStiffness >= 0.8f && fStiffness <= 1.2f);
+      PL_TEST_BOOL(fPhase >= 0.0f && fPhase < 6.2832f);
+      phases[v] = fPhase;
+    }
+    // Spaced a cycle / 8 apart, give or take 20 % of that each.
+    for (plUInt32 v = 1; v < 8; ++v)
+      PL_TEST_BOOL(phases[v] - phases[v - 1] > 6.2831853f / 8.0f * 0.5f);
+  }
+
+  PL_TEST_BLOCK(plTestBlock::Enabled, "Tile coordinates")
+  {
+    plInt32 x, y;
+    plVegetationCompositeWindTiles::TileCoords(plVec3(-0.5f, 63.9f, 0), 64.0f, x, y);
+    PL_TEST_INT(x, -1);
+    PL_TEST_INT(y, 0);
+    plVegetationCompositeWindTiles::TileCoords(plVec3(64.0f, 128.5f, 0), 64.0f, x, y);
+    PL_TEST_INT(x, 1);
+    PL_TEST_INT(y, 2);
+  }
+}
+
+PL_CREATE_SIMPLE_TEST(ForestCells, WindTileLifetime)
+{
+  FakeWindBackend backend;
+  plVegetationCompositeWindTiles tiles;
+  plVegetationCompositeWindSettings settings;
+  plDynamicArray<plVegetationCompositeWindTiles::Change> changes;
+  const float dt = 0.1f;
+
+  auto Frame = [&](bool bUsed) {
+    changes.Clear();
+    tiles.BeginFrame();
+    if (bUsed)
+      tiles.MarkUsed(42, 1, 2, -1, 10.0f, settings, backend, changes);
+    tiles.Update(dt, settings, backend, changes);
+    backend.Tick();
+  };
+
+  plVegetationCellInstance tree = MakeTree(plVec3(150.0f, -20.0f, 10.0f), 1.0f, 9);
+  plUInt32 uiOffset = 0, uiBones = 0;
+
+  PL_TEST_BLOCK(plTestBlock::Enabled, "Registered on first use, ready once posed")
+  {
+    Frame(true);
+    PL_TEST_INT(backend.GetAlive(true), 8);
+    PL_TEST_INT(tiles.GetVariantCount(), 8);
+    PL_TEST_INT(changes.GetCount(), 0); // no pose yet
+    PL_TEST_BOOL(!tiles.GetTreePalette(42, tree, settings.m_fTileSize, uiOffset, uiBones));
+
+    // Canonical sample position: the tile centre at the given height.
+    PL_TEST_VEC3(backend.m_Entries[0].m_vSample, plVec3(160.0f, -32.0f, 10.0f), 0.0f);
+
+    Frame(true);
+    PL_TEST_INT(changes.GetCount(), 1);
+    PL_TEST_BOOL(tiles.GetTreePalette(42, tree, settings.m_fTileSize, uiOffset, uiBones));
+    PL_TEST_INT(uiOffset, plVegetationCompositeWindTiles::ChooseVariant(tree.m_vPosition, tree.m_uiColorSeed, 8) * 100);
+    PL_TEST_INT(uiBones, 50);
+
+    // Ready and used: nothing more to do.
+    const plUInt32 uiRegistrations = backend.m_uiRegistrations;
+    for (plUInt32 f = 0; f < 50; ++f)
+    {
+      Frame(true);
+      PL_TEST_INT(changes.GetCount(), 0);
+    }
+    PL_TEST_INT(backend.m_uiRegistrations, uiRegistrations);
+  }
+
+  PL_TEST_BLOCK(plTestBlock::Enabled, "Released after the delay, kept through short gaps")
+  {
+    // A few unused frames (a camera wobbling at the edge of the draw range) keep it.
+    for (plUInt32 f = 0; f < 10; ++f)
+      Frame(false);
+    Frame(true);
+    PL_TEST_INT(backend.GetAlive(true), 8);
+    PL_TEST_INT(changes.GetCount(), 0);
+
+    // m_fTileReleaseDelay = 2 s of 0.1 s frames.
+    plUInt32 uiReleasedAt = 0;
+    for (plUInt32 f = 1; f <= 30 && uiReleasedAt == 0; ++f)
+    {
+      Frame(false);
+      if (backend.GetAlive(true) == 0)
+        uiReleasedAt = f;
+    }
+    PL_TEST_BOOL(uiReleasedAt >= 20 && uiReleasedAt <= 21); // float accumulation may take one more frame
+    PL_TEST_INT(changes.GetCount(), 1);
+    PL_TEST_INT(tiles.GetVariantCount(), 0);
+    PL_TEST_INT(tiles.GetTileCount(), 0);
+    PL_TEST_BOOL(!tiles.GetTreePalette(42, tree, settings.m_fTileSize, uiOffset, uiBones));
+  }
+
+  PL_TEST_BLOCK(plTestBlock::Enabled, "Mesh not ready: retried; a new variant count or type remakes the tile")
+  {
+    backend.m_bMeshReady = false;
+    Frame(true);
+    PL_TEST_INT(backend.GetAlive(true), 0);
+    backend.m_bMeshReady = true;
+    Frame(true);
+    Frame(true);
+    PL_TEST_INT(backend.GetAlive(true), 8);
+    PL_TEST_INT(changes.GetCount(), 1);
+
+    settings.m_uiVariants = 4;
+    Frame(true);
+    PL_TEST_INT(backend.GetAlive(true), 4);
+    PL_TEST_INT(tiles.GetVariantCount(), 4);
+    PL_TEST_INT(changes.GetCount(), 1); // the ready tile went away
+
+    tiles.ReleaseAll(backend);
+    PL_TEST_INT(backend.GetAlive(true), 0);
+    PL_TEST_INT(tiles.GetVariantCount(), 0);
+  }
+}
+
+PL_CREATE_SIMPLE_TEST(ForestCells, TreePromotionTiming)
+{
+  FakeWindBackend backend;
+  plVegetationCompositeWindSettings settings;
+  const float dt = 0.1f; // fake clock: settings are 0.5 s blend, 2 s demote delay
+
+  plVegetationCellGroup group;
+  group.m_Instances.PushBack(MakeTree(plVec3(10, 10, 0)));
+  group.m_Instances.PushBack(MakeTree(plVec3(20, 20, 0)));
+  plVegetationCellInstance& tree = group.m_Instances[0];
+
+  // The camera far away (but within the 400 m draw range): only the touch can promote.
+  plVegetationCompositeTreeWind::TouchSphere touch = {plVec3(11, 10, 0), 0.5f};
+
+  plVegetationCompositeTreeWind::GroupResult result;
+  auto Frame = [&](bool bTouch, const plVec3& vCamera = plVec3(200, 200, 0)) {
+    plVegetationCompositeTreeWind::GroupInputs inputs = MakeGroupInputs(vCamera);
+    if (bTouch)
+      inputs.m_Touches = plArrayPtr<const plVegetationCompositeTreeWind::TouchSphere>(&touch, 1);
+    plVegetationCompositeTreeWind::UpdateGroup(group, inputs, dt, settings, backend, result);
+    backend.Tick();
+  };
+
+  PL_TEST_BLOCK(plTestBlock::Enabled, "Touch promotes, blends in over BlendTime once posed")
+  {
+    const plUInt32 uiGeneration = group.m_uiBonesGeneration;
+    Frame(true);
+    PL_TEST_INT(result.m_uiPromoted, 1);
+    PL_TEST_BOOL(tree.m_uiBoneInstance != plVegetationCompositeWindBackend::InvalidInstance);
+    PL_TEST_INT(group.m_Instances[1].m_uiBoneInstance, plVegetationCompositeWindBackend::InvalidInstance);
+    PL_TEST_INT(group.m_uiBoneInstances, 1);
+    PL_TEST_INT(group.m_uiBonesGeneration, uiGeneration + 1);
+    PL_TEST_BOOL(group.m_bBonesBlending);
+    PL_TEST_FLOAT(plVegetationCompositeTreeWind::GetSharedWeight(tree), 1.0f, 0.0f);
+
+    // Posed from the next frame; 0.5 s / 0.1 s = five steps to fully standalone.
+    for (plUInt32 f = 1; f <= 5; ++f)
+    {
+      Frame(true);
+      PL_TEST_BOOL(group.m_bBonesBlending);
+      PL_TEST_FLOAT(plVegetationCompositeTreeWind::GetSharedWeight(tree), 1.0f - f * 0.2f, 1e-4f);
+    }
+    Frame(true);
+    PL_TEST_BOOL(!group.m_bBonesBlending); // fully standalone: no bone writes
+    PL_TEST_INT(result.m_uiStandalone, 1);
+    PL_TEST_INT(group.m_uiBonesGeneration, uiGeneration + 1);
+  }
+
+  PL_TEST_BLOCK(plTestBlock::Enabled, "Demoted DemoteDelay after the last touch, blended out, then unregistered")
+  {
+    const plUInt32 uiGeneration = group.m_uiBonesGeneration;
+    plUInt32 uiBlendOutAt = 0, uiDemotedAt = 0;
+    for (plUInt32 f = 1; f <= 40 && uiDemotedAt == 0; ++f)
+    {
+      Frame(false);
+      if (uiBlendOutAt == 0 && plVegetationCompositeTreeWind::GetSharedWeight(tree) > 0.0f)
+        uiBlendOutAt = f;
+      if (result.m_uiDemoted > 0)
+        uiDemotedAt = f;
+    }
+    // Idle reaches 2 s at frame 20 (float accumulation may take one more), then five steps back to shared.
+    PL_TEST_BOOL(uiBlendOutAt >= 20 && uiBlendOutAt <= 21);
+    PL_TEST_INT(uiDemotedAt, uiBlendOutAt + 4);
+    PL_TEST_INT(tree.m_uiBoneInstance, plVegetationCompositeWindBackend::InvalidInstance);
+    PL_TEST_INT(group.m_uiBoneInstances, 0);
+    PL_TEST_INT(group.m_uiBonesGeneration, uiGeneration + 1);
+    PL_TEST_INT(backend.GetAlive(false), 0);
+    PL_TEST_FLOAT(plVegetationCompositeTreeWind::GetSharedWeight(tree), 1.0f, 0.0f);
+  }
+
+  PL_TEST_BLOCK(plTestBlock::Enabled, "A touch during the blend out brings it back without re-registering")
+  {
+    Frame(true);
+    for (plUInt32 f = 0; f < 6; ++f)
+      Frame(true);
+    for (plUInt32 f = 0; f < 22; ++f)
+      Frame(false);
+    PL_TEST_BOOL(plVegetationCompositeTreeWind::GetSharedWeight(tree) > 0.0f);
+    PL_TEST_BOOL(tree.m_uiBoneInstance != plVegetationCompositeWindBackend::InvalidInstance);
+    const plUInt32 uiRegistrations = backend.m_uiRegistrations;
+    Frame(true);
+    Frame(true);
+    PL_TEST_INT(backend.m_uiRegistrations, uiRegistrations);
+    for (plUInt32 f = 0; f < 6; ++f)
+      Frame(true);
+    PL_TEST_FLOAT(plVegetationCompositeTreeWind::GetSharedWeight(tree), 0.0f, 0.0f);
+    for (plUInt32 f = 0; f < 40; ++f)
+      Frame(false);
+    PL_TEST_INT(group.m_uiBoneInstances, 0);
+  }
+
+  PL_TEST_BLOCK(plTestBlock::Enabled, "Camera within PromoteRadius, and pins")
+  {
+    Frame(false, plVec3(10, 30, 0)); // 20 m from tree 0, 10 m from tree 1
+    PL_TEST_INT(result.m_uiPromoted, 2);
+    for (plUInt32 f = 0; f < 40; ++f)
+      Frame(false);
+    PL_TEST_INT(group.m_uiBoneInstances, 0);
+
+    group.m_Instances[1].m_uiWindPins = 1;
+    group.m_uiPinnedTrees = 1;
+    Frame(false);
+    PL_TEST_INT(result.m_uiPromoted, 1);
+    PL_TEST_BOOL(group.m_Instances[1].m_uiBoneInstance != plVegetationCompositeWindBackend::InvalidInstance);
+    for (plUInt32 f = 0; f < 60; ++f)
+      Frame(false);
+    PL_TEST_BOOL(group.m_Instances[1].m_uiBoneInstance != plVegetationCompositeWindBackend::InvalidInstance); // pinned: stays
+
+    group.m_Instances[1].m_uiWindPins = 0;
+    group.m_uiPinnedTrees = 0;
+    for (plUInt32 f = 0; f < 40; ++f)
+      Frame(false);
+    PL_TEST_INT(group.m_uiBoneInstances, 0);
+  }
+
+  PL_TEST_BLOCK(plTestBlock::Enabled, "Not drawn: never promoted")
+  {
+    plVegetationCompositeTreeWind::GroupInputs inputs = MakeGroupInputs(plVec3(10, 30, 0));
+    inputs.m_fDrawRange = 5.0f;
+    inputs.m_Touches = plArrayPtr<const plVegetationCompositeTreeWind::TouchSphere>(&touch, 1);
+    plVegetationCompositeTreeWind::UpdateGroup(group, inputs, dt, settings, backend, result);
+    PL_TEST_INT(result.m_uiPromoted, 0);
+  }
+}
+
+PL_CREATE_SIMPLE_TEST(ForestCells, SharedTreesCostNothingPerFrame)
+{
+  // A cell of shared trees, away from the camera and every touch: no per-tree work, no pool calls, no bone data to
+  // rewrite (the generation stays, nothing blends) however many frames pass.
+  FakeWindBackend backend;
+  plVegetationCompositeWindSettings settings;
+
+  plVegetationCellGroup group;
+  MakeCell(plVec3(0, 0, 0), group.m_Instances);
+  const plUInt32 uiGeneration = group.m_uiBonesGeneration;
+
+  const plVegetationCompositeTreeWind::TouchSphere farTouch = {plVec3(200, 0, 0), 1.0f};
+  plVegetationCompositeTreeWind::GroupInputs inputs = MakeGroupInputs(plVec3(-100, 16, 0));
+  inputs.m_Touches = plArrayPtr<const plVegetationCompositeTreeWind::TouchSphere>(&farTouch, 1);
+
+  plVegetationCompositeTreeWind::GroupResult result;
+  for (plUInt32 f = 0; f < 1000; ++f)
+  {
+    plVegetationCompositeTreeWind::UpdateGroup(group, inputs, 1.0f / 60.0f, settings, backend, result);
+    PL_TEST_BOOL(!result.m_bEvaluatedPerTree);
+    PL_TEST_BOOL(!group.m_bBonesBlending);
+  }
+  PL_TEST_INT(group.m_uiBonesGeneration, uiGeneration);
+  PL_TEST_INT(backend.m_uiRegistrations, 0);
+  PL_TEST_INT(backend.m_uiTreeUpdates, 0);
+  PL_TEST_INT(group.m_uiBoneInstances, 0);
+
+  // A camera inside the cell's promote reach looks at its trees, and promotes only the near ones.
+  inputs.m_vCamera = plVec3(-5, 0, 0);
+  plVegetationCompositeTreeWind::UpdateGroup(group, inputs, 1.0f / 60.0f, settings, backend, result);
+  PL_TEST_BOOL(result.m_bEvaluatedPerTree);
+  PL_TEST_BOOL(result.m_uiPromoted > 0 && result.m_uiPromoted < group.m_Instances.GetCount());
 }

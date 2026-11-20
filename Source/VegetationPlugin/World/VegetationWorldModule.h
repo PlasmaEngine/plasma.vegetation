@@ -10,8 +10,10 @@
 #include <VegetationPlugin/Grass/GrassGpuManager.h>
 #include <VegetationPlugin/Resources/VegetationTypeResource.h>
 #include <VegetationPlugin/VegetationDeclarations.h>
+#include <VegetationPlugin/World/VegetationCompositeWind.h>
 
 class plVegetationCellComponent;
+struct plFoliageInstanceBones;
 class plVegetationLayerComponent;
 class plGrassCoverageData;
 struct plGrassCoverageEntry;
@@ -29,7 +31,12 @@ struct plVegetationCellInstance
   plBitflags<plVegetationInstanceFlags> m_Flags;
   plVegetationTileId m_TileId;
   plUInt32 m_uiIndexInTile;
-  plUInt32 m_uiBoneInstance; ///< plFoliageBonePool instance of a foliage composite tree, 0xFFFFFFFF while it has none.
+  /// Standalone plFoliageBonePool instance of a promoted foliage composite tree, 0xFFFFFFFF while it borrows a shared
+  /// variant's pose only (plVegetationCompositeWindTiles).
+  plUInt32 m_uiBoneInstance;
+  float m_fStandalone; ///< 0 = shared pose only, 1 = own pose only; blends while promoted (plVegetationCompositeTreeWind).
+  float m_fWindIdle;   ///< Seconds the promoted tree has not been needed standalone.
+  plUInt16 m_uiWindPins; ///< plVegetationWorldModule::PinTree calls without a matching UnpinTree.
 };
 
 /// \brief All instances of one type inside one cell.
@@ -38,11 +45,13 @@ struct plVegetationCellGroup
   plVegetationTypeResourceHandle m_hType;
   plDynamicArray<plVegetationCellInstance> m_Instances;
 
-  /// Bumped whenever a tree of the group registers with or leaves plFoliageBonePool: the cell rewrites the bone data of
-  /// its batches.
+  /// Bumped whenever a tree of the group is promoted or demoted, or a wind tile its trees borrow from becomes ready or is
+  /// released: the cell rewrites the bone data of its batches.
   plUInt32 m_uiBonesGeneration = 0;
-  plUInt32 m_uiBoneInstances = 0; ///< instances with a plFoliageBonePool registration
+  plUInt32 m_uiBoneInstances = 0; ///< promoted instances with a standalone plFoliageBonePool registration
+  plUInt32 m_uiPinnedTrees = 0;   ///< instances with m_uiWindPins > 0
   plUInt32 m_uiBonesTypeChangeCounter = 0xFFFFFFFF; ///< type change counter the registrations were made for
+  bool m_bBonesBlending = false; ///< This frame a promoted tree blends or waits for its pose: the cell rewrites those trees.
 };
 
 /// \brief A 32 m square column of the world holding every vegetation instance inside it, rendered by one
@@ -104,8 +113,28 @@ public:
   /// plFoliageBonesComponent; 0xFFFFFFFF before the first update.
   plUInt32 GetFoliageBonesDataIndex() const { return m_uiFoliageBonesDataIndex; }
 
-  /// \brief Foliage composite trees kept registered and animated by plFoliageBonePool at the last update. For stats.
-  plUInt32 GetAnimatedCompositeTreeCount() const { return m_uiAnimatedCompositeTrees; }
+  /// \brief Keeps a foliage composite tree standalone - its own bone instance at its real transform - until UnpinTree,
+  /// for gameplay that needs it to move on its own (a tree being cut, shaken or climbed). The tree blends in over
+  /// Vegetation.Composite.BlendTime once drawn. False when the instance does not exist. Pins count.
+  bool PinTree(const plVegetationInstanceRef& tree);
+
+  /// \brief Releases a PinTree. Once nothing else needs it for Vegetation.Composite.DemoteDelay the tree blends back to
+  /// the shared wind.
+  bool UnpinTree(const plVegetationInstanceRef& tree);
+
+  /// \brief Foliage composite trees standing alone, fully blended, at the last update. For stats and tests.
+  plUInt32 GetStandaloneCompositeTreeCount() const { return m_uiStandaloneCompositeTrees; }
+
+  /// \brief Foliage composite trees blending between shared and standalone at the last update.
+  plUInt32 GetBlendingCompositeTreeCount() const { return m_uiBlendingCompositeTrees; }
+
+  /// \brief Shared wind variants registered with plFoliageBonePool.
+  plUInt32 GetCompositeSharedVariantCount() const { return m_WindTiles.GetVariantCount(); }
+
+  /// \brief The bone data a drawn foliage composite tree's instances carry: its tile's shared variant (when ready), its
+  /// standalone palette (when promoted and posed), the blend between them and the tree's transform. uiTypeKey is the
+  /// type's resource id hash.
+  void FillTreeBones(plUInt64 uiTypeKey, const plVegetationCellInstance& tree, plFoliageInstanceBones& out_bones) const;
 
   /// \brief Touch sources registered this frame, consumed by the touch map.
   struct TouchSource
@@ -218,9 +247,13 @@ private:
   void NotifyCellChanged(plVegetationCell& cell);
   void BeginFrame(const plWorldModule::UpdateContext& context);
 
-  /// Registers the foliage composite trees near the main camera with plFoliageBonePool and keeps their pool transforms
-  /// current, so the pool animates or freezes them (Vegetation.Bones.AnimationDistance).
+  /// Keeps the shared wind variants of every wind tile with drawn foliage composite trees registered with
+  /// plFoliageBonePool, and promotes trees that need their own motion to standalone instances (touch sources, the main
+  /// camera, pins), blending them in and out (plVegetationCompositeWindTiles, plVegetationCompositeTreeWind).
   void UpdateCompositeBones();
+
+  /// Finds a stored instance by its reference, nullptr when it does not exist.
+  plVegetationCellInstance* FindInstance(const plVegetationInstanceRef& ref, plVegetationCellGroup*& out_pGroup);
   static void UnregisterBones(plVegetationCellGroup& ref_group, plVegetationCellInstance& ref_instance);
   static void UnregisterBones(plVegetationCellGroup& ref_group);
   void PublishTouchMap(const plWorldModule::UpdateContext& context);
@@ -247,7 +280,12 @@ private:
   mutable float m_fMainCameraViewportHeight = 1080.0f;
 
   plUInt32 m_uiFoliageBonesDataIndex = 0xFFFFFFFF;
-  plUInt32 m_uiAnimatedCompositeTrees = 0;
+  plUInt32 m_uiStandaloneCompositeTrees = 0;
+  plUInt32 m_uiBlendingCompositeTrees = 0;
+
+  plVegetationCompositeWindTiles m_WindTiles;
+  float m_fWindTileSize = 64.0f; ///< Vegetation.Composite.WindTileSize at the last update; tree lookups use the same
 
   plHybridArray<TouchSource, 32> m_TouchSources;
+  plHybridArray<TouchSource, 32> m_LastTouchSources; ///< Last frame's full set (components and physics), for promotion.
 };

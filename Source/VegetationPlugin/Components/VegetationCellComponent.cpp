@@ -583,8 +583,12 @@ void plVegetationCellComponent::BuildCompositeBatches(const plVegetationCellGrou
     bBonesStale = true;
   }
 
+  // Shared trees' bone data is static: written when the split or a generation changes. Only promoted trees that blend
+  // are rewritten per frame.
   if (bBonesStale)
-    WriteCompositeBones(group, set, msg);
+    WriteCompositeBones(group, set, module, msg);
+  else if (group.m_bBonesBlending)
+    WriteActiveCompositeBones(group, set, module, msg);
 
   const plBoundingBoxSphere cellBounds = GetOwner()->GetGlobalBounds();
   const plMeshResourceHandle& hMergedMesh = type.GetLodMesh(0);
@@ -767,10 +771,12 @@ void plVegetationCellComponent::FillCompositeSet(const plVegetationCellGroup& gr
     ref_set.m_Parts[p].m_uiCount = partCursor[p];
 }
 
-void plVegetationCellComponent::WriteCompositeBones(const plVegetationCellGroup& group, CompositeSet& ref_set, plMsgExtractRenderData& msg) const
+void plVegetationCellComponent::WriteCompositeBones(const plVegetationCellGroup& group, CompositeSet& ref_set, const plVegetationWorldModule& module, plMsgExtractRenderData& msg) const
 {
   ref_set.m_uiBonesGeneration = group.m_uiBonesGeneration;
   ref_set.m_bBonesPending = false;
+  ref_set.m_ActiveSlots.Clear();
+  ref_set.m_uiActiveWriteFrame = plRenderWorld::GetFrameCounter();
 
   if (m_uiFoliageBonesDataIndex == 0xFFFFFFFF)
   {
@@ -778,13 +784,14 @@ void plVegetationCellComponent::WriteCompositeBones(const plVegetationCellGroup&
     return;
   }
 
-  // Each tree's palette location, read from the pool once however many of its instances are drawn.
+  // Each tree's bone data, made once however many of its instances are drawn.
+  const plUInt64 uiTypeKey = group.m_hType.GetResourceIDHash();
   plDynamicArray<plFoliageInstanceBones> treeBones;
   plDynamicArray<plUInt8> treeRead;
   treeBones.SetCount(group.m_Instances.GetCount());
   treeRead.SetCount(group.m_Instances.GetCount());
 
-  auto Write = [&](CompositeBatch& ref_batch, plUInt32 uiFlags)
+  auto Write = [&](CompositeBatch& ref_batch, plUInt32 uiBatch, plUInt32 uiFlags)
   {
     if (ref_batch.m_uiCount == 0)
       return;
@@ -807,22 +814,56 @@ void plVegetationCellComponent::WriteCompositeBones(const plVegetationCellGroup&
       if (treeRead[t] == 0)
       {
         treeRead[t] = 1;
-        const plUInt32 uiPoolInstance = group.m_Instances[t].m_uiBoneInstance;
-        plFoliageBonePool::GetInstanceBones(uiPoolInstance, treeBones[t]);
-        // Registered but not dispatched yet: the palette holds no pose. Read again next frame.
-        ref_set.m_bBonesPending |= uiPoolInstance != plFoliageBonePool::InvalidInstance && treeBones[t].Valid == 0;
+        module.FillTreeBones(uiTypeKey, group.m_Instances[t], treeBones[t]);
       }
 
       slots[k] = treeBones[t];
       slots[k].Flags |= uiFlags;
+
+      // A promoted tree's own pose and blend move while it blends: its slots are rewritten then (the pool's own pose
+      // becomes valid, or the blend moves, without a generation change).
+      if (group.m_Instances[t].m_uiBoneInstance != plFoliageBonePool::InvalidInstance)
+        ref_set.m_ActiveSlots.PushBack({uiBatch, k});
     }
   };
 
-  for (CompositeBatch& batch : ref_set.m_Parts)
-    Write(batch, 0);
+  for (plUInt32 p = 0; p < ref_set.m_Parts.GetCount(); ++p)
+    Write(ref_set.m_Parts[p], p, 0);
 
   // The merged mesh gives each vertex the two heaviest bones of its part instance (TexCoord1.x and .y).
-  Write(ref_set.m_Merged, FOLIAGE_BONES_FLAG_VERTEX_WEIGHTS);
+  Write(ref_set.m_Merged, MergedBatch, FOLIAGE_BONES_FLAG_VERTEX_WEIGHTS);
+}
+
+void plVegetationCellComponent::WriteActiveCompositeBones(const plVegetationCellGroup& group, CompositeSet& ref_set, const plVegetationWorldModule& module, plMsgExtractRenderData& msg) const
+{
+  // Every view of a frame extracts the same set; once per frame is enough.
+  const plUInt64 uiFrame = plRenderWorld::GetFrameCounter();
+  if (ref_set.m_uiActiveWriteFrame == uiFrame || ref_set.m_ActiveSlots.IsEmpty() || m_uiFoliageBonesDataIndex == 0xFFFFFFFF)
+    return;
+  ref_set.m_uiActiveWriteFrame = uiFrame;
+
+  const plUInt64 uiTypeKey = group.m_hType.GetResourceIDHash();
+  plUInt32 uiMappedBatch = 0xFFFFFFFE;
+  plArrayPtr<plFoliageInstanceBones> slots;
+
+  // Grouped by batch as the full write recorded them, so each batch is mapped once.
+  for (const CompositeSet::ActiveSlot& active : ref_set.m_ActiveSlots)
+  {
+    CompositeBatch& batch = active.m_uiBatch == MergedBatch ? ref_set.m_Merged : ref_set.m_Parts[active.m_uiBatch];
+    if (active.m_uiBatch != uiMappedBatch)
+    {
+      uiMappedBatch = active.m_uiBatch;
+      slots = {};
+      if (!batch.m_BonesOffset.IsInvalidated())
+        slots = msg.m_pRenderDataManager->GetOrCreateCustomInstanceData<plFoliageInstanceBones>(m_uiFoliageBonesDataIndex, this, batch.m_hBonesBuffer, batch.m_BonesOffset, batch.m_uiBonesCapacity);
+    }
+    if (active.m_uiSlot >= slots.GetCount() || active.m_uiSlot >= batch.m_Trees.GetCount() || batch.m_Trees[active.m_uiSlot] >= group.m_Instances.GetCount())
+      continue;
+
+    const plVegetationCellInstance& tree = group.m_Instances[batch.m_Trees[active.m_uiSlot]];
+    module.FillTreeBones(uiTypeKey, tree, slots[active.m_uiSlot]);
+    slots[active.m_uiSlot].Flags |= active.m_uiBatch == MergedBatch ? FOLIAGE_BONES_FLAG_VERTEX_WEIGHTS : 0u;
+  }
 }
 
 void plVegetationCellComponent::EmitCompositeBatch(const CompositeBatch& batch, const plMeshResourceHandle& hMesh, const plVegetationTypeResource& type, const plMeshResourceHandle& hMergedMesh, const plBoundingBoxSphere& cellBounds, plMsgExtractRenderData& msg) const

@@ -113,5 +113,6 @@ PL_STATICLINK_LIBRARY(VegetationPlugin)
   PL_STATICLINK_REFERENCE(VegetationPlugin_Grass_GrassTypeResource);
   PL_STATICLINK_REFERENCE(VegetationPlugin_Resources_VegetationTypeResource);
   PL_STATICLINK_REFERENCE(VegetationPlugin_World_VegetationCompositeSplit);
+  PL_STATICLINK_REFERENCE(VegetationPlugin_World_VegetationCompositeWind);
   PL_STATICLINK_REFERENCE(VegetationPlugin_World_VegetationWorldModule);
 }

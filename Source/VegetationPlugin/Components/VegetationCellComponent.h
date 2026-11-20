@@ -97,9 +97,21 @@ private:
     plDynamicArray<CompositeBatch> m_Parts; ///< by composite part index
     CompositeBatch m_Merged;
     bool m_bDirty = true;         ///< the split changed (or a part mesh was loading): instances are written again
-    bool m_bBonesPending = false; ///< a registered tree had no pose yet: its bone data is read again next frame
+    bool m_bBonesPending = false; ///< bone data could not be written: written again next frame
     plUInt32 m_uiBonesGeneration = 0xFFFFFFFF;
+
+    /// Drawn instances of promoted trees, rewritten every frame their group blends: batch (part index, or
+    /// MergedBatch) and slot. Rebuilt by every full bone write.
+    struct ActiveSlot
+    {
+      PL_DECLARE_POD_TYPE();
+      plUInt32 m_uiBatch;
+      plUInt32 m_uiSlot;
+    };
+    plDynamicArray<ActiveSlot> m_ActiveSlots;
+    plUInt64 m_uiActiveWriteFrame = 0xFFFFFFFFFFFFFFFF; ///< frame the active slots were last written in (once per frame for every view)
   };
+  static constexpr plUInt32 MergedBatch = 0xFFFFFFFF;
 
   /// A foliage composite type's per-tree split and its batches, rebuilt only when a tree crosses a threshold.
   struct CompositeState
@@ -127,7 +139,11 @@ private:
   /// Draws a type whose LOD 0 is a foliage composite (see plVegetationCompositeInfo).
   void BuildCompositeBatches(const plVegetationCellGroup& group, CompositeState& ref_state, const plVegetationTypeResource& type, const plVegetationCompositeInfo& info, bool bShadow, const plVegetationWorldModule& module, plMsgExtractRenderData& msg) const;
   void FillCompositeSet(const plVegetationCellGroup& group, CompositeSet& ref_set, plArrayPtr<const plUInt8> states, const plVegetationTypeResource& type, const plVegetationCompositeInfo& info, bool bShadow, plMsgExtractRenderData& msg) const;
-  void WriteCompositeBones(const plVegetationCellGroup& group, CompositeSet& ref_set, plMsgExtractRenderData& msg) const;
+  /// Every drawn instance's bone data: its tree's shared variant, own palette and blend (plVegetationWorldModule::FillTreeBones).
+  void WriteCompositeBones(const plVegetationCellGroup& group, CompositeSet& ref_set, const plVegetationWorldModule& module, plMsgExtractRenderData& msg) const;
+
+  /// Only the drawn instances of promoted trees, while their group blends: no per-frame work for shared trees.
+  void WriteActiveCompositeBones(const plVegetationCellGroup& group, CompositeSet& ref_set, const plVegetationWorldModule& module, plMsgExtractRenderData& msg) const;
   void EmitCompositeBatch(const CompositeBatch& batch, const plMeshResourceHandle& hMesh, const plVegetationTypeResource& type, const plMeshResourceHandle& hMergedMesh, const plBoundingBoxSphere& cellBounds, plMsgExtractRenderData& msg) const;
 
   /// \brief World-space box around every instance of the cell at its bounding radius; invalid for an empty cell.
