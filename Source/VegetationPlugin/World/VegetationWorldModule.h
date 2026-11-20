@@ -162,6 +162,8 @@ private:
     bool m_bResident = false; ///< the tile's strands are in the pool
     bool m_bDirty = true;     ///< the coverage changed since the resident strands were grown
     bool m_bSeen = false;
+    plUInt64 m_uiFullCountKey = 0; ///< Vegetation.Grass.Debug.StreamMode 1: what m_uiFullCount was counted for
+    plUInt32 m_uiFullCount = 0;    ///< strands of the tile at stride 1, cached under m_uiFullCountKey
   };
 
   /// \brief One grass type of one painted layer in the GPU strand pool, drawn through a generated render object.
