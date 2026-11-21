@@ -93,6 +93,7 @@ private:
     plGALDynamicBufferHandle m_hBonesBuffer;
     plUInt32 m_uiBonesCapacity = 0;
     plUInt32 m_uiCount = 0;
+    plUInt32 m_uiCrossfading = 0; ///< the last m_uiCrossfading of m_uiCount instances dither in a hand-off (drawn flagged LodCrossfade)
     plDynamicArray<plUInt32> m_Trees; ///< per drawn instance, the instance index of its tree in the group
   };
 

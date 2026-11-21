@@ -392,7 +392,7 @@ PL_CREATE_SIMPLE_TEST(Vegetation, TypeFileVersions)
     PL_TEST_STRING(loaded.m_Lods[0].m_sMesh, original.m_Lods[0].m_sMesh);
   }
 
-  PL_TEST_BLOCK(plTestBlock::Enabled, "Version 3 round trip")
+  PL_TEST_BLOCK(plTestBlock::Enabled, "Version 4 round trip")
   {
     plVegetationTypeResourceDescriptor desc = original;
     desc.m_Placement.m_fDensityWeight = 2.5f;
@@ -406,7 +406,7 @@ PL_CREATE_SIMPLE_TEST(Vegetation, TypeFileVersions)
       plMemoryStreamReader versionReader(&storage);
       plUInt8 uiVersion = 0;
       versionReader >> uiVersion;
-      PL_TEST_INT(uiVersion, 3);
+      PL_TEST_INT(uiVersion, 4);
     }
 
     plVegetationTypeResourceDescriptor loaded;
@@ -422,11 +422,11 @@ PL_CREATE_SIMPLE_TEST(Vegetation, TypeFileVersions)
   {
     plDefaultMemoryStreamStorage storage;
     plMemoryStreamWriter writer(&storage);
-    writer << static_cast<plUInt8>(4);
+    writer << static_cast<plUInt8>(5);
 
     plTestLogInterface log;
     plTestLogSystemScope logScope(&log);
-    log.ExpectMessage("Unknown vegetation type version 4", plLogMsgType::ErrorMsg);
+    log.ExpectMessage("Unknown vegetation type version 5", plLogMsgType::ErrorMsg);
 
     plVegetationTypeResourceDescriptor loaded;
     plMemoryStreamReader reader(&storage);
