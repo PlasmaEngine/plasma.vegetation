@@ -201,6 +201,31 @@ SamplerState ImpostorAlbedo_AutoSampler BIND_GROUP(BG_MATERIAL);
 Texture2D ImpostorNormalDepth BIND_GROUP(BG_MATERIAL);
 SamplerState ImpostorNormalDepth_AutoSampler BIND_GROUP(BG_MATERIAL);
 
+// The far levels of the tree's mesh are cubes: they cover more than the leaves they stand for, and their faces catch
+// the light one cube at a time. The impostor meets them at the hand-off with the three values below.
+// Share of a texel's samples that must show the tree for the pixel to draw; lower draws thin foliage fuller.
+#define IMPOSTOR_COVERAGE_CUT 0.25
+// Atlas texels (at the sampled mip) per side of one leaf cluster, which shades with one normal.
+#define IMPOSTOR_CLUSTER_TEXELS 3.0
+// Share of the clusters that lie flat, facing up; the others face the viewer, cosine-weighted.
+#define IMPOSTOR_FLAT_SHARE 0.5
+// Share of the baked mean normal in a cluster's shading normal.
+#define IMPOSTOR_MEAN_NORMAL_SHARE 0.15
+
+// Three uniform random numbers per leaf cluster (xy) and mip (z), the same from every view of the cluster.
+float3 ImpostorHash3(float3 cluster)
+{
+  uint3 v = uint3(cluster);
+  uint h = v.x * 0x9E3779B1u ^ v.y * 0x85EBCA77u ^ v.z * 0xC2B2AE3Du;
+  h ^= h >> 15;
+  h *= 0x2C1B3C6Du;
+  h ^= h >> 12;
+  h *= 0x297A2D39u;
+  h ^= h >> 15;
+  const uint h2 = h * 0x9E3779B1u + 0x7F4A7C15u;
+  return float3(h & 0xFFFFu, h >> 16, h2 >> 16) / 65535.0;
+}
+
 float ImpostorDitherNoise(float2 pixelPos)
 {
   // Same interleaved gradient noise as the LOD crossfade of Vegetation.plShader, so the two halves of a hand-off match.
@@ -262,6 +287,9 @@ void FillCustomGlobals()
   float3 surface = 0;
   float coverage = 0;
   float weightSum = 0;
+  // The atlas texel of the view that contributes most: it names the leaf this pixel shades as (see below).
+  float3 leafTexel = 0;
+  float leafWeight = 0;
 
   [unroll]
   for (uint k = 0; k < 3; ++k)
@@ -295,6 +323,11 @@ void FillCustomGlobals()
     hit = planeHit + ray * ((b.b * 2.0 - 1.0) * radius / denom);
 
     const float wa = weights[k] * a.a;
+    if (wa > leafWeight)
+    {
+      leafWeight = wa;
+      leafTexel = float3(floor(atlasUV * layout.w * exp2(-floor(lod)) / IMPOSTOR_CLUSTER_TEXELS), floor(lod));
+    }
     albedo.rgb += a.rgb * wa;
     normal += ImpostorOctDecodeNormal(b.rg * 2.0 - 1.0) * wa;
     translucency += b.a * wa;
@@ -304,7 +337,7 @@ void FillCustomGlobals()
   }
 
   // Coverage of the views that took part; the atlases' mips keep it right under the 0.5 test.
-  if (coverage < 0.5 * max(weightSum, 1.0e-4))
+  if (coverage < IMPOSTOR_COVERAGE_CUT * max(weightSum, 1.0e-4))
     discard;
 
   // Hand-off, by CustomData.w:
@@ -345,6 +378,24 @@ void FillCustomGlobals()
 
   float3 normalWorld = mul(rotation, normal);
   normalWorld = dot(normalWorld, normalWorld) > 1.0e-8 ? normalize(normalWorld) : -rayWorld;
+
+  // A texel shows many leaves and the atlas keeps their mean normal, which faces the view: lit with it, a canopy loses
+  // the leaves that catch the light. Each cluster of texels shades as one leaf surface instead: flat ones face up, the
+  // others lie cosine-weighted around the direction to the viewer, as the leaves a view sees do. A small share of the
+  // mean keeps the crown's form.
+  const float3 leafRandom = ImpostorHash3(leafTexel);
+  const float3 toViewer = -rayWorld;
+  const float3 leafAxis = leafRandom.z < IMPOSTOR_FLAT_SHARE ? float3(0, 0, 1) : toViewer;
+  const float3 leafReference = abs(leafAxis.z) > 0.9 ? float3(1, 0, 0) : float3(0, 0, 1);
+  const float3 leafRight = normalize(cross(leafReference, leafAxis));
+  const float3 leafUp = cross(leafAxis, leafRight);
+  const float leafAngle = 6.2831853 * leafRandom.x;
+  // Flat clusters stay within a few degrees of up.
+  const float leafSpread = leafRandom.z < IMPOSTOR_FLAT_SHARE ? leafRandom.y * 0.05 : leafRandom.y;
+  float3 leafNormal = (leafRight * cos(leafAngle) + leafUp * sin(leafAngle)) * sqrt(leafSpread) + leafAxis * sqrt(1.0 - leafSpread);
+  // Two-sided: the side the viewer sees.
+  leafNormal = dot(leafNormal, toViewer) < 0.0 ? -leafNormal : leafNormal;
+  normalWorld = normalize(lerp(leafNormal, normalWorld, IMPOSTOR_MEAN_NORMAL_SHARE));
   G.ImpNormal = normalWorld;
 
   // Lighting, shadows and fog see the reconstructed surface, not the quad.
