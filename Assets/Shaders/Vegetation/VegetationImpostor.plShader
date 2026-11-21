@@ -166,7 +166,8 @@ VS_OUT main(VS_IN Input)
 
 #define USE_MATERIAL_OCCLUSION
 #define USE_FOG
-#define USE_PIXEL_DEPTH
+// The depth is the quad's own, not the reconstructed surface's: the lit pass then rejects every impostor behind the
+// nearest one with its equal depth test before shading, where a depth written by the pixel stage is only compared after.
 #define USE_MATERIAL_FOLIAGE_REPRESENTATION
 // The tree as the atlases show it at this pixel, filled once in FillCustomGlobals.
 #define CUSTOM_GLOBALS float4 ImpAlbedo; float3 ImpNormal; float ImpTranslucency; float ImpDepth;
