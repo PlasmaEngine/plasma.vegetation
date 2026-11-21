@@ -148,8 +148,11 @@ float3 GetWorldPositionOffset(plPerInstanceData data, float3 worldPosition)
   const float3 right = normalize(cross(reference, dir));
   const float3 quadUp = cross(dir, right);
 
+  // The depth written is the quad's. A shadow view's quad stands at the tree's centre, so the half of the crown toward
+  // the light stays lit and the half behind it is shaded; in the other views it stands in front of the sphere.
+  const float front = IsShadowPass ? 0.0 : radius;
   const float2 corner = G.Input.TexCoord0.xy * 2.0 - 1.0;
-  const float3 position = swayedCenter - dir * radius + (right * corner.x + quadUp * corner.y) * radius;
+  const float3 position = swayedCenter - dir * front + (right * corner.x + quadUp * corner.y) * radius;
   return position - worldPosition;
 }
 
