@@ -43,6 +43,10 @@ plCVarFloat cvar_VegetationCompositeBlendTime("Vegetation.Composite.BlendTime", 
   "Seconds a foliage composite tree takes to blend between its shared wind variant and its own bone instance");
 plCVarFloat cvar_VegetationCompositeDemoteDelay("Vegetation.Composite.DemoteDelay", 2.0f, plCVarFlags::Default,
   "Seconds a standalone foliage composite tree must go without a touch, the camera nearby or a pin before it blends back to its shared wind variant");
+plCVarBool cvar_VegetationCompositeControlHandOff("Vegetation.Composite.ControlHandOff", true, plCVarFlags::Default,
+  "A foliage composite tree that gets its own bone instance starts bent, simulating with its shared wind variant's wind sample, stiffness and phase, and then moves to its own. Off: it starts unbent with its own at once");
+plCVarFloat cvar_VegetationCompositeControlBlendTime("Vegetation.Composite.ControlBlendTime", 1.5f, plCVarFlags::Default,
+  "Seconds a standalone foliage composite tree's wind control takes between its shared variant's and its own. Keep it below Vegetation.Composite.DemoteDelay so the control is back at the variant's before the tree blends back");
 plCVarInt cvar_VegetationTouchMaxPhysicsSources("Vegetation.Touch.MaxPhysicsSources", 32, plCVarFlags::Default, "Most physics bodies that bend vegetation per frame, nearest to the camera first");
 
 namespace
@@ -62,9 +66,12 @@ namespace
   class PoolWindBackend : public plVegetationCompositeWindBackend
   {
   public:
-    PoolWindBackend(plUInt32 uiWorldIndex, const plHashTable<plUInt64, plMeshResourceHandle>* pMeshes)
+    /// With pTiles, a tree that gets its own instance takes over from the shared variant it borrows.
+    PoolWindBackend(plUInt32 uiWorldIndex, const plHashTable<plUInt64, plMeshResourceHandle>* pMeshes, const plVegetationCompositeWindTiles* pTiles = nullptr, float fTileSize = 0.0f)
       : m_uiWorldIndex(uiWorldIndex)
       , m_pMeshes(pMeshes)
+      , m_pTiles(pTiles)
+      , m_fTileSize(fTileSize)
     {
     }
 
@@ -76,10 +83,21 @@ namespace
 
     virtual plUInt32 RegisterTree(plUInt64 uiTypeKey, const plVegetationCellInstance& tree) override
     {
-      PL_IGNORE_UNUSED(tree);
       const plMeshResourceHandle* pMesh = m_pMeshes != nullptr ? m_pMeshes->GetValue(uiTypeKey) : nullptr;
-      return pMesh != nullptr ? plFoliageBonePool::RegisterInstance(m_uiWorldIndex, *pMesh) : InvalidInstance;
+      const plUInt32 uiInstance = pMesh != nullptr ? plFoliageBonePool::RegisterInstance(m_uiWorldIndex, *pMesh) : InvalidInstance;
+
+      // The tree shows its shared variant's wind-bent pose until now. Its own simulation takes over the variant's wind
+      // sample point, stiffness and phase and starts bent, so the pose blend runs between two matching bends, and the
+      // control then moves to the tree's own.
+      if (uiInstance != InvalidInstance && cvar_VegetationCompositeControlHandOff)
+      {
+        const plUInt32 uiVariant = m_pTiles != nullptr ? m_pTiles->GetTreeVariant(uiTypeKey, tree, m_fTileSize) : InvalidInstance;
+        plFoliageBonePool::StartInstanceFromVariant(uiInstance, uiVariant, plMath::Max(cvar_VegetationCompositeControlBlendTime.GetValue(), 0.0f));
+      }
+      return uiInstance;
     }
+
+    virtual void SetTreeWanted(plUInt32 uiInstance, bool bWanted) override { plFoliageBonePool::SetInstanceOwnControl(uiInstance, bWanted); }
 
     virtual void UpdateTree(plUInt32 uiInstance, const plVegetationCellInstance& tree) override
     {
@@ -104,6 +122,8 @@ namespace
   private:
     plUInt32 m_uiWorldIndex = 0;
     const plHashTable<plUInt64, plMeshResourceHandle>* m_pMeshes = nullptr;
+    const plVegetationCompositeWindTiles* m_pTiles = nullptr;
+    float m_fTileSize = 0.0f;
   };
 } // namespace
 
@@ -1550,7 +1570,7 @@ void plVegetationWorldModule::UpdateCompositeBones()
   const plVegetationCompositeWindSettings settings = GetCompositeWindSettings();
   const plUInt32 uiWorldIndex = GetWorld()->GetIndex();
   plHashTable<plUInt64, plMeshResourceHandle> meshes;
-  PoolWindBackend backend(uiWorldIndex, &meshes);
+  PoolWindBackend backend(uiWorldIndex, &meshes, &m_WindTiles, settings.m_fTileSize);
   plDynamicArray<plVegetationCompositeWindTiles::Change> tileChanges;
 
   // A new tile size moves every tree to another tile: the old tiles go unused and are released.

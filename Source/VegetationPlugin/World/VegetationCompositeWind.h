@@ -45,6 +45,15 @@ public:
   /// Keeps a standalone tree animating at its transform; called every frame it is registered.
   virtual void UpdateTree(plUInt32 uiInstance, const plVegetationCellInstance& tree) = 0;
 
+  /// Called every frame for a standalone tree: whether something still wants it standalone. A backend whose trees take
+  /// over their shared variant's wind control moves it to the tree's own while wanted, and back before the tree is
+  /// given up, so the pose blend at either end runs between two matching bends.
+  virtual void SetTreeWanted(plUInt32 uiInstance, bool bWanted)
+  {
+    PL_IGNORE_UNUSED(uiInstance);
+    PL_IGNORE_UNUSED(bWanted);
+  }
+
   virtual void Unregister(plUInt32& inout_uiInstance) = 0;
 
   /// Whether the instance's palette holds a pose; out_uiPaletteOffset and out_uiBoneCount locate it.
@@ -110,6 +119,9 @@ public:
 
   /// The shared palette a tree borrows. False while its tile is not ready.
   bool GetTreePalette(plUInt64 uiTypeKey, const plVegetationCellInstance& tree, float fTileSize, plUInt32& out_uiPaletteOffset, plUInt32& out_uiBoneCount) const;
+
+  /// The pool instance of the shared variant a tree borrows. InvalidInstance while its tile is not ready.
+  plUInt32 GetTreeVariant(plUInt64 uiTypeKey, const plVegetationCellInstance& tree, float fTileSize) const;
 
   plUInt32 GetTileCount() const { return m_Tiles.GetCount(); }
 

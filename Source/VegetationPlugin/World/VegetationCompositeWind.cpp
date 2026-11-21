@@ -183,6 +183,17 @@ bool plVegetationCompositeWindTiles::GetTreePalette(plUInt64 uiTypeKey, const pl
   return true;
 }
 
+plUInt32 plVegetationCompositeWindTiles::GetTreeVariant(plUInt64 uiTypeKey, const plVegetationCellInstance& tree, float fTileSize) const
+{
+  plInt32 iX, iY;
+  TileCoords(tree.m_vPosition, fTileSize, iX, iY);
+  const Tile* pTile = Find(uiTypeKey, iX, iY);
+  if (pTile == nullptr || !pTile->m_bReady)
+    return plVegetationCompositeWindBackend::InvalidInstance;
+
+  return pTile->m_Variants[ChooseVariant(tree.m_vPosition, tree.m_uiColorSeed, pTile->m_uiVariantCount)];
+}
+
 //////////////////////////////////////////////////////////////////////////
 // plVegetationCompositeTreeWind
 
@@ -282,6 +293,7 @@ void plVegetationCompositeTreeWind::UpdateGroup(plVegetationCellGroup& ref_group
     {
       plUInt32 uiOffset = 0, uiBones = 0;
       bOwnPoseValid = ref_backend.GetPose(tree.m_uiBoneInstance, uiOffset, uiBones);
+      ref_backend.SetTreeWanted(tree.m_uiBoneInstance, bWanted);
     }
 
     switch (Step(tree, bWanted, bOwnPoseValid, fDeltaTime, settings))
@@ -301,7 +313,7 @@ void plVegetationCompositeTreeWind::UpdateGroup(plVegetationCellGroup& ref_group
           bRegisterFailed = true;
           break;
         }
-        // Starts at rest, fully shared; it blends in once the pool posed it.
+        // Starts fully shared, its own springs bent as its shared variant's are; it blends in once the pool posed it.
         tree.m_fStandalone = 0.0f;
         tree.m_fWindIdle = 0.0f;
         ++ref_group.m_uiBoneInstances;
