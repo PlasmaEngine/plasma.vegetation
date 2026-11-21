@@ -48,7 +48,7 @@ plCVarFloat cvar_VegetationRayTracingRange("Vegetation.RayTracing.Range", 128.0f
 // Far representations of foliage composite types, nearest to farthest: trees (parts, then the merged mesh through its
 // cluster hierarchy) up to Vegetation.CellShell.Distance, the cell's merged voxel shell from there, and impostors beyond
 // the type's impostor distance (times Vegetation.Impostor.DistanceScale). Every hand-off is a short screen dither.
-plCVarBool cvar_VegetationImpostorEnabled("Vegetation.Impostor.Enabled", true, plCVarFlags::Default,
+plCVarBool cvar_VegetationImpostorEnabled("Vegetation.Impostor.Enabled", false, plCVarFlags::Default,
   "Foliage composite trees with a baked impostor draw it beyond their type's impostor distance; off keeps the shell or the merged mesh out there");
 plCVarFloat cvar_VegetationImpostorDistanceScale("Vegetation.Impostor.DistanceScale", 1.0f, plCVarFlags::Default,
   "Scales every vegetation type's impostor distance (the hand-off to the impostors)");
