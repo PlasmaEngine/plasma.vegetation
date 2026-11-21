@@ -58,7 +58,7 @@ plCVarBool cvar_VegetationImpostorShadows("Vegetation.Impostor.Shadows", true, p
   "Trees beyond the impostor distance cast their shadow with the impostor too; off casts it with the merged mesh");
 plCVarBool cvar_VegetationImpostorFarCells("Vegetation.Impostor.FarCells", true, plCVarFlags::Default,
   "Vegetation cells entirely beyond the impostor hand-off draw their impostors from instance data written once, without per-tree work per frame");
-plCVarBool cvar_VegetationCellShellEnabled("Vegetation.CellShell.Enabled", true, plCVarFlags::Default,
+plCVarBool cvar_VegetationCellShellEnabled("Vegetation.CellShell.Enabled", false, plCVarFlags::Default,
   "Foliage composite trees with a voxel proxy draw as their cell's merged voxel shell between Vegetation.CellShell.Distance and the impostors");
 plCVarFloat cvar_VegetationCellShellDistance("Vegetation.CellShell.Distance", 90.0f, plCVarFlags::Default,
   "Metres from the main camera where the trees hand over to their cell's merged voxel shell (the middle of the hand-off)");
