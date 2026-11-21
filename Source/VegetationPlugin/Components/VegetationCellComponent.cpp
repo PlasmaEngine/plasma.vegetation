@@ -4,6 +4,7 @@
 #include <Foundation/Configuration/CVar.h>
 #include <RendererCore/Lights/Implementation/VirtualShadowPool.h>
 #include <RendererCore/Meshes/MeshComponentBase.h>
+#include <RendererCore/Meshes/MeshResourceDescriptor.h>
 #include <RendererCore/Pipeline/RenderDataManager.h>
 #include <RendererCore/Pipeline/View.h>
 #include <RendererCore/RenderWorld/RenderWorld.h>
@@ -12,9 +13,11 @@
 #include <RendererFoundation/Device/Device.h>
 #include <RendererFoundation/Resources/DynamicBuffer.h>
 #include <VegetationPlugin/Components/VegetationCellComponent.h>
+#include <VegetationPlugin/World/VegetationCellShell.h>
 #include <VegetationPlugin/World/VegetationWorldModule.h>
 
 #include <Shaders/Vegetation/FoliageBonesData.h>
+#include <Shaders/Vegetation/FoliageRepresentation.h>
 
 // clang-format off
 PL_BEGIN_COMPONENT_TYPE(plVegetationCellComponent, 1, plComponentMode::Static)
@@ -41,6 +44,47 @@ plCVarFloat cvar_VegetationCompositeShadowPartsDistance("Vegetation.Composite.Sh
   "Foliage composite trees in vegetation layers cast their shadow with their parts only this close (metres, at instance scale 1); beyond, the merged mesh casts it");
 plCVarFloat cvar_VegetationDensityScale("Vegetation.DensityScale", 1.0f, plCVarFlags::Save, "Fraction of instances kept by distance thinning, 0..1");
 plCVarFloat cvar_VegetationRayTracingRange("Vegetation.RayTracing.Range", 128.0f, plCVarFlags::Default, "Largest distance in metres up to which vegetation is part of the ray tracing scene, whatever a type asks for. 0 keeps vegetation out of it.");
+
+// Far representations of foliage composite types, nearest to farthest: trees (parts, then the merged mesh through its
+// cluster hierarchy) up to Vegetation.CellShell.Distance, the cell's merged voxel shell from there, and impostors beyond
+// the type's impostor distance (times Vegetation.Impostor.DistanceScale). Every hand-off is a short screen dither.
+plCVarBool cvar_VegetationImpostorEnabled("Vegetation.Impostor.Enabled", true, plCVarFlags::Default,
+  "Foliage composite trees with a baked impostor draw it beyond their type's impostor distance; off keeps the shell or the merged mesh out there");
+plCVarFloat cvar_VegetationImpostorDistanceScale("Vegetation.Impostor.DistanceScale", 1.0f, plCVarFlags::Default,
+  "Scales every vegetation type's impostor distance (the hand-off to the impostors)");
+plCVarFloat cvar_VegetationImpostorFadeDistance("Vegetation.Impostor.FadeDistance", 10.0f, plCVarFlags::Default,
+  "Metres over which the impostors dither in against the shell or the merged mesh. 0 = switch at once");
+plCVarBool cvar_VegetationImpostorShadows("Vegetation.Impostor.Shadows", true, plCVarFlags::Default,
+  "Trees beyond the impostor distance cast their shadow with the impostor too; off casts it with the merged mesh");
+plCVarBool cvar_VegetationImpostorFarCells("Vegetation.Impostor.FarCells", true, plCVarFlags::Default,
+  "Vegetation cells entirely beyond the impostor hand-off draw their impostors from instance data written once, without per-tree work per frame");
+plCVarBool cvar_VegetationCellShellEnabled("Vegetation.CellShell.Enabled", true, plCVarFlags::Default,
+  "Foliage composite trees with a voxel proxy draw as their cell's merged voxel shell between Vegetation.CellShell.Distance and the impostors");
+plCVarFloat cvar_VegetationCellShellDistance("Vegetation.CellShell.Distance", 90.0f, plCVarFlags::Default,
+  "Metres from the main camera where the trees hand over to their cell's merged voxel shell (the middle of the hand-off)");
+plCVarFloat cvar_VegetationCellShellFadeDistance("Vegetation.CellShell.FadeDistance", 10.0f, plCVarFlags::Default,
+  "Metres over which the trees and the cell's voxel shell dither against each other");
+plCVarFloat cvar_VegetationCellShellVoxelSize("Vegetation.CellShell.VoxelSize", 0.6f, plCVarFlags::Default,
+  "Metres: the voxel grid of the cells' merged voxel shells. Cells rebuild when it changes");
+
+/// Builds a cell's merged voxel shell on a task from a copy of what it needs.
+class plVegetationCellShellTask final : public plTask
+{
+public:
+  plVegetationCellShellTask() { ConfigureTask("Vegetation Cell Shell", plTaskNesting::Never); }
+
+  plDynamicArray<plVegetationCellShellTree> m_Trees;
+  plHybridArray<plSharedPtr<plVegetationVoxelProxy>, 8> m_Proxies; ///< keeps the trees' proxies alive
+  plVec3 m_vOrigin = plVec3::MakeZero();
+  plVegetationCellShellSettings m_Settings;
+
+  plMeshResourceDescriptor m_Mesh;
+  plVegetationCellShellStats m_Stats;
+  bool m_bSucceeded = false;
+
+private:
+  virtual void Execute() override { m_bSucceeded = plVegetationCellShellBuilder::Build(m_Trees, m_vOrigin, m_Settings, m_Mesh, &m_Stats).Succeeded(); }
+};
 
 extern plCVarInt cvar_VegetationRayTracingLodOverride;
 plCVarBool cvar_VegetationRayTracingLogTypes("Vegetation.RayTracing.LogTypes", false, plCVarFlags::Default, "Log once per vegetation type whether it is part of the ray tracing scene, with its size, traced LOD and range.");
@@ -92,6 +136,14 @@ namespace
     return 1.0f;
   }
 
+  /// The random seed of a drawn instance: a hash of its position and colour seed, with how it is drawn in the top bits
+  /// for the Foliage Representation view mode.
+  plUInt32 MakeInstanceSeed(const plVegetationCellInstance& inst, plUInt32 uiRepresentation)
+  {
+    const plUInt32 uiHash = plHashingUtils::xxHash32(&inst.m_vPosition, sizeof(plVec3)) ^ inst.m_uiColorSeed;
+    return (uiHash & FOLIAGE_REPRESENTATION_SEED_MASK) | (uiRepresentation << FOLIAGE_REPRESENTATION_SHIFT);
+  }
+
   /// The instance colour of every colour seed of a type; white without a gradient.
   void ResolveSeedColors(const plVegetationTypeResource& type, plColor out_colors[256])
   {
@@ -124,6 +176,11 @@ void plVegetationCellComponent::OnDeactivated()
   }
 
   ReleaseBatches(GetWorld()->GetModuleReadOnly<plRenderDataManager>());
+
+  {
+    PL_LOCK(m_BatchMutex);
+    ReleaseShell(GetWorld()->GetModuleReadOnly<plRenderDataManager>());
+  }
 
   {
     PL_LOCK(m_RTMutex);
@@ -223,6 +280,9 @@ void plVegetationCellComponent::ReleaseBatches(const plRenderDataManager* pRende
 
     ReleaseCompositeSet(pRenderDataManager, state.m_Composite.m_Main);
     ReleaseCompositeSet(pRenderDataManager, state.m_Composite.m_Shadow);
+    ReleaseCompositeBatch(pRenderDataManager, state.m_Composite.m_CellMain);
+    ReleaseCompositeBatch(pRenderDataManager, state.m_Composite.m_CellShadow);
+    state.m_Composite.m_bCellBuilt = false;
   }
 
   m_GroupStates.Clear();
@@ -248,6 +308,7 @@ void plVegetationCellComponent::ReleaseCompositeSet(const plRenderDataManager* p
   for (CompositeBatch& batch : ref_set.m_Parts)
     ReleaseCompositeBatch(pRenderDataManager, batch);
   ReleaseCompositeBatch(pRenderDataManager, ref_set.m_Merged);
+  ReleaseCompositeBatch(pRenderDataManager, ref_set.m_Impostor);
 
   ref_set = CompositeSet();
 }
@@ -334,10 +395,20 @@ void plVegetationCellComponent::OnMsgExtractRenderData(plMsgExtractRenderData& m
   m_uiFoliageBonesDataIndex = pModule->GetFoliageBonesDataIndex();
   SyncGroupStates(msg.m_pRenderDataManager);
 
+  // The shell is decided once per frame, before any group splits its trees around it.
+  const plUInt64 uiFrame = plRenderWorld::GetFrameCounter();
+  if (m_Shell.m_uiUpdateFrame != uiFrame)
+  {
+    m_Shell.m_uiUpdateFrame = uiFrame;
+    UpdateShell(*pModule, msg);
+  }
+
   for (plUInt32 g = 0; g < m_pCell->m_Groups.GetCount(); ++g)
   {
     BuildBatches(m_pCell->m_Groups[g], m_GroupStates[g], bShadow, vCameraPosition, fTanHalfFov, msg);
   }
+
+  EmitShell(*pModule, bShadow, msg);
 }
 
 void plVegetationCellComponent::BuildBatches(const plVegetationCellGroup& group, GroupState& state, bool bShadow, const plVec3& vCameraPosition, float fTanHalfFov, plMsgExtractRenderData& msg) const
@@ -509,7 +580,7 @@ void plVegetationCellComponent::BuildBatches(const plVegetationCellGroup& group,
         transform.m_vScale.Set(inst.m_fScale);
 
         const plColor color = seedColors[inst.m_uiColorSeed];
-        const plUInt32 uiSeed = plHashingUtils::xxHash32(&inst.m_vPosition, sizeof(plVec3)) ^ inst.m_uiColorSeed;
+        const plUInt32 uiSeed = MakeInstanceSeed(inst, FOLIAGE_REPRESENTATION_LOD);
         const plVec4 vCustomData(fLower, fUpper, fRadius * inst.m_fScale, fBand);
 
         plRenderDataManager::FillPerInstanceData(instanceData[k], nullptr, transform, uiOwnerId, color, vCustomData, fRadius * inst.m_fScale, uiSeed);
@@ -579,14 +650,28 @@ void plVegetationCellComponent::BuildCompositeBatches(const plVegetationCellGrou
   if (bShadow && !render.m_bCastShadows)
     return;
 
-  // A reloaded type may name other part meshes.
+  // A reloaded type may name other part meshes, or carry another impostor.
   if (ref_state.m_uiTypeChangeCounter != type.GetCurrentResourceChangeCounter())
   {
     ReleaseCompositeSet(msg.m_pRenderDataManager, ref_state.m_Main);
     ReleaseCompositeSet(msg.m_pRenderDataManager, ref_state.m_Shadow);
+    ReleaseCompositeBatch(msg.m_pRenderDataManager, ref_state.m_CellMain);
+    ReleaseCompositeBatch(msg.m_pRenderDataManager, ref_state.m_CellShadow);
+    ref_state.m_bCellBuilt = false;
     ref_state.m_Split.Reset();
     ref_state.m_uiTypeChangeCounter = type.GetCurrentResourceChangeCounter();
   }
+
+  const plVegetationImpostorGpu* pImpostor = nullptr;
+  if (cvar_VegetationImpostorEnabled && type.GetImpostorDistance() > 0.0f)
+  {
+    bool bKnown = false;
+    pImpostor = type.GetImpostor(bKnown);
+  }
+
+  // A cell far enough away draws the whole group from instance data it wrote once.
+  if (pImpostor != nullptr && IsMergedCell(module) && BuildMergedCell(group, ref_state, type, *pImpostor, bShadow, msg))
+    return;
 
   // Once per frame, from the main camera, for every view: shadow views and the main view see the same trees as parts.
   const plUInt64 uiFrame = plRenderWorld::GetFrameCounter();
@@ -607,6 +692,56 @@ void plVegetationCellComponent::BuildCompositeBatches(const plVegetationCellGrou
     thresholds.m_fShadowCullDistance = render.m_bCastShadows ? plMath::Min(thresholds.m_fCullDistance, render.m_fShadowCullDistance * fDistanceScale) : -1.0f;
     thresholds.m_fDensity = plMath::Clamp(cvar_VegetationDensityScale.GetValue(), 0.0f, 1.0f);
 
+    const float fTanHalfFov = plMath::Max(module.GetMainCameraTanHalfFov(), 0.0001f);
+
+    // The hand-off to the cell's voxel shell, when the cell has one for this type, never before the parts are gone. The
+    // trees fade by screen size (ApplyLodCrossfade, with CustomData x as the screen size per unit of radius), the shell
+    // per pixel by distance over the same metres.
+    ref_state.m_bShell = m_Shell.m_bReady && pImpostor != nullptr && type.GetVoxelProxy() != nullptr;
+    ref_state.m_fCellLower = 0.0f;
+    ref_state.m_fCellBand = 0.0f;
+    float fCellDistance = 0.0f;
+    if (ref_state.m_bShell)
+    {
+      const float fFade = plMath::Max(cvar_VegetationCellShellFadeDistance.GetValue(), 0.0f);
+      fCellDistance = plMath::Max(cvar_VegetationCellShellDistance.GetValue(), thresholds.m_fSwitchDistance + fFade * 0.5f + 1.0f);
+      const float fBand = plMath::Clamp(fFade / (2.0f * fCellDistance), 0.0f, 0.4f);
+      thresholds.m_fCellNear = fCellDistance / (1.0f + fBand) * 0.98f;
+      thresholds.m_fCellFar = fCellDistance / (1.0f - fBand) * 1.02f;
+      ref_state.m_fCellLower = 1.0f / (fCellDistance * fTanHalfFov);
+      ref_state.m_fCellBand = fBand;
+    }
+
+    // The hand-off to the impostor. Against the merged mesh it fades like the shell hand-off; against the shell both
+    // fade by distance over [start, start + length].
+    ref_state.m_fImpostorLower = 0.0f;
+    ref_state.m_fImpostorBand = 0.0f;
+    ref_state.m_fImpostorFadeStart = 0.0f;
+    ref_state.m_fImpostorFadeLength = 0.0f;
+    if (pImpostor != nullptr)
+    {
+      const float fFade = plMath::Max(cvar_VegetationImpostorFadeDistance.GetValue(), 0.0f);
+      float fDistance = ref_state.m_bShell ? m_Shell.m_fImpostorDistance : type.GetImpostorDistance() * plMath::Max(cvar_VegetationImpostorDistanceScale.GetValue(), 0.0f);
+      fDistance = plMath::Max(fDistance, plMath::Max(thresholds.m_fSwitchDistance, thresholds.m_fCellFar) + fFade * 0.5f + 1.0f);
+
+      if (ref_state.m_bShell)
+      {
+        ref_state.m_fImpostorFadeStart = fDistance - fFade * 0.5f;
+        ref_state.m_fImpostorFadeLength = fFade;
+        thresholds.m_fImpostorNear = ref_state.m_fImpostorFadeStart - 0.5f;
+        thresholds.m_fImpostorFar = ref_state.m_fImpostorFadeStart + fFade + 0.5f;
+      }
+      else
+      {
+        const float fBand = plMath::Clamp(fFade / (2.0f * fDistance), 0.0f, 0.4f);
+        thresholds.m_fImpostorNear = fDistance / (1.0f + fBand) * 0.98f;
+        thresholds.m_fImpostorFar = fDistance / (1.0f - fBand) * 1.02f;
+        ref_state.m_fImpostorLower = 1.0f / (fDistance * fTanHalfFov);
+        ref_state.m_fImpostorBand = fBand;
+      }
+      thresholds.m_fShadowImpostorDistance = cvar_VegetationImpostorShadows ? fDistance : 0.0f;
+    }
+
     if (ref_state.m_Split.Update(group.m_Instances, module.GetMainCameraPosition(), thresholds))
     {
       ref_state.m_Main.m_bDirty = true;
@@ -616,10 +751,14 @@ void plVegetationCellComponent::BuildCompositeBatches(const plVegetationCellGrou
 
   CompositeSet& set = bShadow ? ref_state.m_Shadow : ref_state.m_Main;
 
+  // A zoom moves the hand-off screen sizes: the fading instances are written again.
+  if (set.m_fFillImpostorLower != ref_state.m_fImpostorLower || set.m_fFillCellLower != ref_state.m_fCellLower)
+    set.m_bDirty = true;
+
   bool bBonesStale = set.m_bBonesPending || set.m_uiBonesGeneration != group.m_uiBonesGeneration;
   if (set.m_bDirty)
   {
-    FillCompositeSet(group, set, ref_state.m_Split.GetStates(), type, info, bShadow, msg);
+    FillCompositeSet(group, set, ref_state, type, info, pImpostor != nullptr, bShadow, msg);
     bBonesStale = true;
   }
 
@@ -637,11 +776,17 @@ void plVegetationCellComponent::BuildCompositeBatches(const plVegetationCellGrou
     EmitCompositeBatch(set.m_Parts[p], info.m_PartMeshes[p], type, hMergedMesh, cellBounds, msg);
 
   EmitCompositeBatch(set.m_Merged, hMergedMesh, type, hMergedMesh, cellBounds, msg);
+
+  if (pImpostor != nullptr)
+    EmitImpostorBatch(set.m_Impostor, *pImpostor, cellBounds, msg);
 }
 
-void plVegetationCellComponent::FillCompositeSet(const plVegetationCellGroup& group, CompositeSet& ref_set, plArrayPtr<const plUInt8> states, const plVegetationTypeResource& type, const plVegetationCompositeInfo& info, bool bShadow, plMsgExtractRenderData& msg) const
+void plVegetationCellComponent::FillCompositeSet(const plVegetationCellGroup& group, CompositeSet& ref_set, const CompositeState& state, const plVegetationTypeResource& type, const plVegetationCompositeInfo& info, bool bHasImpostor, bool bShadow, plMsgExtractRenderData& msg) const
 {
+  const plArrayPtr<const plUInt8> states = state.m_Split.GetStates();
   ref_set.m_bDirty = false;
+  ref_set.m_fFillImpostorLower = state.m_fImpostorLower;
+  ref_set.m_fFillCellLower = state.m_fCellLower;
 
   const plUInt32 uiPartCount = info.m_PartMeshes.GetCount();
   ref_set.m_Parts.SetCount(uiPartCount);
@@ -680,18 +825,37 @@ void plVegetationCellComponent::FillCompositeSet(const plVegetationCellGroup& gr
   if (!bPartsReady)
     ref_set.m_bDirty = true;
 
-  // What a tree draws in this set: shadows keep parts only for the trees near enough (ShadowParts).
-  auto DrawnState = [bShadow](plUInt8 uiState) -> plUInt8
+  // What a tree draws in this set: shadows keep parts only for the trees near enough (ShadowParts) and switch to the
+  // impostor at one distance (ShadowImpostor); without an impostor the merged mesh stands in for it.
+  auto DrawnState = [bShadow, bHasImpostor](plUInt8 uiState) -> plUInt8
   {
-    const plUInt8 uiMain = uiState & plVegetationCompositeTreeState::MainMask;
-    if (bShadow && uiMain == plVegetationCompositeTreeState::Parts && (uiState & plVegetationCompositeTreeState::ShadowParts) == 0)
+    plUInt8 uiMain = uiState & plVegetationCompositeTreeState::MainMask;
+    if (bShadow)
+    {
+      if (uiMain == plVegetationCompositeTreeState::Hidden)
+        return uiMain;
+      if (bHasImpostor && (uiState & plVegetationCompositeTreeState::ShadowImpostor) != 0)
+        return plVegetationCompositeTreeState::Impostor;
+      if (uiMain == plVegetationCompositeTreeState::Impostor)
+        return plVegetationCompositeTreeState::Merged;
+      if (uiMain == plVegetationCompositeTreeState::Parts && (uiState & plVegetationCompositeTreeState::ShadowParts) == 0)
+        return plVegetationCompositeTreeState::Merged;
+      return uiMain;
+    }
+
+    if (uiMain == plVegetationCompositeTreeState::Impostor && !bHasImpostor)
       return plVegetationCompositeTreeState::Merged;
     return uiMain;
   };
 
+  // Main views draw a fading tree twice: its merged mesh fades out while its impostor fades in.
+  auto AlsoImpostor = [bShadow, bHasImpostor](plUInt8 uiState) -> bool
+  { return !bShadow && bHasImpostor && (uiState & plVegetationCompositeTreeState::ImpostorFade) != 0; };
+
   // Counts first, so every batch is allocated once.
   plUInt32 uiPartTrees = 0;
   plUInt32 uiMergedTrees = 0;
+  plUInt32 uiImpostorTrees = 0;
   for (plUInt32 i = 0; i < states.GetCount(); ++i)
   {
     const plUInt8 uiState = states[i];
@@ -701,8 +865,13 @@ void plVegetationCellComponent::FillCompositeSet(const plVegetationCellGroup& gr
     const plUInt8 uiMain = DrawnState(uiState);
     if (uiMain == plVegetationCompositeTreeState::Parts && bPartsReady)
       ++uiPartTrees;
+    else if (uiMain == plVegetationCompositeTreeState::Impostor)
+      ++uiImpostorTrees;
     else if (uiMain != plVegetationCompositeTreeState::Hidden)
       ++uiMergedTrees;
+
+    if (AlsoImpostor(uiState))
+      ++uiImpostorTrees;
   }
 
   auto Allocate = [&](CompositeBatch& ref_batch, plUInt32 uiCount) -> plArrayPtr<plPerInstanceData>
@@ -735,6 +904,8 @@ void plVegetationCellComponent::FillCompositeSet(const plVegetationCellGroup& gr
   for (plUInt32 p = 0; p < uiPartCount; ++p)
     partData[p] = Allocate(ref_set.m_Parts[p], info.m_PartMeshes[p].IsValid() ? uiPartTrees * partPlacements[p] : 0);
   plArrayPtr<plPerInstanceData> mergedData = Allocate(ref_set.m_Merged, uiMergedTrees);
+  plArrayPtr<plPerInstanceData> impostorData = Allocate(ref_set.m_Impostor, uiImpostorTrees);
+  plUInt32 uiImpostorCursor = 0;
 
   plColor seedColors[256];
   ResolveSeedColors(type, seedColors);
@@ -754,9 +925,10 @@ void plVegetationCellComponent::FillCompositeSet(const plVegetationCellGroup& gr
       continue;
 
     plUInt8 uiMain = DrawnState(uiState);
-    if (uiMain == plVegetationCompositeTreeState::Hidden)
+    // A tree the shell holds still draws its impostor while that fades in.
+    if (uiMain == plVegetationCompositeTreeState::Hidden && !AlsoImpostor(uiState))
       continue;
-    if (!bPartsReady)
+    if (!bPartsReady && uiMain == plVegetationCompositeTreeState::Parts)
       uiMain = plVegetationCompositeTreeState::Merged;
 
     const plVegetationCellInstance& inst = group.m_Instances[i];
@@ -767,22 +939,59 @@ void plVegetationCellComponent::FillCompositeSet(const plVegetationCellGroup& gr
     tree.m_vScale.Set(inst.m_fScale);
 
     const plColor color = seedColors[inst.m_uiColorSeed];
-    const plUInt32 uiSeed = plHashingUtils::xxHash32(&inst.m_vPosition, sizeof(plVec3)) ^ inst.m_uiColorSeed;
+    const float fTreeRadius = fMergedRadius * inst.m_fScale;
+
+    // Fading trees carry their hand-off in CustomData. Merged mesh: x = screen size where it is half gone, w = band
+    // (Vegetation.plShader ApplyLodCrossfade); the shell or the impostor draws the complementary pixels. Impostor against
+    // the shell: x = start, y = length in metres, w = -1 (VegetationImpostor.plShader).
+    plVec4 vFadeData(0.0f, 1.0e9f, fTreeRadius, 0.0f);
+    plVec4 vImpostorData = vFadeData;
+    if (!bShadow)
+    {
+      if ((uiState & plVegetationCompositeTreeState::CellFade) != 0 && state.m_bShell)
+        vFadeData = plVec4(state.m_fCellLower * fTreeRadius, 1.0e9f, fTreeRadius, state.m_fCellBand);
+
+      if (bHasImpostor && (uiState & plVegetationCompositeTreeState::ImpostorFade) != 0)
+      {
+        if (state.m_bShell)
+        {
+          vImpostorData = plVec4(state.m_fImpostorFadeStart, state.m_fImpostorFadeLength, fTreeRadius, -1.0f);
+        }
+        else
+        {
+          vFadeData = plVec4(state.m_fImpostorLower * fTreeRadius, 1.0e9f, fTreeRadius, state.m_fImpostorBand);
+          vImpostorData = vFadeData;
+        }
+      }
+    }
+
+    if (uiMain == plVegetationCompositeTreeState::Impostor || AlsoImpostor(uiState))
+    {
+      if (uiImpostorCursor < ref_set.m_Impostor.m_uiCount)
+      {
+        plRenderDataManager::FillPerInstanceData(impostorData[uiImpostorCursor], nullptr, tree, uiOwnerId, color, vImpostorData, fTreeRadius, MakeInstanceSeed(inst, FOLIAGE_REPRESENTATION_IMPOSTOR));
+        ref_set.m_Impostor.m_Trees[uiImpostorCursor] = i;
+        ++uiImpostorCursor;
+      }
+
+      if (uiMain == plVegetationCompositeTreeState::Impostor || uiMain == plVegetationCompositeTreeState::Hidden)
+        continue;
+    }
 
     if (uiMain == plVegetationCompositeTreeState::Merged)
     {
       if (uiMergedCursor >= ref_set.m_Merged.m_uiCount)
         continue;
 
-      // CustomData as the other types write it, with the LOD crossfade off. The merged mesh's bones come from its
-      // vertices (TexCoord1), so Wind stays zero.
-      const float fRadius = fMergedRadius * inst.m_fScale;
-      plRenderDataManager::FillPerInstanceData(mergedData[uiMergedCursor], nullptr, tree, uiOwnerId, color, plVec4(0.0f, 1.0e9f, fRadius, 0.0f), fRadius, uiSeed);
+      // CustomData as the other types write it, the LOD crossfade only in the impostor hand-off. The merged mesh's bones
+      // come from its vertices (TexCoord1), so Wind stays zero.
+      plRenderDataManager::FillPerInstanceData(mergedData[uiMergedCursor], nullptr, tree, uiOwnerId, color, vFadeData, fTreeRadius, MakeInstanceSeed(inst, FOLIAGE_REPRESENTATION_MERGED));
       ref_set.m_Merged.m_Trees[uiMergedCursor] = i;
       ++uiMergedCursor;
       continue;
     }
 
+    const plUInt32 uiSeed = MakeInstanceSeed(inst, FOLIAGE_REPRESENTATION_PARTS);
     for (plUInt32 j = 0; j < info.m_Instances.GetCount(); ++j)
     {
       const plFoliageCompositeInstance& placement = info.m_Instances[j];
@@ -807,6 +1016,7 @@ void plVegetationCellComponent::FillCompositeSet(const plVegetationCellGroup& gr
 
   // An allocation that failed draws nothing rather than stale instances.
   ref_set.m_Merged.m_uiCount = uiMergedCursor;
+  ref_set.m_Impostor.m_uiCount = uiImpostorCursor;
   for (plUInt32 p = 0; p < uiPartCount; ++p)
     ref_set.m_Parts[p].m_uiCount = partCursor[p];
 }
@@ -964,6 +1174,357 @@ void plVegetationCellComponent::EmitCompositeBatch(const CompositeBatch& batch, 
     const plRenderData::Category category = plMaterialResource::GetRenderDataCategory(hMaterial, &bDontCacheYet);
     msg.AddRenderData(pRenderData, category, plRenderData::Caching::Never);
   }
+}
+
+void plVegetationCellComponent::ReleaseShell(const plRenderDataManager* pRenderDataManager) const
+{
+  if (m_Shell.m_pTask != nullptr)
+    plTaskSystem::WaitForGroup(m_Shell.m_TaskGroup);
+
+  if (pRenderDataManager != nullptr && !m_Shell.m_Offset.IsInvalidated())
+    pRenderDataManager->DeleteInstanceData(m_Shell.m_Offset);
+
+  m_Shell = Shell();
+}
+
+void plVegetationCellComponent::UpdateShell(const plVegetationWorldModule& module, plMsgExtractRenderData& msg) const
+{
+  PL_IGNORE_UNUSED(msg);
+
+  if (!cvar_VegetationCellShellEnabled || !cvar_VegetationImpostorEnabled || m_pCell == nullptr)
+  {
+    m_Shell.m_bReady = false;
+    return;
+  }
+
+  // A finished build replaces the shell; until then the previous one (if any) keeps drawing.
+  if (m_Shell.m_pTask != nullptr && plTaskSystem::IsTaskGroupFinished(m_Shell.m_TaskGroup))
+  {
+    plVegetationCellShellTask& task = *m_Shell.m_pTask;
+    m_Shell.m_hMesh.Invalidate();
+    if (task.m_bSucceeded)
+    {
+      plStringBuilder sId;
+      sId.SetFormat("VegetationCellShell/{}_{}/{}", m_pCell->m_iX, m_pCell->m_iY, task.m_Stats.m_uiFaces);
+      static plAtomicInteger32 s_iShells = 0;
+      sId.AppendFormat("/{}", s_iShells.Increment());
+      m_Shell.m_hMesh = plResourceManager::CreateResource<plMeshResource>(sId, std::move(task.m_Mesh), sId);
+    }
+    m_Shell.m_uiVersion = m_Shell.m_uiTaskVersion;
+    m_Shell.m_uiTypeCounters = m_Shell.m_uiTaskTypeCounters;
+    m_Shell.m_pTask.Clear();
+  }
+
+  // Only cells that reach into the shell's band keep one.
+  const plBoundingBoxSphere bounds = GetOwner()->GetGlobalBounds();
+  if (!bounds.IsValid())
+  {
+    m_Shell.m_bReady = false;
+    return;
+  }
+
+  const plVec3 vCamera = module.GetMainCameraPosition();
+  plVec3 corners[8];
+  bounds.GetBox().GetCorners(corners);
+  float fFarthestSq = 0.0f;
+  for (const plVec3& vCorner : corners)
+    fFarthestSq = plMath::Max(fFarthestSq, (vCorner - vCamera).GetLengthSquared());
+
+  const float fShellStart = cvar_VegetationCellShellDistance.GetValue() - cvar_VegetationCellShellFadeDistance.GetValue();
+  const bool bInReach = plMath::Sqrt(fFarthestSq) > fShellStart - 16.0f;
+
+  // What the shell is built from: every composite type with a voxel proxy and an impostor.
+  const float fDensity = plMath::Clamp(cvar_VegetationDensityScale.GetValue(), 0.0f, 1.0f);
+  const float fVoxelSize = plMath::Max(cvar_VegetationCellShellVoxelSize.GetValue(), 0.1f);
+  plUInt32 uiTypeCounters = plHashingUtils::xxHash32(&fDensity, sizeof(float), plHashingUtils::xxHash32(&fVoxelSize, sizeof(float)));
+  for (const plVegetationCellGroup& group : m_pCell->m_Groups)
+  {
+    plResourceLock<plVegetationTypeResource> pType(group.m_hType, plResourceAcquireMode::PointerOnly);
+    if (pType)
+      uiTypeCounters = uiTypeCounters * 31 + pType->GetCurrentResourceChangeCounter();
+  }
+
+  const bool bCurrent = m_Shell.m_uiVersion == m_pCell->m_uiVersion && m_Shell.m_uiTypeCounters == uiTypeCounters;
+  const bool bBuilding = m_Shell.m_pTask != nullptr;
+  const bool bBuildingCurrent = bBuilding && m_Shell.m_uiTaskVersion == m_pCell->m_uiVersion && m_Shell.m_uiTaskTypeCounters == uiTypeCounters;
+
+  if (bInReach && !bCurrent && !bBuildingCurrent && !bBuilding)
+  {
+    plSharedPtr<plVegetationCellShellTask> pTask = PL_DEFAULT_NEW(plVegetationCellShellTask);
+    pTask->m_vOrigin = m_pCell->m_vOrigin;
+    pTask->m_Settings.m_fVoxelSize = fVoxelSize;
+
+    float fImpostorDistance = plMath::MaxValue<float>();
+    float fShadowCull = 0.0f;
+    plUInt32 uiMostTrees = 0;
+    plMaterialResourceHandle hMaterial;
+    bool bTypesReady = true;
+
+    for (const plVegetationCellGroup& group : m_pCell->m_Groups)
+    {
+      plResourceLock<plVegetationTypeResource> pType(group.m_hType, plResourceAcquireMode::AllowLoadingFallback_NeverFail);
+      if (pType.GetAcquireResult() != plResourceAcquireResult::Final)
+      {
+        bTypesReady = false;
+        continue;
+      }
+
+      plSharedPtr<plVegetationVoxelProxy> pProxy = pType->GetVoxelProxy();
+      if (pProxy == nullptr || pType->GetImpostorDistance() <= 0.0f)
+        continue;
+
+      bool bKnown = false;
+      const plVegetationImpostorGpu* pImpostor = pType->GetImpostor(bKnown);
+      if (pImpostor == nullptr)
+      {
+        bTypesReady &= bKnown;
+        continue;
+      }
+
+      plColor seedColors[256];
+      ResolveSeedColors(*pType.GetPointer(), seedColors);
+
+      plUInt32 uiTrees = 0;
+      for (const plVegetationCellInstance& inst : group.m_Instances)
+      {
+        if (!inst.m_Flags.IsSet(plVegetationInstanceFlags::Hero) && (inst.m_uiColorSeed + 0.5f) / 256.0f > fDensity)
+          continue;
+
+        plVegetationCellShellTree& tree = pTask->m_Trees.ExpandAndGetRef();
+        tree.m_Transform.m_vPosition = inst.m_vPosition;
+        tree.m_Transform.m_qRotation = inst.m_qRotation;
+        tree.m_Transform.m_vScale.Set(inst.m_fScale);
+        tree.m_Color = seedColors[inst.m_uiColorSeed];
+        tree.m_pProxy = pProxy.Borrow();
+        ++uiTrees;
+      }
+
+      pTask->m_Proxies.PushBack(pProxy);
+      fImpostorDistance = plMath::Min(fImpostorDistance, pType->GetImpostorDistance() * plMath::Max(cvar_VegetationImpostorDistanceScale.GetValue(), 0.0f));
+      const auto& render = pType->GetDescriptor().m_Render;
+      if (render.m_bCastShadows)
+        fShadowCull = plMath::Max(fShadowCull, plMath::Min(render.m_fShadowCullDistance, render.m_fCullDistance));
+      if (uiTrees > uiMostTrees)
+      {
+        uiMostTrees = uiTrees;
+        hMaterial = pImpostor->m_hCellMaterial;
+      }
+    }
+
+    // A type still loading: try again next frame rather than building a shell without its trees.
+    if (bTypesReady)
+    {
+      m_Shell.m_uiTaskVersion = m_pCell->m_uiVersion;
+      m_Shell.m_uiTaskTypeCounters = uiTypeCounters;
+
+      if (pTask->m_Trees.IsEmpty())
+      {
+        m_Shell.m_hMesh.Invalidate();
+        m_Shell.m_uiVersion = m_pCell->m_uiVersion;
+        m_Shell.m_uiTypeCounters = uiTypeCounters;
+      }
+      else
+      {
+        m_Shell.m_hMaterial = hMaterial;
+        m_Shell.m_fImpostorDistance = fImpostorDistance;
+        m_Shell.m_fShadowCullDistance = fShadowCull * plMath::Max(cvar_VegetationDrawDistanceScale.GetValue(), 0.0f);
+        m_Shell.m_pTask = pTask;
+        m_Shell.m_TaskGroup = plTaskSystem::StartSingleTask(pTask, plTaskPriority::LongRunning);
+      }
+    }
+  }
+
+  // Draw the shell that matches the cell. While a rebuild after an edit runs, the previous one stands in.
+  m_Shell.m_bReady = m_Shell.m_hMesh.IsValid() && m_Shell.m_hMaterial.IsValid() && (bCurrent || m_Shell.m_pTask != nullptr);
+}
+
+void plVegetationCellComponent::EmitShell(const plVegetationWorldModule& module, bool bShadow, plMsgExtractRenderData& msg) const
+{
+  if (!m_Shell.m_bReady)
+    return;
+
+  const plBoundingBoxSphere cellBounds = GetOwner()->GetGlobalBounds();
+  const plVec3 vCamera = module.GetMainCameraPosition();
+  if (bShadow && cellBounds.IsValid() && cellBounds.GetBox().GetDistanceTo(vCamera) > m_Shell.m_fShadowCullDistance)
+    return;
+
+  // One instance at the cell origin, written once per frame: it carries the main camera position and the bands, which
+  // every view (shadow views included) fades by.
+  const plUInt64 uiFrame = plRenderWorld::GetFrameCounter();
+  if (m_Shell.m_uiInstanceFrame != uiFrame || m_Shell.m_Offset.IsInvalidated())
+  {
+    plArrayPtr<plPerInstanceData> data = msg.m_pRenderDataManager->GetOrCreateInstanceData(this, true, m_Shell.m_hBuffer, m_Shell.m_Offset, 1);
+    if (data.IsEmpty())
+      return;
+    m_Shell.m_uiInstanceFrame = uiFrame;
+
+    const float fCellFade = plMath::Max(cvar_VegetationCellShellFadeDistance.GetValue(), 0.001f);
+    const float fImpostorFade = plMath::Max(cvar_VegetationImpostorFadeDistance.GetValue(), 0.001f);
+    const float fCellStart = cvar_VegetationCellShellDistance.GetValue() - fCellFade * 0.5f;
+    const float fImpostorStart = m_Shell.m_fImpostorDistance - fImpostorFade * 0.5f;
+
+    plTransform transform = plTransform::MakeIdentity();
+    transform.m_vPosition = m_pCell->m_vOrigin;
+    const float fRadius = cellBounds.IsValid() ? cellBounds.m_fSphereRadius : plVegetationCellSize;
+
+    plPerInstanceData& instance = data[0];
+    const plUInt32 uiSeed = (plHashingUtils::xxHash32(&m_pCell->m_vOrigin, sizeof(plVec3)) & FOLIAGE_REPRESENTATION_SEED_MASK) | (FOLIAGE_REPRESENTATION_MERGED_CELL << FOLIAGE_REPRESENTATION_SHIFT);
+    plRenderDataManager::FillPerInstanceData(instance, nullptr, transform, GetUniqueIdForRendering(), plColor(m_Shell.m_fShadowCullDistance, 0.0f, 0.0f, 1.0f), plVec4(fCellStart, fCellFade, fImpostorStart, fImpostorFade), fRadius, uiSeed);
+    instance.Wind = vCamera;
+  }
+
+  plMeshRenderData* pRenderData = msg.m_pRenderDataManager->CreateRenderDataForThisFrame<plMeshRenderData>(GetOwner());
+  pRenderData->m_Flags.Add(plRenderData::Flags::SkipGI);
+  pRenderData->m_Flags.Add(plRenderData::Flags::NotPickable);
+  pRenderData->m_vGlobalPosition = cellBounds.IsValid() ? cellBounds.m_vCenter : m_pCell->m_vOrigin;
+  pRenderData->SetFallbackGlobalBounds(cellBounds);
+  pRenderData->Fill(m_Shell.m_Offset, m_Shell.m_hBuffer, m_Shell.m_hMaterial, m_Shell.m_hMesh, 0, 0, 1);
+
+  bool bDontCacheYet = false;
+  const plRenderData::Category category = plMaterialResource::GetRenderDataCategory(m_Shell.m_hMaterial, &bDontCacheYet, plDefaultRenderDataCategories::LitMasked);
+  msg.AddRenderData(pRenderData, category, plRenderData::Caching::Never);
+}
+
+void plVegetationCellComponent::EmitImpostorBatch(const CompositeBatch& batch, const plVegetationImpostorGpu& impostor, const plBoundingBoxSphere& cellBounds, plMsgExtractRenderData& msg) const
+{
+  if (batch.m_uiCount == 0 || batch.m_Offset.IsInvalidated() || !impostor.m_hMesh.IsValid() || !impostor.m_hMaterial.IsValid())
+    return;
+
+  plMeshRenderData* pRenderData = msg.m_pRenderDataManager->CreateRenderDataForThisFrame<plMeshRenderData>(GetOwner());
+  // Static like the merged mesh: the quads only turn to the view in the shader, so cached shadow pages stay valid.
+  pRenderData->m_Flags.Add(plRenderData::Flags::SkipGI);
+  pRenderData->m_Flags.Add(plRenderData::Flags::NotPickable);
+  pRenderData->m_vGlobalPosition = cellBounds.IsValid() ? cellBounds.m_vCenter : m_pCell->m_vOrigin;
+  pRenderData->SetFallbackGlobalBounds(cellBounds);
+  pRenderData->Fill(batch.m_Offset, batch.m_hBuffer, impostor.m_hMaterial, impostor.m_hMesh, 0, 0, batch.m_uiCount);
+
+  bool bDontCacheYet = false;
+  const plRenderData::Category category = plMaterialResource::GetRenderDataCategory(impostor.m_hMaterial, &bDontCacheYet, plDefaultRenderDataCategories::LitMasked);
+  msg.AddRenderData(pRenderData, category, plRenderData::Caching::Never);
+}
+
+bool plVegetationCellComponent::IsMergedCell(const plVegetationWorldModule& module) const
+{
+  PL_IGNORE_UNUSED(module);
+  if (!cvar_VegetationImpostorFarCells)
+  {
+    m_bMergedCell = false;
+    return false;
+  }
+
+  // Once per frame, so every view of a frame draws the cell the same way: whether the cell lies far enough beyond the
+  // hand-off is decided per type by BuildMergedCell.
+  const plUInt64 uiFrame = plRenderWorld::GetFrameCounter();
+  if (m_uiMergedCellFrame != uiFrame)
+  {
+    m_uiMergedCellFrame = uiFrame;
+    m_bMergedCell = GetOwner()->GetGlobalBounds().IsValid();
+  }
+
+  return m_bMergedCell;
+}
+
+bool plVegetationCellComponent::BuildMergedCell(const plVegetationCellGroup& group, CompositeState& ref_state, const plVegetationTypeResource& type, const plVegetationImpostorGpu& impostor, bool bShadow, plMsgExtractRenderData& msg) const
+{
+  const plVegetationWorldModule* pModule = GetWorld()->GetModuleReadOnly<plVegetationWorldModule>();
+  const plBoundingBoxSphere cellBounds = GetOwner()->GetGlobalBounds();
+  if (pModule == nullptr || !cellBounds.IsValid())
+    return false;
+
+  const auto& render = type.GetDescriptor().m_Render;
+  const plBoundingBox box = cellBounds.GetBox();
+  const plVec3 vCamera = pModule->GetMainCameraPosition();
+  const float fDistanceScale = plMath::Max(cvar_VegetationDrawDistanceScale.GetValue(), 0.0f);
+
+  // Every tree must be an impostor and drawn: the whole cell beyond the type's hand-off (with room for large trees) and
+  // within its cull distance. Otherwise the group draws tree by tree.
+  const float fNearest = box.GetDistanceTo(vCamera);
+  plVec3 corners[8];
+  box.GetCorners(corners);
+  float fFarthestSq = 0.0f;
+  for (const plVec3& vCorner : corners)
+    fFarthestSq = plMath::Max(fFarthestSq, (vCorner - vCamera).GetLengthSquared());
+
+  const float fFade = plMath::Max(cvar_VegetationImpostorFadeDistance.GetValue(), 0.0f);
+  const float fImpostorDistance = m_Shell.m_bReady ? m_Shell.m_fImpostorDistance : type.GetImpostorDistance() * plMath::Max(cvar_VegetationImpostorDistanceScale.GetValue(), 0.0f);
+  const float fHandOff = fImpostorDistance + fFade;
+  if (fNearest < fHandOff + 8.0f || plMath::Sqrt(fFarthestSq) > render.m_fCullDistance * fDistanceScale)
+    return false;
+
+  if (bShadow)
+  {
+    // Shadows as the trees beyond the hand-off cast them: with the impostor, or (Impostor.Shadows off) tree by tree.
+    if (!render.m_bCastShadows)
+      return true;
+    if (!cvar_VegetationImpostorShadows)
+      return false;
+    if (fNearest > plMath::Min(render.m_fCullDistance, render.m_fShadowCullDistance) * fDistanceScale)
+      return true;
+  }
+
+  // Written once per cell version (SyncGroupStates drops the state on any change), type and density.
+  const float fDensity = plMath::Clamp(cvar_VegetationDensityScale.GetValue(), 0.0f, 1.0f);
+  if (!ref_state.m_bCellBuilt || ref_state.m_fCellDensity != fDensity)
+  {
+    ref_state.m_bCellBuilt = true;
+    ref_state.m_fCellDensity = fDensity;
+
+    plColor seedColors[256];
+    ResolveSeedColors(type, seedColors);
+    const float fRadius = type.GetBoundingRadius();
+    const plUInt32 uiOwnerId = GetUniqueIdForRendering();
+
+    auto Fill = [&](CompositeBatch& ref_batch, bool bShadowSet)
+    {
+      plUInt32 uiCount = 0;
+      for (const plVegetationCellInstance& inst : group.m_Instances)
+      {
+        const bool bKept = inst.m_Flags.IsSet(plVegetationInstanceFlags::Hero) || (inst.m_uiColorSeed + 0.5f) / 256.0f <= fDensity;
+        if (bKept && !(bShadowSet && inst.m_Flags.IsSet(plVegetationInstanceFlags::NoShadow)))
+          ++uiCount;
+      }
+
+      ref_batch.m_uiCount = 0;
+      if (uiCount == 0)
+        return;
+
+      if (!ref_batch.m_Offset.IsInvalidated() && ref_batch.m_uiCapacity < uiCount)
+      {
+        msg.m_pRenderDataManager->DeleteInstanceData(ref_batch.m_Offset);
+        ref_batch.m_Offset = plInstanceDataOffset();
+      }
+
+      const plUInt32 uiCapacity = plMath::Max(uiCount, ref_batch.m_uiCapacity);
+      plArrayPtr<plPerInstanceData> data = msg.m_pRenderDataManager->GetOrCreateInstanceData(this, true, ref_batch.m_hBuffer, ref_batch.m_Offset, uiCapacity);
+      if (data.GetCount() < uiCount)
+        return;
+      ref_batch.m_uiCapacity = uiCapacity;
+
+      plUInt32 k = 0;
+      for (const plVegetationCellInstance& inst : group.m_Instances)
+      {
+        const bool bKept = inst.m_Flags.IsSet(plVegetationInstanceFlags::Hero) || (inst.m_uiColorSeed + 0.5f) / 256.0f <= fDensity;
+        if (!bKept || (bShadowSet && inst.m_Flags.IsSet(plVegetationInstanceFlags::NoShadow)))
+          continue;
+
+        plTransform tree;
+        tree.m_vPosition = inst.m_vPosition;
+        tree.m_qRotation = inst.m_qRotation;
+        tree.m_vScale.Set(inst.m_fScale);
+
+        const float fTreeRadius = fRadius * inst.m_fScale;
+        plRenderDataManager::FillPerInstanceData(data[k], nullptr, tree, uiOwnerId, seedColors[inst.m_uiColorSeed], plVec4(0.0f, 1.0e9f, fTreeRadius, 0.0f), fTreeRadius, MakeInstanceSeed(inst, FOLIAGE_REPRESENTATION_IMPOSTOR));
+        ++k;
+      }
+      ref_batch.m_uiCount = k;
+    };
+
+    Fill(ref_state.m_CellMain, false);
+    Fill(ref_state.m_CellShadow, true);
+  }
+
+  EmitImpostorBatch(bShadow ? ref_state.m_CellShadow : ref_state.m_CellMain, impostor, cellBounds, msg);
+  return true;
 }
 
 void plVegetationCellComponent::GetRTChunks(const plRenderDataManager* pRenderDataManager, const plVec3& vCenter, float fRangeCap, plDynamicArray<plSharedPtr<plRefCounted>>& out_chunks) const

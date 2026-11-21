@@ -7,10 +7,14 @@
 #include <Foundation/Strings/String.h>
 #include <Foundation/Threading/AtomicInteger.h>
 #include <Foundation/Threading/Mutex.h>
+#include <Foundation/Types/SharedPtr.h>
 #include <Foundation/Types/UniquePtr.h>
 #include <RendererCore/Material/MaterialResource.h>
 #include <RendererCore/Meshes/MeshResource.h>
+#include <VegetationPlugin/Impostors/VegetationImpostor.h>
 #include <VegetationPlugin/VegetationDeclarations.h>
+
+using plTexture2DResourceHandle = plTypedResourceHandle<class plTexture2DResource>;
 
 /// \brief Wind response of a type, mirrored into plVegetationWindProfile in the shader.
 struct PL_VEGETATIONPLUGIN_DLL plVegetationWindSettings
@@ -126,8 +130,26 @@ struct PL_VEGETATIONPLUGIN_DLL plVegetationTypeResourceDescriptor
   plVegetationRenderSettings m_Render;
   plVegetationRayTracingSettings m_RayTracing;
 
+  // Version 4: the far representations of a foliage composite type and, when the transform baked them, its impostor and
+  // voxel proxy.
+  plVegetationImpostorSettings m_Impostor;
+  plSharedPtr<plVegetationImpostorData> m_pImpostorData;
+  plSharedPtr<plVegetationVoxelProxy> m_pVoxelProxy;
+
   void Save(plStreamWriter& inout_stream) const;
   plResult Load(plStreamReader& inout_stream);
+};
+
+/// \brief What the cells draw a type's impostor with, made from its baked data on first use.
+struct PL_VEGETATIONPLUGIN_DLL plVegetationImpostorGpu
+{
+  plMeshResourceHandle m_hMesh;         ///< One quad whose bounds hold the bounding sphere; the shader turns it to the view.
+  plMaterialResourceHandle m_hMaterial; ///< Shaded with the material of the baked slot.
+  plMaterialResourceHandle m_hCellMaterial; ///< The merged voxel shell of a cell whose trees are mostly of this type.
+  plTexture2DResourceHandle m_hAlbedo;
+  plTexture2DResourceHandle m_hNormalDepth;
+  float m_fRadius = 0.0f; ///< Bounding sphere radius at scale 1.
+  plVec3 m_vCenter = plVec3::MakeZero();
 };
 
 /// \brief What the cells need of a type whose first LOD mesh is a foliage composite (plFoliageComposite), copied from the
@@ -215,6 +237,19 @@ public:
   /// \brief The type's placement rules (scale, slope, spacing, sink, alignment, density weight, clearing avoidance).
   const plVegetationPlacementSettings& GetPlacement() const { return m_Descriptor.m_Placement; }
 
+  /// \brief The impostor the cells draw far trees with; nullptr when the type has none baked or its material cannot be
+  /// resolved yet (out_bKnown false: try again later). Created on first request. Thread-safe.
+  const plVegetationImpostorGpu* GetImpostor(bool& out_bKnown) const;
+
+  /// \brief Where trees switch to the impostor at scale 1 (the type's setting), 0 without an impostor.
+  float GetImpostorDistance() const { return m_Descriptor.m_pImpostorData != nullptr ? m_Descriptor.m_Impostor.m_fDistance : 0.0f; }
+
+  /// \brief The voxel proxy cells build their merged voxel shells from; nullptr when none was baked. Shared, immutable.
+  plSharedPtr<plVegetationVoxelProxy> GetVoxelProxy() const { return m_Descriptor.m_pVoxelProxy; }
+
+  /// \brief Object-space error of the merged mesh's first voxel level, 0 when unknown. The bake measures it.
+  float GetVoxelError() const { return m_Descriptor.m_pImpostorData != nullptr ? m_Descriptor.m_pImpostorData->m_fVoxelError : 0.0f; }
+
 
 private:
   virtual plResourceLoadDesc UnloadData(Unload WhatToUnload) override;
@@ -235,4 +270,9 @@ private:
   mutable plAtomicInteger32 m_iCompositeState = -1;
   mutable plMutex m_CompositeMutex;
   mutable plUniquePtr<plVegetationCompositeInfo> m_pComposite;
+
+  /// Same pattern for the impostor: -1 not yet, 0 none, 1 m_pImpostor holds it.
+  mutable plAtomicInteger32 m_iImpostorState = -1;
+  mutable plMutex m_ImpostorMutex;
+  mutable plUniquePtr<plVegetationImpostorGpu> m_pImpostor;
 };

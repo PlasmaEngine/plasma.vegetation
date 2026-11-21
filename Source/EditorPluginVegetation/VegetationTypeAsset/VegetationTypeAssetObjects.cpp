@@ -122,6 +122,8 @@ void plVegetationTypeAssetProperties::PropertyMetaStateEventHandler(plPropertyMe
   if (pType == plGetStaticRTTI<plVegetationTypeAssetProperties>())
   {
     props["Composite"].m_Visibility = IsComposite(e.m_pObject) ? plPropertyUiState::Default : plPropertyUiState::Invisible;
+    // Only foliage composites bake an impostor.
+    props["Impostor"].m_Visibility = IsComposite(e.m_pObject) ? plPropertyUiState::Default : plPropertyUiState::Invisible;
     return;
   }
 
@@ -164,7 +166,8 @@ PL_BEGIN_STATIC_REFLECTED_TYPE(plVegetationTypeAssetLod, plNoBase, 1, plRTTIDefa
 {
   PL_BEGIN_PROPERTIES
   {
-    PL_MEMBER_PROPERTY("Mesh", m_sMesh)->AddAttributes(new plAssetBrowserAttribute("CompatibleAsset_Mesh_Static")),
+    // A transform dependency: the impostor is baked from LOD 0.
+    PL_MEMBER_PROPERTY("Mesh", m_sMesh)->AddAttributes(new plAssetBrowserAttribute("CompatibleAsset_Mesh_Static", plDependencyFlags::Thumbnail | plDependencyFlags::Package | plDependencyFlags::Transform)),
     PL_MEMBER_PROPERTY("ScreenSize", m_fScreenSize)->AddAttributes(new plDefaultValueAttribute(1.0f), new plClampValueAttribute(0.0f, 2.0f)),
   }
   PL_END_PROPERTIES;
@@ -236,6 +239,19 @@ PL_BEGIN_STATIC_REFLECTED_TYPE(plVegetationTypeAssetRender, plNoBase, 1, plRTTID
 }
 PL_END_STATIC_REFLECTED_TYPE;
 
+PL_BEGIN_STATIC_REFLECTED_TYPE(plVegetationTypeAssetImpostor, plNoBase, 1, plRTTIDefaultAllocator<plVegetationTypeAssetImpostor>)
+{
+  PL_BEGIN_PROPERTIES
+  {
+    PL_MEMBER_PROPERTY("Distance", m_fDistance)->AddAttributes(new plDefaultValueAttribute(280.0f), new plClampValueAttribute(0.0f, 5000.0f), new plSuffixAttribute(" m")),
+    PL_MEMBER_PROPERTY("Views", m_uiViews)->AddAttributes(new plDefaultValueAttribute(8), new plClampValueAttribute(2, 16)),
+    PL_MEMBER_PROPERTY("Resolution", m_uiResolution)->AddAttributes(new plDefaultValueAttribute(192), new plClampValueAttribute(32, 512), new plSuffixAttribute(" px")),
+    PL_MEMBER_PROPERTY("ProxyVoxelSize", m_fProxyVoxelSize)->AddAttributes(new plDefaultValueAttribute(0.25f), new plClampValueAttribute(0.05f, 2.0f), new plSuffixAttribute(" m")),
+  }
+  PL_END_PROPERTIES;
+}
+PL_END_STATIC_REFLECTED_TYPE;
+
 PL_BEGIN_STATIC_REFLECTED_TYPE(plVegetationTypeAssetRayTracing, plNoBase, 1, plRTTIDefaultAllocator<plVegetationTypeAssetRayTracing>)
 {
   PL_BEGIN_PROPERTIES
@@ -254,11 +270,12 @@ PL_BEGIN_DYNAMIC_REFLECTED_TYPE(plVegetationTypeAssetProperties, 1, plRTTIDefaul
   {
     PL_ARRAY_MEMBER_PROPERTY("Lods", m_Lods),
     PL_MEMBER_PROPERTY("Composite", m_sComposite)->AddAttributes(new plReadOnlyAttribute(), new plTemporaryAttribute()),
-    PL_ARRAY_MEMBER_PROPERTY("Materials", m_Materials)->AddAttributes(new plAssetBrowserAttribute("CompatibleAsset_Material")),
+    PL_ARRAY_MEMBER_PROPERTY("Materials", m_Materials)->AddAttributes(new plAssetBrowserAttribute("CompatibleAsset_Material", plDependencyFlags::Thumbnail | plDependencyFlags::Package | plDependencyFlags::Transform)),
     PL_MEMBER_PROPERTY("Wind", m_Wind),
     PL_MEMBER_PROPERTY("Touch", m_Touch),
     PL_MEMBER_PROPERTY("Placement", m_Placement),
     PL_MEMBER_PROPERTY("Render", m_Render),
+    PL_MEMBER_PROPERTY("Impostor", m_Impostor),
     PL_MEMBER_PROPERTY("RayTracing", m_RayTracing),
   }
   PL_END_PROPERTIES;
@@ -316,6 +333,12 @@ void plVegetationTypeAssetProperties::FillDescriptor(plVegetationTypeResourceDes
   out_desc.m_Render.m_fLodCrossfade = m_Render.m_fLodCrossfade;
   out_desc.m_Render.m_bCastShadows = m_Render.m_bCastShadows;
   out_desc.m_Render.m_bUseImpostor = m_Render.m_bUseImpostor;
+
+  out_desc.m_Impostor.m_fDistance = m_Impostor.m_fDistance;
+  out_desc.m_Impostor.m_uiViews = static_cast<plUInt8>(plMath::Clamp<plUInt32>(m_Impostor.m_uiViews, 2, 16));
+  out_desc.m_Impostor.m_uiResolution = static_cast<plUInt16>(plMath::Clamp<plUInt32>(m_Impostor.m_uiResolution, 32, 512));
+  out_desc.m_Impostor.m_fProxyVoxelSize = m_Impostor.m_fProxyVoxelSize;
+  out_desc.m_Impostor = out_desc.m_Impostor.GetValidated();
 
   out_desc.m_RayTracing.m_Mode = m_RayTracing.m_Mode;
   out_desc.m_RayTracing.m_iLod = m_RayTracing.m_iLod;

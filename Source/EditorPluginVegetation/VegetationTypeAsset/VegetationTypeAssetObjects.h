@@ -92,6 +92,19 @@ struct plVegetationTypeAssetRender
 
 PL_DECLARE_REFLECTABLE_TYPE(PL_NO_LINKAGE, plVegetationTypeAssetRender);
 
+/// The far representations of a foliage composite type, baked from LOD 0 at transform time: trees beyond Distance draw as
+/// an impostor of Views x Views directions of Resolution texels each, and in the middle distances (Vegetation.CellShell)
+/// as part of their cell's voxel shell, built from a voxel proxy of ProxyVoxelSize. Distance 0 bakes neither.
+struct plVegetationTypeAssetImpostor
+{
+  float m_fDistance = 280.0f;
+  plUInt32 m_uiViews = 8;
+  plUInt32 m_uiResolution = 192;
+  float m_fProxyVoxelSize = 0.25f;
+};
+
+PL_DECLARE_REFLECTABLE_TYPE(PL_NO_LINKAGE, plVegetationTypeAssetImpostor);
+
 /// How the ray tracing scene (GI, reflections, ray traced shadows) sees the type.
 struct plVegetationTypeAssetRayTracing
 {
@@ -126,5 +139,6 @@ public:
   plVegetationTypeAssetTouch m_Touch;
   plVegetationTypeAssetPlacement m_Placement;
   plVegetationTypeAssetRender m_Render;
+  plVegetationTypeAssetImpostor m_Impostor;
   plVegetationTypeAssetRayTracing m_RayTracing;
 };

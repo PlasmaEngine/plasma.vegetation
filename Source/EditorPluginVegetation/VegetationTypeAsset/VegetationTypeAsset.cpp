@@ -4,12 +4,14 @@
 #include <EditorFramework/Assets/AssetCurator.h>
 #include <Foundation/Utilities/ConversionUtils.h>
 #include <ToolsFoundation/Object/DocumentObjectManager.h>
+#include <EditorPluginVegetation/VegetationTypeAsset/VegetationImpostorBake.h>
 #include <EditorPluginVegetation/VegetationTypeAsset/VegetationTypeAsset.h>
 #include <Foundation/Utilities/Progress.h>
 #include <VegetationPlugin/Resources/VegetationTypeResource.h>
 
 // clang-format off
-PL_BEGIN_DYNAMIC_REFLECTED_TYPE(plVegetationTypeAssetDocument, 1, plRTTINoAllocator)
+// Version 2: the transform bakes the impostor of foliage composite types.
+PL_BEGIN_DYNAMIC_REFLECTED_TYPE(plVegetationTypeAssetDocument, 2, plRTTINoAllocator)
 PL_END_DYNAMIC_REFLECTED_TYPE;
 // clang-format on
 
@@ -138,12 +140,31 @@ plTransformStatus plVegetationTypeAssetDocument::InternalTransformAsset(plStream
   PL_IGNORE_UNUSED(AssetHeader);
   PL_IGNORE_UNUSED(transformFlags);
 
-  plProgressRange range("Transforming Asset", 1, false);
+  plProgressRange range("Transforming Asset", 2, false);
 
-  const plStatus status = WriteVegetationType(stream);
-  if (status.Failed())
-    return status;
+  const plVegetationTypeAssetProperties* pProp = GetProperties();
+  if (pProp == nullptr)
+    return plStatus("Vegetation type document has no properties.");
 
+  plVegetationTypeResourceDescriptor desc;
+  pProp->FillDescriptor(desc);
+
+  // A foliage composite bakes its impostor from LOD 0's merged mesh (on the CPU). A failed bake leaves the type without
+  // one: its trees keep the merged mesh at every distance.
+  range.BeginNextStep("Baking Impostor");
+  plSharedPtr<plVegetationImpostorData> pImpostor = PL_DEFAULT_NEW(plVegetationImpostorData);
+  plSharedPtr<plVegetationVoxelProxy> pProxy = PL_DEFAULT_NEW(plVegetationVoxelProxy);
+  const plStatus bakeStatus = plVegetationImpostorEditorBake::Bake(desc, *pImpostor, *pProxy);
+  if (bakeStatus.Succeeded())
+  {
+    desc.m_pImpostorData = pImpostor;
+    desc.m_pVoxelProxy = pProxy;
+  }
+  else if (!bakeStatus.m_sMessage.IsEmpty())
+    plLog::Warning("{}", bakeStatus.m_sMessage);
+
+  range.BeginNextStep("Writing");
+  desc.Save(stream);
   return plStatus(PL_SUCCESS);
 }
 

@@ -74,6 +74,71 @@ PL_CREATE_SIMPLE_TEST(ForestCells, ClassifyTree)
   PL_TEST_INT(plVegetationCompositeSplit::ClassifyTree(high, 10.0f, thin), S::Parts | S::CastsShadow);
 }
 
+PL_CREATE_SIMPLE_TEST(ForestCells, ImpostorHandOff)
+{
+  using S = plVegetationCompositeTreeState;
+  plVegetationCompositeThresholds t = MakeThresholds();
+  t.m_fImpostorNear = 77.0f;
+  t.m_fImpostorFar = 83.0f;
+  t.m_fShadowImpostorDistance = 80.0f;
+
+  plVegetationCellInstance tree = MakeTree(plVec3::MakeZero());
+
+  // Merged mesh before the band, both inside it, the impostor beyond.
+  PL_TEST_INT(plVegetationCompositeSplit::ClassifyTree(tree, 70.0f, t), S::Merged | S::CastsShadow);
+  PL_TEST_INT(plVegetationCompositeSplit::ClassifyTree(tree, 79.0f, t), S::Merged | S::ImpostorFade | S::CastsShadow);
+  PL_TEST_INT(plVegetationCompositeSplit::ClassifyTree(tree, 81.0f, t), S::Merged | S::ImpostorFade | S::CastsShadow | S::ShadowImpostor);
+  PL_TEST_INT(plVegetationCompositeSplit::ClassifyTree(tree, 90.0f, t), S::Impostor | S::CastsShadow | S::ShadowImpostor);
+  // Beyond the shadow distance: no shadow, so no shadow representation either.
+  PL_TEST_INT(plVegetationCompositeSplit::ClassifyTree(tree, 200.0f, t), S::Impostor);
+  PL_TEST_INT(plVegetationCompositeSplit::ClassifyTree(tree, 500.0f, t), S::Hidden);
+
+  // The far bands are plain distances, whatever the tree's scale: the cell shell fades per pixel.
+  tree.m_fScale = 2.0f;
+  PL_TEST_INT(plVegetationCompositeSplit::ClassifyTree(tree, 90.0f, t), S::Impostor | S::CastsShadow | S::ShadowImpostor);
+
+  // Without an impostor nothing changes.
+  const plVegetationCompositeThresholds plain = MakeThresholds();
+  tree.m_fScale = 1.0f;
+  PL_TEST_INT(plVegetationCompositeSplit::ClassifyTree(tree, 90.0f, plain), S::Merged | S::CastsShadow);
+
+  // A cell far beyond the band evaluates nothing per tree while the camera moves; one crossing it does.
+  plDynamicArray<plVegetationCellInstance> trees;
+  MakeCell(plVec3(200.0f, 0.0f, 0.0f), trees);
+  plVegetationCompositeSplit split;
+  PL_TEST_BOOL(split.Update(trees, plVec3(0, 0, 0), t));
+  PL_TEST_INT(split.GetCount(S::Impostor), 16);
+  PL_TEST_BOOL(!split.Update(trees, plVec3(10.0f, 0, 0), t));
+  PL_TEST_BOOL(!split.WasEvaluatedPerTree());
+  PL_TEST_BOOL(split.Update(trees, plVec3(135.0f, 0, 0), t));
+  PL_TEST_BOOL(split.WasEvaluatedPerTree());
+  PL_TEST_BOOL(split.GetCount(S::Impostor) > 0 && split.GetCount(S::Impostor) < 16);
+}
+
+PL_CREATE_SIMPLE_TEST(ForestCells, ThreeBands)
+{
+  // Trees up to 90 m, the cell's voxel shell from there, impostors from 280 m; 10 m hand-offs.
+  using S = plVegetationCompositeTreeState;
+  plVegetationCompositeThresholds t = MakeThresholds();
+  t.m_fCullDistance = 1200.0f;
+  t.m_fCellNear = 85.0f;
+  t.m_fCellFar = 95.0f;
+  t.m_fImpostorNear = 275.0f;
+  t.m_fImpostorFar = 285.0f;
+  t.m_fShadowImpostorDistance = 280.0f;
+
+  const plVegetationCellInstance tree = MakeTree(plVec3::MakeZero());
+  PL_TEST_INT(plVegetationCompositeSplit::ClassifyTree(tree, 60.0f, t), S::Merged | S::CastsShadow);
+  // In the shell hand-off: the merged mesh fades; it casts its shadow until the band's middle.
+  PL_TEST_INT(plVegetationCompositeSplit::ClassifyTree(tree, 88.0f, t), S::Merged | S::CellFade | S::CastsShadow);
+  PL_TEST_INT(plVegetationCompositeSplit::ClassifyTree(tree, 92.0f, t), S::Merged | S::CellFade);
+  // The shell draws it, shadow included.
+  PL_TEST_INT(plVegetationCompositeSplit::ClassifyTree(tree, 150.0f, t), S::Hidden | S::InCell);
+  // The impostor fades in against the shell, then takes over.
+  PL_TEST_INT(plVegetationCompositeSplit::ClassifyTree(tree, 280.0f, t), S::Hidden | S::InCell | S::ImpostorFade);
+  PL_TEST_INT(plVegetationCompositeSplit::ClassifyTree(tree, 300.0f, t), S::Impostor);
+}
+
 PL_CREATE_SIMPLE_TEST(ForestCells, SplitOnlyChangesWhenATreeCrosses)
 {
   plDynamicArray<plVegetationCellInstance> trees;

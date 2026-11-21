@@ -12,13 +12,18 @@ struct plVegetationCompositeTreeState
 {
   enum Enum : plUInt8
   {
-    Hidden = 0, ///< Beyond the cull distance, or dropped by Vegetation.DensityScale.
-    Merged = 1, ///< The composite's merged mesh.
-    Parts = 2,  ///< The composite's parts, each an instance of its part mesh.
+    Hidden = 0,   ///< Beyond the cull distance, or dropped by Vegetation.DensityScale.
+    Merged = 1,   ///< The composite's merged mesh.
+    Parts = 2,    ///< The composite's parts, each an instance of its part mesh.
+    Impostor = 3, ///< The type's impostor.
 
     MainMask = 3,
-    CastsShadow = 4, ///< Within the shadow cull distance and not flagged NoShadow.
-    ShadowParts = 8, ///< Parts in the main view and near enough to cast its shadow with parts too; else the merged mesh.
+    CastsShadow = 4,     ///< Within the shadow cull distance and not flagged NoShadow.
+    ShadowParts = 8,     ///< Parts in the main view and near enough to cast its shadow with parts too; else the merged mesh.
+    ImpostorFade = 16,   ///< In the impostor hand-off: the impostor dithers against the merged mesh (main state) or, with a cell shell, the shell.
+    ShadowImpostor = 32, ///< Casts its shadow with the impostor; else the merged mesh (or parts).
+    CellFade = 64,       ///< In the shell hand-off: the merged mesh (main state) dithers against the cell's voxel shell.
+    InCell = 128,        ///< Drawn by the cell's voxel shell (main state Hidden), shadow included.
   };
 };
 
@@ -30,6 +35,17 @@ struct plVegetationCompositeThresholds
   float m_fShadowCullDistance = 0.0f; ///< Trees further away cast no shadow; at most m_fCullDistance.
   float m_fShadowPartsDistance = 0.0f; ///< At instance scale 1: shadows use parts closer than this, the merged mesh beyond.
   float m_fDensity = 1.0f;            ///< Vegetation.DensityScale: fraction of the non-hero trees kept, by colour seed.
+
+  /// The hand-off band to the cell's merged voxel shell, metres from the camera whatever the tree's scale (the shell
+  /// fades per pixel): closer than near the tree alone, beyond far the shell alone. 0 = no shell.
+  float m_fCellNear = 0.0f;
+  float m_fCellFar = 0.0f;
+
+  /// The hand-off band to the impostor, metres from the camera whatever the tree's scale. Closer than near the merged
+  /// mesh (or the shell) alone, beyond far the impostor alone, in between both. 0 = no impostor.
+  float m_fImpostorNear = 0.0f;
+  float m_fImpostorFar = 0.0f;
+  float m_fShadowImpostorDistance = 0.0f; ///< Shadows use the impostor beyond this. 0 = never.
 
   bool operator==(const plVegetationCompositeThresholds& other) const = default;
 };
@@ -62,7 +78,7 @@ public:
   static plUInt8 ClassifyTree(const plVegetationCellInstance& inst, float fDistance, const plVegetationCompositeThresholds& thresholds);
 
 private:
-  /// Per threshold, 0 all trees nearer, 1 all further, 2 mixed; packed two bits each.
+  /// Per threshold, 0 all trees nearer, 1 all further, 2 mixed; packed two bits each (nine thresholds).
   plUInt32 ComputeBandKey(const plVec3& vCamera, const plVegetationCompositeThresholds& thresholds) const;
 
   plDynamicArray<plUInt8> m_States;
@@ -74,5 +90,5 @@ private:
   plVegetationCompositeThresholds m_Thresholds;
   bool m_bValid = false;
   bool m_bEvaluatedPerTree = false;
-  plUInt32 m_uiCounts[3] = {};
+  plUInt32 m_uiCounts[4] = {};
 };

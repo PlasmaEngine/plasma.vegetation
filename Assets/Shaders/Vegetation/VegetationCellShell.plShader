@@ -1,0 +1,229 @@
+[PLATFORMS]
+ALL
+
+[PERMUTATIONS]
+
+// The merged voxel shell of a vegetation cell (plVegetationCellShellBuilder): the middle distances of a forest, between
+// the trees drawn one by one and their impostors. The runtime creates the material on top of a type's leaf material,
+// so the foliage lighting parameters are the leaves' own; colour, coverage and translucency come from the vertices.
+BLEND_MODE
+RENDER_PASS
+SHADING_MODE
+TWO_SIDED
+FORWARD_PASS_WRITE_DEPTH
+MSAA
+CAMERA_MODE
+VELOCITY_OUTPUT
+SHADING_QUALITY = SHADING_QUALITY_NORMAL
+FLIP_WINDING = FALSE
+GAMEOBJECT_VELOCITY = TRUE
+SSS_PROFILE = SSS_PROFILE_NONE
+OPENPBR_COAT = FALSE
+OPENPBR_COAT_EXTENDED = FALSE
+OPENPBR_FUZZ = FALSE
+OPENPBR_ANISOTROPY = FALSE
+OPENPBR_TRANSMISSION = FALSE
+OPENPBR_TRANSMISSION_BLUR = FALSE
+OPENPBR_TRANSMISSION_DISPERSION = FALSE
+OPENPBR_THINFILM = FALSE
+OPENPBR_SUBSURFACE = FALSE
+
+[MATERIALPARAMETER]
+
+#include <Shaders/Materials/OpenPBRParams.h>
+
+float foliage_transmission_wrap @Default(0.5) @Clamp(0.0, 1.0) @Group("Foliage");
+float foliage_transmission_distortion @Default(0.1) @Clamp(0.0, 0.5) @Group("Foliage");
+float foliage_transmission_power @Default(20.0) @Clamp(10.0, 80.0) @Group("Foliage");
+float foliage_transmission_intensity @Default(1.0) @Clamp(0.0, 2.0) @Group("Foliage");
+float foliage_ambient_transmission @Default(0.25) @Clamp(0.0, 1.0) @Group("Foliage");
+
+[MATERIALCONFIG]
+
+#include <Shaders/Materials/OpenPBRConfig.h>
+
+[RENDERSTATE]
+
+#include <Shaders/Materials/MaterialState.h>
+
+[MATERIALCONSTANTS]
+
+#include <Shaders/Materials/OpenPBRConstants.h>
+
+FLOAT1(foliage_transmission_wrap);
+FLOAT1(foliage_transmission_distortion);
+FLOAT1(foliage_transmission_power);
+FLOAT1(foliage_transmission_intensity);
+FLOAT1(foliage_ambient_transmission);
+
+[VERTEXSHADER]
+
+#define USE_NORMAL
+#define USE_TANGENT
+#define USE_TEXCOORD0
+#define USE_COLOR0
+
+#if GAMEOBJECT_VELOCITY
+  #define USE_VELOCITY
+#endif
+
+#if RENDER_PASS == RENDER_PASS_EDITOR
+  #define USE_DEBUG_INTERPOLATOR
+#endif
+
+#include <Shaders/Materials/MaterialVertexShader.h>
+
+VS_OUT main(VS_IN Input)
+{
+  return FillVertexData(Input);
+}
+
+[PIXELSHADER]
+
+#define USE_NORMAL
+#define USE_TANGENT
+#define USE_TEXCOORD0
+#define USE_COLOR0
+
+#define USE_MATERIAL_OCCLUSION
+#define USE_FOG
+#define USE_MATERIAL_FOLIAGE_REPRESENTATION
+
+#define USE_SIMPLE_MATERIAL_MODEL
+#define USE_MATERIAL_DIFFUSE_ROUGHNESS
+#define USE_MATERIAL_SPECULAR_TINT
+
+#define MATERIAL_FOLIAGE
+#define USE_MATERIAL_SUBSURFACE_COLOR
+#define MATERIAL_SUBSURFACE_COLOR_UNTINTED
+#define USE_MATERIAL_SUBSURFACE_PARAMS
+#define USE_MATERIAL_SUBSURFACE_EXTENDED
+#define USE_MATERIAL_FOLIAGE_PARAMS
+
+#define CUSTOM_GLOBALS float Unused;
+
+#if GAMEOBJECT_VELOCITY
+  #define USE_VELOCITY
+#endif
+
+#if RENDER_PASS == RENDER_PASS_EDITOR
+  #define USE_DEBUG_INTERPOLATOR
+#endif
+
+#include <Shaders/Materials/MaterialPixelShader.h>
+#include <Shaders/Vegetation/FoliageRepresentation.h>
+
+// Same interleaved gradient noise as the vegetation LOD crossfade and the impostor, so the hand-offs are complementary.
+float CellShellDitherNoise(float2 pixelPos)
+{
+  return frac(52.9829189 * frac(dot(pixelPos, float2(0.06711056, 0.00583715))));
+}
+
+// The instance of a shell (plVegetationCellComponent): Wind = the main camera position, CustomData = start and length
+// of the hand-off from the trees, start and length of the hand-off to the impostors (metres from the main camera),
+// Color.r = the shadow cull distance.
+void FillCustomGlobals()
+{
+  plPerInstanceData data = GetInstanceData();
+  const float dist = length(G.Input.WorldPosition.xyz - data.Wind);
+  const float4 bands = data.CustomData;
+
+  // Coverage of the voxel, as a dither: on average as much of the shell covers as the trees it stands for.
+  const float coverageNoise = CellShellDitherNoise(G.Input.Position.xy + float2(5.588238, 3.137));
+
+  [branch]
+  if (IsShadowPass)
+  {
+    // Shadows switch at the middle of each band and do not dither the hand-off.
+    if (dist < bands.x + bands.y * 0.5 || dist > data.Color.r || G.Input.Color0.a < coverageNoise)
+      discard;
+    return;
+  }
+
+  // The trees keep the pixels where the noise is at most their opacity, the impostors where it is below theirs; the
+  // shell keeps the rest.
+  const float treeOpacity = 1.0 - saturate((dist - bands.x) / max(bands.y, 0.001));
+  const float impostorOpacity = saturate((dist - bands.z) / max(bands.w, 0.001));
+  const float noise = CellShellDitherNoise(G.Input.Position.xy);
+  if (noise <= treeOpacity || noise < impostorOpacity || G.Input.Color0.a < coverageNoise)
+    discard;
+}
+
+float3 GetFoliageRepresentationColor()
+{
+  return FoliageRepresentationColor(GetFoliageRepresentation(GetInstanceData().RandomSeed));
+}
+
+float3 GetNormal()
+{
+  return G.Input.Normal;
+}
+
+float3 GetBaseColor()
+{
+  return G.Input.Color0.rgb;
+}
+
+float GetMetallic()
+{
+  return GetMaterialData(base_metalness);
+}
+
+float GetReflectance()
+{
+  const float ior = max(GetMaterialData(specular_ior), 1.0f);
+  return ((ior - 1.0f) / (ior + 1.0f)) / 0.4f * GetMaterialData(specular_weight) * GetLuminance(GetMaterialData(specular_color).rgb);
+}
+
+float3 GetSpecularTint()
+{
+  const float3 tint = GetMaterialData(specular_color).rgb;
+  const float luminance = GetLuminance(tint);
+  return luminance > 1e-4f ? tint / luminance : float3(1.0f, 1.0f, 1.0f);
+}
+
+float GetDiffuseRoughness()
+{
+  return GetMaterialData(base_diffuse_roughness);
+}
+
+float GetRoughness()
+{
+  return GetMaterialData(specular_roughness);
+}
+
+float GetOpacity()
+{
+  // FillCustomGlobals already discarded by coverage.
+  return 1.0;
+}
+
+float GetOcclusion()
+{
+  return 1.0;
+}
+
+float3 GetSubsurfaceColor()
+{
+  return GetMaterialData(subsurface_color).rgb;
+}
+
+void GetSubsurfaceParams(out float scatterPower, out float shadowFalloff)
+{
+  scatterPower = GetMaterialData(foliage_transmission_power);
+  shadowFalloff = GetMaterialData(foliage_ambient_transmission);
+}
+
+void GetSubsurfaceExtendedParams(out float weight, out float3 radius, out float scatterAnisotropy)
+{
+  weight = saturate(G.Input.TexCoord0.x);
+  radius = saturate(GetMaterialData(subsurface_radius) * GetMaterialData(subsurface_radius_scale).rgb);
+  scatterAnisotropy = clamp(GetMaterialData(subsurface_scatter_anisotropy), -1.0f, 1.0f);
+}
+
+void GetFoliageParams(out float wrap, out float distortion, out float intensity)
+{
+  wrap = saturate(GetMaterialData(foliage_transmission_wrap));
+  distortion = saturate(GetMaterialData(foliage_transmission_distortion));
+  intensity = max(GetMaterialData(foliage_transmission_intensity), 0.0f);
+}

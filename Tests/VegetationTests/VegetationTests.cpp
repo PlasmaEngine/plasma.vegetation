@@ -9,7 +9,9 @@
 #include <VegetationPlugin/Components/VegetationLayerData.h>
 #include <VegetationPlugin/Grass/GrassCoverageData.h>
 #include <VegetationPlugin/Placement/VegetationScatter.h>
+#include <RendererCore/Meshes/MeshResourceDescriptor.h>
 #include <VegetationPlugin/Resources/VegetationTypeResource.h>
+#include <VegetationPlugin/World/VegetationCellShell.h>
 
 PL_TESTFRAMEWORK_ENTRY_POINT("VegetationTests", "Vegetation CPU tests")
 PL_CREATE_SIMPLE_TEST_GROUP(Vegetation);
@@ -682,4 +684,266 @@ PL_CREATE_SIMPLE_TEST(Vegetation, LayerFillProperties)
   const plRTTI* pSpecies = plGetStaticRTTI<plVegetationFillSpecies>();
   PL_TEST_BOOL(pSpecies->FindPropertyByName("Type") != nullptr);
   PL_TEST_BOOL(pSpecies->FindPropertyByName("Weight") != nullptr);
+}
+
+namespace
+{
+  /// A closed box of 12 triangles: slot 0 on the lower half (bark), slot 1 on the upper half (leaves).
+  plVegetationImpostorBakeMesh MakeBoxMesh(const plVec3& vHalf, float fZOffset)
+  {
+    plVegetationImpostorBakeMesh mesh;
+    for (plUInt32 c = 0; c < 8; ++c)
+      mesh.m_Positions.PushBack(plVec3((c & 1) ? vHalf.x : -vHalf.x, (c & 2) ? vHalf.y : -vHalf.y, ((c & 4) ? vHalf.z : -vHalf.z) + fZOffset));
+
+    const plUInt32 faces[6][4] = {{0, 1, 3, 2}, {4, 6, 7, 5}, {0, 4, 5, 1}, {2, 3, 7, 6}, {0, 2, 6, 4}, {1, 5, 7, 3}};
+    for (plUInt32 f = 0; f < 6; ++f)
+    {
+      for (plUInt32 t = 0; t < 2; ++t)
+      {
+        mesh.m_Indices.PushBack(faces[f][0]);
+        mesh.m_Indices.PushBack(faces[f][t + 1]);
+        mesh.m_Indices.PushBack(faces[f][t + 2]);
+        mesh.m_TriangleSlots.PushBack(f == 1 ? 1 : 0);
+      }
+    }
+
+    mesh.m_Slots.SetCount(2);
+    mesh.m_Slots[0].m_BaseColor = plColor(0.3f, 0.2f, 0.1f);
+    mesh.m_Slots[1].m_BaseColor = plColor(0.1f, 0.6f, 0.1f);
+    mesh.m_Slots[1].m_fTranslucency = 0.8f;
+    return mesh;
+  }
+} // namespace
+
+PL_CREATE_SIMPLE_TEST(Vegetation, CellShell)
+{
+  // A dense 2 m box crown, sampled at 0.25 m.
+  const plVegetationImpostorBakeMesh mesh = MakeBoxMesh(plVec3(1.0f, 1.0f, 1.0f), 3.0f);
+  plSharedPtr<plVegetationVoxelProxy> pProxy = PL_DEFAULT_NEW(plVegetationVoxelProxy);
+  PL_TEST_BOOL(plVegetationImpostorBaker::BakeVoxelProxy(mesh, 0.25f, *pProxy).Succeeded());
+
+  PL_TEST_BLOCK(plTestBlock::Enabled, "Voxel proxy")
+  {
+    PL_TEST_BOOL(pProxy->IsValid());
+    float fArea = 0.0f;
+    for (const plVegetationVoxelProxy::Voxel& v : pProxy->m_Voxels)
+    {
+      fArea += v.m_fArea;
+      // Normals point out of the crown.
+      PL_TEST_BOOL(v.m_vNormal.Dot(v.m_vCenter - plVec3(0, 0, 3)) >= -0.001f);
+    }
+    // Six faces of 4 square metres.
+    PL_TEST_FLOAT(fArea, 24.0f, 0.01f);
+
+    plDefaultMemoryStreamStorage storage;
+    plMemoryStreamWriter writer(&storage);
+    pProxy->Save(writer);
+    plMemoryStreamReader reader(&storage);
+    plVegetationVoxelProxy loaded;
+    PL_TEST_BOOL(loaded.Load(reader).Succeeded());
+    PL_TEST_INT(loaded.m_Voxels.GetCount(), pProxy->m_Voxels.GetCount());
+  }
+
+  PL_TEST_BLOCK(plTestBlock::Enabled, "Overlapping trees share one shell")
+  {
+    plVegetationCellShellSettings settings;
+    settings.m_fVoxelSize = 0.5f;
+
+    plVegetationCellShellTree tree;
+    tree.m_pProxy = pProxy.Borrow();
+    tree.m_Transform = plTransform::MakeIdentity();
+
+    plMeshResourceDescriptor one;
+    plVegetationCellShellStats oneStats;
+    PL_TEST_BOOL(plVegetationCellShellBuilder::Build(plArrayPtr<const plVegetationCellShellTree>(&tree, 1), plVec3::MakeZero(), settings, one, &oneStats).Succeeded());
+    PL_TEST_INT(oneStats.m_uiTrees, 1);
+    PL_TEST_BOOL(oneStats.m_uiFaces > 0);
+
+    // Two trees half a crown apart: the faces between them are hidden, so fewer than twice as many remain.
+    plVegetationCellShellTree two[2] = {tree, tree};
+    two[1].m_Transform.m_vPosition = plVec3(1.0f, 0.0f, 0.0f);
+    plMeshResourceDescriptor merged;
+    plVegetationCellShellStats mergedStats;
+    PL_TEST_BOOL(plVegetationCellShellBuilder::Build(plArrayPtr<const plVegetationCellShellTree>(two, 2), plVec3::MakeZero(), settings, merged, &mergedStats).Succeeded());
+    PL_TEST_INT(mergedStats.m_uiTrees, 2);
+    PL_TEST_BOOL(mergedStats.m_uiFaces < oneStats.m_uiFaces * 2);
+    PL_TEST_INT(merged.MeshBufferDesc().GetPrimitiveCount(), mergedStats.m_uiFaces * 2);
+    PL_TEST_BOOL(merged.MeshBufferDesc().GetVertexStreamConfig().HasColor0());
+
+    // No proxies, no shell.
+    plVegetationCellShellTree empty;
+    plMeshResourceDescriptor none;
+    PL_TEST_BOOL(plVegetationCellShellBuilder::Build(plArrayPtr<const plVegetationCellShellTree>(&empty, 1), plVec3::MakeZero(), settings, none).Failed());
+  }
+}
+
+PL_CREATE_SIMPLE_TEST(Vegetation, ImpostorMath)
+{
+  PL_TEST_BLOCK(plTestBlock::Enabled, "Hemi-octahedral mapping round trip")
+  {
+    for (plUInt32 i = 0; i <= 16; ++i)
+    {
+      for (plUInt32 j = 0; j <= 16; ++j)
+      {
+        const plVec2 e(i / 8.0f - 1.0f, j / 8.0f - 1.0f);
+        const plVec3 d = plVegetationImpostorMath::HemiOctDecode(e);
+        PL_TEST_BOOL(d.z >= 0.0f);
+        PL_TEST_FLOAT(d.GetLength(), 1.0f, 0.0001f);
+        const plVec2 back = plVegetationImpostorMath::HemiOctEncode(d);
+        PL_TEST_FLOAT(back.x, e.x, 0.0001f);
+        PL_TEST_FLOAT(back.y, e.y, 0.0001f);
+      }
+    }
+
+    // The grid's centre view looks straight down, its corners along the horizon.
+    PL_TEST_BOOL(plVegetationImpostorMath::GetViewDirection(4, 4, 9).IsEqual(plVec3(0, 0, 1), 0.0001f));
+    PL_TEST_FLOAT(plVegetationImpostorMath::GetViewDirection(0, 0, 9).z, 0.0f, 0.0001f);
+  }
+
+  PL_TEST_BLOCK(plTestBlock::Enabled, "View basis")
+  {
+    for (plUInt32 i = 0; i < 8; ++i)
+    {
+      for (plUInt32 j = 0; j < 8; ++j)
+      {
+        const plVec3 w = plVegetationImpostorMath::GetViewDirection(i, j, 8);
+        plVec3 r, u;
+        plVegetationImpostorMath::GetViewBasis(w, r, u);
+        PL_TEST_FLOAT(r.GetLength(), 1.0f, 0.0001f);
+        PL_TEST_FLOAT(u.GetLength(), 1.0f, 0.0001f);
+        PL_TEST_FLOAT(r.Dot(w), 0.0f, 0.0001f);
+        PL_TEST_FLOAT(u.Dot(w), 0.0f, 0.0001f);
+        PL_TEST_FLOAT(r.Dot(u), 0.0f, 0.0001f);
+        // Up leans toward world up except for the view from straight above.
+        if (w.z < 0.99f)
+          PL_TEST_BOOL(u.z > 0.0f);
+      }
+    }
+  }
+
+  PL_TEST_BLOCK(plTestBlock::Enabled, "Normal encoding round trip")
+  {
+    for (plUInt32 i = 0; i < 64; ++i)
+    {
+      plVec3 n(plMath::Sin(plAngle::MakeFromRadian(i * 0.7f)), plMath::Cos(plAngle::MakeFromRadian(i * 1.3f)), plMath::Sin(plAngle::MakeFromRadian(i * 2.1f + 0.3f)));
+      n.Normalize();
+      const plVec3 back = plVegetationImpostorMath::OctDecodeNormal(plVegetationImpostorMath::OctEncodeNormal(n));
+      PL_TEST_BOOL(back.IsEqual(n, 0.001f));
+    }
+  }
+
+  PL_TEST_BLOCK(plTestBlock::Enabled, "Settings validation")
+  {
+    plVegetationImpostorSettings s;
+    s.m_uiViews = 40;
+    s.m_uiResolution = 100;
+    const plVegetationImpostorSettings v = s.GetValidated();
+    PL_TEST_INT(v.m_uiViews, 16);
+    PL_TEST_INT(v.m_uiResolution, 96);
+    PL_TEST_INT(plVegetationImpostorData::ComputeMipCount(192), 6);
+    PL_TEST_INT(plVegetationImpostorData::ComputeMipCount(128), 6);
+  }
+}
+
+PL_CREATE_SIMPLE_TEST(Vegetation, ImpostorBake)
+{
+  plVegetationImpostorSettings settings;
+  settings.m_uiViews = 4;
+  settings.m_uiResolution = 32;
+
+  // A 2 m wide, 4 m tall box standing on the pivot.
+  const plVegetationImpostorBakeMesh mesh = MakeBoxMesh(plVec3(1.0f, 1.0f, 2.0f), 2.0f);
+  plVegetationImpostorData data;
+  PL_TEST_BOOL(plVegetationImpostorBaker::Bake(mesh, settings, false, data).Succeeded());
+
+  PL_TEST_BLOCK(plTestBlock::Enabled, "Layout and bounds")
+  {
+    PL_TEST_INT(data.m_uiViews, 4);
+    PL_TEST_INT(data.m_uiResolution, 32);
+    PL_TEST_BOOL(data.m_vCenter.IsEqual(plVec3(0, 0, 2), 0.0001f));
+    PL_TEST_FLOAT(data.m_fRadius, plMath::Sqrt(6.0f) * 1.01f, 0.001f);
+    PL_TEST_INT(data.m_Albedo.GetWidth(), 128);
+    PL_TEST_INT(data.m_Albedo.GetNumMipLevels(), 4);
+    PL_TEST_INT(data.m_NormalDepth.GetNumMipLevels(), 4);
+    PL_TEST_BOOL(data.IsValid());
+    // Slot 0 (sides and bottom) has more area than slot 1 (the top face): it shades the impostor.
+    PL_TEST_INT(data.m_uiMaterialSlot, 0);
+  }
+
+  PL_TEST_BLOCK(plTestBlock::Enabled, "Coverage, depth and normal of the side view")
+  {
+    // View (0, 3) looks along the horizon; its tile centre shows the middle of a side face.
+    const plVec3 w = plVegetationImpostorMath::GetViewDirection(0, 3, 4);
+    PL_TEST_FLOAT(w.z, 0.0f, 0.0001f);
+
+    const plUInt32 x = 0 * 32 + 16, y = 3 * 32 + 16;
+    const plUInt8* pA = data.m_Albedo.GetPixelPointer<plUInt8>(0, 0, 0, x, y);
+    const plUInt8* pB = data.m_NormalDepth.GetPixelPointer<plUInt8>(0, 0, 0, x, y);
+    PL_TEST_INT(pA[3], 255);
+    // A side face of the box is in front of the centre: depth above the middle of the range.
+    PL_TEST_BOOL(pB[2] > 128);
+    // Bark: no translucency.
+    PL_TEST_INT(pB[3], 0);
+
+    const plVec3 n = plVegetationImpostorMath::OctDecodeNormal(plVec2(pB[0] / 255.0f * 2.0f - 1.0f, pB[1] / 255.0f * 2.0f - 1.0f));
+    PL_TEST_BOOL(n.Dot(w) > 0.5f);
+
+    // The tile's corner lies outside the box's silhouette.
+    const plUInt8* pCorner = data.m_Albedo.GetPixelPointer<plUInt8>(0, 0, 0, 0 * 32 + 1, 3 * 32 + 1);
+    PL_TEST_INT(pCorner[3], 0);
+  }
+
+  PL_TEST_BLOCK(plTestBlock::Enabled, "The view from above shows the leaves")
+  {
+    // The top view sits between grid points of an even grid: use a 3x3 grid, whose centre is the top.
+    plVegetationImpostorSettings top = settings;
+    top.m_uiViews = 3;
+    plVegetationImpostorData topData;
+    PL_TEST_BOOL(plVegetationImpostorBaker::Bake(mesh, top, false, topData).Succeeded());
+    const plUInt8* pB = topData.m_NormalDepth.GetPixelPointer<plUInt8>(0, 0, 0, 32 + 16, 32 + 16);
+    PL_TEST_BOOL(pB[3] > 190);
+  }
+
+  PL_TEST_BLOCK(plTestBlock::Enabled, "Mips keep the coverage")
+  {
+    plUInt32 uiCovered0 = 0, uiCoveredLast = 0;
+    const plUInt32 uiLast = data.m_Albedo.GetNumMipLevels() - 1;
+    const plUInt32 uiTile0 = 32, uiTileLast = 32 >> uiLast;
+    for (plUInt32 y = 0; y < uiTile0; ++y)
+      for (plUInt32 x = 0; x < uiTile0; ++x)
+        uiCovered0 += data.m_Albedo.GetPixelPointer<plUInt8>(0, 0, 0, x, 3 * uiTile0 + y)[3] >= 128 ? 1 : 0;
+    for (plUInt32 y = 0; y < uiTileLast; ++y)
+      for (plUInt32 x = 0; x < uiTileLast; ++x)
+        uiCoveredLast += data.m_Albedo.GetPixelPointer<plUInt8>(uiLast, 0, 0, x, 3 * uiTileLast + y)[3] >= 128 ? 1 : 0;
+
+    const float fShare0 = static_cast<float>(uiCovered0) / (uiTile0 * uiTile0);
+    const float fShareLast = static_cast<float>(uiCoveredLast) / (uiTileLast * uiTileLast);
+    PL_TEST_FLOAT(fShareLast, fShare0, 0.2f);
+  }
+
+  PL_TEST_BLOCK(plTestBlock::Enabled, "Type file round trip")
+  {
+    plVegetationTypeResourceDescriptor desc;
+    desc.m_Impostor = settings;
+    desc.m_Impostor.m_fDistance = 95.0f;
+    desc.m_pImpostorData = PL_DEFAULT_NEW(plVegetationImpostorData);
+    PL_TEST_BOOL(plVegetationImpostorBaker::Bake(mesh, settings, false, *desc.m_pImpostorData).Succeeded());
+
+    plDefaultMemoryStreamStorage storage;
+    plMemoryStreamWriter writer(&storage);
+    desc.Save(writer);
+
+    plMemoryStreamReader reader(&storage);
+    plVegetationTypeResourceDescriptor loaded;
+    PL_TEST_BOOL(loaded.Load(reader).Succeeded());
+    PL_TEST_FLOAT(loaded.m_Impostor.m_fDistance, 95.0f, 0.0f);
+    PL_TEST_BOOL(loaded.m_pImpostorData != nullptr);
+    if (loaded.m_pImpostorData != nullptr)
+    {
+      PL_TEST_INT(loaded.m_pImpostorData->m_uiViews, 4);
+      PL_TEST_FLOAT(loaded.m_pImpostorData->m_fRadius, desc.m_pImpostorData->m_fRadius, 0.0f);
+      PL_TEST_INT(loaded.m_pImpostorData->m_Albedo.GetNumMipLevels(), desc.m_pImpostorData->m_Albedo.GetNumMipLevels());
+      PL_TEST_BOOL(plMemoryUtils::IsEqual(loaded.m_pImpostorData->m_Albedo.GetPixelPointer<plUInt8>(), desc.m_pImpostorData->m_Albedo.GetPixelPointer<plUInt8>(), 128 * 128 * 4));
+    }
+  }
 }

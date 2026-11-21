@@ -1,6 +1,11 @@
 #include <VegetationPlugin/VegetationPluginPCH.h>
 
+#include <Core/Graphics/Geometry.h>
 #include <Core/ResourceManager/ResourceManager.h>
+#include <RendererCore/Pipeline/RenderData.h>
+#include <RendererCore/Shader/ShaderResource.h>
+#include <RendererCore/Textures/Texture2DResource.h>
+#include <RendererFoundation/Device/Device.h>
 #include <Foundation/Configuration/CVar.h>
 #include <Foundation/IO/Stream.h>
 #include <Foundation/Utilities/AssetFileHeader.h>
@@ -144,7 +149,7 @@ void plVegetationRayTracingSettings::Load(plStreamReader& inout_stream)
 
 void plVegetationTypeResourceDescriptor::Save(plStreamWriter& inout_stream) const
 {
-  const plUInt8 uiVersion = 3;
+  const plUInt8 uiVersion = 4;
   inout_stream << uiVersion;
 
   inout_stream << m_Lods.GetCount();
@@ -168,6 +173,18 @@ void plVegetationTypeResourceDescriptor::Save(plStreamWriter& inout_stream) cons
 
   // version 3
   m_Placement.SaveExtra(inout_stream);
+
+  // version 4
+  m_Impostor.Save(inout_stream);
+  const bool bHasImpostor = m_pImpostorData != nullptr && m_pImpostorData->IsValid();
+  inout_stream << bHasImpostor;
+  if (bHasImpostor)
+    m_pImpostorData->Save(inout_stream);
+
+  const bool bHasProxy = m_pVoxelProxy != nullptr && m_pVoxelProxy->IsValid();
+  inout_stream << bHasProxy;
+  if (bHasProxy)
+    m_pVoxelProxy->Save(inout_stream);
 }
 
 plResult plVegetationTypeResourceDescriptor::Load(plStreamReader& inout_stream)
@@ -175,7 +192,7 @@ plResult plVegetationTypeResourceDescriptor::Load(plStreamReader& inout_stream)
   plUInt8 uiVersion = 0;
   inout_stream >> uiVersion;
 
-  if (uiVersion < 1 || uiVersion > 3)
+  if (uiVersion < 1 || uiVersion > 4)
   {
     plLog::Error("Unknown vegetation type version {}", uiVersion);
     return PL_FAILURE;
@@ -216,6 +233,40 @@ plResult plVegetationTypeResourceDescriptor::Load(plStreamReader& inout_stream)
 
   if (uiVersion >= 3)
     m_Placement.LoadExtra(inout_stream);
+
+  // Older files have no impostor: their trees keep the merged mesh at every distance until the type is transformed again.
+  m_Impostor = plVegetationImpostorSettings();
+  m_pImpostorData.Clear();
+  m_pVoxelProxy.Clear();
+  if (uiVersion >= 4)
+  {
+    m_Impostor.Load(inout_stream);
+    bool bHasImpostor = false;
+    inout_stream >> bHasImpostor;
+    if (bHasImpostor)
+    {
+      plSharedPtr<plVegetationImpostorData> pData = PL_DEFAULT_NEW(plVegetationImpostorData);
+      if (pData->Load(inout_stream).Failed())
+      {
+        plLog::Error("Vegetation type has an unreadable impostor; it draws without one.");
+        return PL_SUCCESS;
+      }
+      m_pImpostorData = pData;
+    }
+
+    bool bHasProxy = false;
+    inout_stream >> bHasProxy;
+    if (bHasProxy)
+    {
+      plSharedPtr<plVegetationVoxelProxy> pProxy = PL_DEFAULT_NEW(plVegetationVoxelProxy);
+      if (pProxy->Load(inout_stream).Failed())
+      {
+        plLog::Error("Vegetation type has an unreadable voxel proxy; its cells draw it tree by tree.");
+        return PL_SUCCESS;
+      }
+      m_pVoxelProxy = pProxy;
+    }
+  }
 
   return PL_SUCCESS;
 }
@@ -330,9 +381,15 @@ void plVegetationTypeResource::ResolveHandles()
 
 void plVegetationTypeResource::ResetCompositeInfo()
 {
-  PL_LOCK(m_CompositeMutex);
-  m_iCompositeState = -1;
-  m_pComposite.Clear();
+  {
+    PL_LOCK(m_CompositeMutex);
+    m_iCompositeState = -1;
+    m_pComposite.Clear();
+  }
+
+  PL_LOCK(m_ImpostorMutex);
+  m_iImpostorState = -1;
+  m_pImpostor.Clear();
 }
 
 const plVegetationCompositeInfo* plVegetationTypeResource::GetCompositeInfo(bool& out_bKnown) const
@@ -382,6 +439,178 @@ const plVegetationCompositeInfo* plVegetationTypeResource::GetCompositeInfo(bool
   // Published last: readers that see 1 find the info complete.
   m_iCompositeState = 1;
   return m_pComposite.Borrow();
+}
+
+namespace
+{
+  /// The impostor shader of this package (Assets/Shaders/Vegetation/VegetationImpostor.plShader).
+  constexpr const char* s_szImpostorShader = "Shaders/Vegetation/VegetationImpostor.plShader";
+  /// The merged voxel shell shader (Assets/Shaders/Vegetation/VegetationCellShell.plShader).
+  constexpr const char* s_szCellShader = "Shaders/Vegetation/VegetationCellShell.plShader";
+
+  plAtomicInteger32 s_iImpostorResources = 0;
+
+  plTexture2DResourceHandle CreateImpostorTexture(plStringView sTypeId, plStringView sName, const plImage& image, bool bSRGB)
+  {
+    plTexture2DResourceDescriptor td;
+    td.m_SamplerDesc.m_AddressU = plImageAddressMode::Clamp;
+    td.m_SamplerDesc.m_AddressV = plImageAddressMode::Clamp;
+    td.m_SamplerDesc.m_AddressW = plImageAddressMode::Clamp;
+    td.m_SamplerDesc.m_MinFilter = plGALTextureFilterMode::Linear;
+    td.m_SamplerDesc.m_MagFilter = plGALTextureFilterMode::Linear;
+    td.m_SamplerDesc.m_MipFilter = plGALTextureFilterMode::Linear;
+
+    plUInt32 uiMemory = 0;
+    plHybridArray<plGALSystemMemoryDescription, 32> initData;
+    plTexture2DResource::FillOutDescriptor(td, &image, bSRGB, image.GetNumMipLevels(), uiMemory, initData);
+    td.m_InitialContent = initData;
+
+    // Unique per creation: a reloaded type must not pick up the textures of its previous bake.
+    plStringBuilder sId;
+    sId.SetFormat("{}/Impostor{}/{}", sTypeId, s_iImpostorResources.Increment(), sName);
+    return plResourceManager::CreateResource<plTexture2DResource>(sId, std::move(td), sId);
+  }
+
+  plMeshResourceHandle CreateImpostorMesh(plStringView sTypeId, const plVec3& vCenter, float fRadius)
+  {
+    // One quad (texture coordinates are the corners the vertex shader spreads toward the view) plus the corners of the
+    // sphere's box, which no triangle uses: they give the mesh bounds that hold the tree from every side, for culling.
+    plGeometry geom;
+    plUInt32 quad[4];
+    quad[0] = geom.AddVertex(vCenter, plVec3(0, 0, 1), plVec2(0, 0));
+    quad[1] = geom.AddVertex(vCenter, plVec3(0, 0, 1), plVec2(1, 0));
+    quad[2] = geom.AddVertex(vCenter, plVec3(0, 0, 1), plVec2(1, 1));
+    quad[3] = geom.AddVertex(vCenter, plVec3(0, 0, 1), plVec2(0, 1));
+    geom.AddPolygon(plArrayPtr<plUInt32>(quad), false);
+    for (plUInt32 c = 0; c < 8; ++c)
+    {
+      const plVec3 vCorner((c & 1) ? fRadius : -fRadius, (c & 2) ? fRadius : -fRadius, (c & 4) ? fRadius : -fRadius);
+      geom.AddVertex(vCenter + vCorner, plVec3(0, 0, 1), plVec2(0.5f, 0.5f));
+    }
+
+    plMeshResourceDescriptor desc;
+    desc.MeshBufferDesc().AddCommonStreams();
+    desc.MeshBufferDesc().AllocateStreamsFromGeometry(geom, plGALPrimitiveTopology::Triangles);
+    desc.AddSubMesh(desc.MeshBufferDesc().GetPrimitiveCount(), 0, 0);
+    desc.ComputeBounds();
+
+    plStringBuilder sId;
+    sId.SetFormat("{}/Impostor{}/Quad", sTypeId, s_iImpostorResources.Increment());
+    return plResourceManager::CreateResource<plMeshResource>(sId, std::move(desc), sId);
+  }
+} // namespace
+
+const plVegetationImpostorGpu* plVegetationTypeResource::GetImpostor(bool& out_bKnown) const
+{
+  out_bKnown = true;
+
+  const plInt32 iState = m_iImpostorState;
+  if (iState == 0)
+    return nullptr;
+  if (iState == 1)
+    return m_pImpostor.Borrow();
+
+  PL_LOCK(m_ImpostorMutex);
+  if (m_iImpostorState >= 0)
+    return m_iImpostorState == 1 ? m_pImpostor.Borrow() : nullptr;
+
+  const plVegetationImpostorData* pData = m_Descriptor.m_pImpostorData.Borrow();
+  if (pData == nullptr || !pData->IsValid() || m_Descriptor.m_Impostor.m_fDistance <= 0.0f || m_LodMeshes.IsEmpty() || plGALDevice::GetDefaultDevice() == nullptr)
+  {
+    m_iImpostorState = 0;
+    return nullptr;
+  }
+
+  // The impostor shades with the material of its baked slot: the type's override, else the merged mesh's material.
+  plMaterialResourceHandle hBaseMaterial = GetMaterialOverride(pData->m_uiMaterialSlot);
+  if (!hBaseMaterial.IsValid())
+  {
+    plResourceLock<plMeshResource> pMesh(m_LodMeshes[0], plResourceAcquireMode::AllowLoadingFallback_NeverFail);
+    if (pMesh.GetAcquireResult() != plResourceAcquireResult::Final)
+    {
+      out_bKnown = false;
+      return nullptr;
+    }
+
+    if (pData->m_uiMaterialSlot < pMesh->GetMaterials().GetCount())
+      hBaseMaterial = pMesh->GetMaterials()[pData->m_uiMaterialSlot];
+  }
+
+  if (hBaseMaterial.IsValid())
+  {
+    // Material creation flattens the base chain and blocks on it: only start once it is there.
+    plResourceLock<plMaterialResource> pBase(hBaseMaterial, plResourceAcquireMode::AllowLoadingFallback_NeverFail);
+    if (pBase.GetAcquireResult() == plResourceAcquireResult::LoadingFallback)
+    {
+      out_bKnown = false;
+      return nullptr;
+    }
+    if (pBase.GetAcquireResult() != plResourceAcquireResult::Final)
+      hBaseMaterial.Invalidate();
+  }
+
+  plUniquePtr<plVegetationImpostorGpu> pGpu = PL_DEFAULT_NEW(plVegetationImpostorGpu);
+  pGpu->m_fRadius = pData->m_fRadius;
+  pGpu->m_vCenter = pData->m_vCenter;
+
+  const plStringView sTypeId = GetResourceID();
+  pGpu->m_hAlbedo = CreateImpostorTexture(sTypeId, "Albedo", pData->m_Albedo, true);
+  pGpu->m_hNormalDepth = CreateImpostorTexture(sTypeId, "NormalDepth", pData->m_NormalDepth, false);
+  pGpu->m_hMesh = CreateImpostorMesh(sTypeId, pData->m_vCenter, pData->m_fRadius);
+
+  plMaterialResourceDescriptor md;
+  md.m_hBaseMaterial = hBaseMaterial;
+  md.m_hShader = plResourceManager::LoadResource<plShaderResource>(s_szImpostorShader);
+  md.m_RenderDataCategory = plDefaultRenderDataCategories::LitMasked;
+
+  auto AddPermutation = [&](const char* szName, const char* szValue)
+  {
+    plPermutationVar& var = md.m_PermutationVars.ExpandAndGetRef();
+    var.m_sName.Assign(szName);
+    var.m_sValue.Assign(szValue);
+  };
+  AddPermutation("BLEND_MODE", "BLEND_MODE_MASKED");
+  AddPermutation("SHADING_MODE", "SHADING_MODE_LIT");
+  // Whichever way the quad's winding faces the view, it is drawn.
+  AddPermutation("TWO_SIDED", "TRUE");
+
+  auto AddParameter = [&](const char* szName, const plVariant& value)
+  {
+    plMaterialResourceDescriptor::Parameter& param = md.m_Parameters.ExpandAndGetRef();
+    param.m_Name.Assign(szName);
+    param.m_Value = value;
+  };
+  const plUInt32 uiMips = plMath::Min(pData->m_Albedo.GetNumMipLevels(), pData->m_NormalDepth.GetNumMipLevels());
+  AddParameter("ImpostorSphere", plVec4(pData->m_vCenter.x, pData->m_vCenter.y, pData->m_vCenter.z, pData->m_fRadius));
+  AddParameter("ImpostorLayout", plVec4(static_cast<float>(pData->m_uiViews), static_cast<float>(pData->m_uiResolution), static_cast<float>(uiMips), static_cast<float>(pData->m_uiViews * pData->m_uiResolution)));
+
+  auto AddTexture = [&](const char* szName, const plTexture2DResourceHandle& hTexture)
+  {
+    plMaterialResourceDescriptor::Texture2DBinding& binding = md.m_Texture2DBindings.ExpandAndGetRef();
+    binding.m_Name.Assign(szName);
+    binding.m_Value = hTexture;
+  };
+  AddTexture("ImpostorAlbedo", pGpu->m_hAlbedo);
+  AddTexture("ImpostorNormalDepth", pGpu->m_hNormalDepth);
+
+  // The merged voxel shell shades with the same base material: its vertices carry colour, coverage and translucency.
+  plMaterialResourceDescriptor cellDesc;
+  cellDesc.m_hBaseMaterial = hBaseMaterial;
+  cellDesc.m_hShader = plResourceManager::LoadResource<plShaderResource>(s_szCellShader);
+  cellDesc.m_RenderDataCategory = plDefaultRenderDataCategories::LitMasked;
+  cellDesc.m_PermutationVars = md.m_PermutationVars;
+
+  plStringBuilder sMaterialId;
+  sMaterialId.SetFormat("{}/Impostor{}/Material", sTypeId, s_iImpostorResources.Increment());
+  pGpu->m_hMaterial = plResourceManager::CreateResource<plMaterialResource>(sMaterialId, std::move(md), sMaterialId);
+
+  sMaterialId.SetFormat("{}/Impostor{}/CellMaterial", sTypeId, s_iImpostorResources.Increment());
+  pGpu->m_hCellMaterial = plResourceManager::CreateResource<plMaterialResource>(sMaterialId, std::move(cellDesc), sMaterialId);
+
+  m_pImpostor = std::move(pGpu);
+  // Published last: readers that see 1 find the impostor complete.
+  m_iImpostorState = 1;
+  return m_pImpostor.Borrow();
 }
 
 float plVegetationCompositeInfo::ComputeSwitchDistance(float fSwitchError, float fScale, float fViewportHeight, float fTanHalfFovY, float fErrorPixels)
