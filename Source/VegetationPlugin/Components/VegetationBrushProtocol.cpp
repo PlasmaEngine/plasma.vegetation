@@ -32,7 +32,7 @@ namespace
 
 void plVegetationStrokeRequest::Write(plStreamWriter& inout_stream) const
 {
-  const plUInt8 uiVersion = 4;
+  const plUInt8 uiVersion = 5;
   inout_stream << uiVersion;
   inout_stream << m_uiMode;
   inout_stream << m_LayerGuid;
@@ -60,14 +60,22 @@ void plVegetationStrokeRequest::Write(plStreamWriter& inout_stream) const
   inout_stream << m_fLength;
   inout_stream << m_fTexelSize;
   inout_stream << m_LayerTransform;
+
+  // version 5
+  inout_stream << m_bUseTypeRules;
+  inout_stream << m_vFillMin;
+  inout_stream << m_vFillMax;
+  inout_stream << m_fTreesPerHectare;
+  inout_stream << m_bRemoveClearings;
+  inout_stream << m_bFillReplace;
 }
 
 plResult plVegetationStrokeRequest::Read(plStreamReader& inout_stream)
 {
-  // Editor and engine plugin ship together; a request from another protocol version is ignored.
+  // Editor and engine plugin ship together; version 4 requests still read, newer or older ones are ignored.
   plUInt8 uiVersion = 0;
   inout_stream >> uiVersion;
-  if (uiVersion != 4)
+  if (uiVersion < 4 || uiVersion > 5)
     return PL_FAILURE;
 
   inout_stream >> m_uiMode;
@@ -96,7 +104,100 @@ plResult plVegetationStrokeRequest::Read(plStreamReader& inout_stream)
   inout_stream >> m_fLength;
   inout_stream >> m_fTexelSize;
   inout_stream >> m_LayerTransform;
+
+  // A version 4 request placed with the brush values only.
+  m_bUseTypeRules = false;
+  m_vFillMin.SetZero();
+  m_vFillMax.SetZero();
+  m_fTreesPerHectare = 600.0f;
+  m_bRemoveClearings = false;
+  m_bFillReplace = false;
+
+  if (uiVersion >= 5)
+  {
+    inout_stream >> m_bUseTypeRules;
+    inout_stream >> m_vFillMin;
+    inout_stream >> m_vFillMax;
+    inout_stream >> m_fTreesPerHectare;
+    inout_stream >> m_bRemoveClearings;
+    inout_stream >> m_bFillReplace;
+  }
+
+  if (m_uiMode > plVegetationBrushMode::Clearing)
+    return PL_FAILURE;
+
   return PL_SUCCESS;
+}
+
+bool plVegetationStrokeRequest::ApplyClearingStamp(plVegetationLayerData& inout_data) const
+{
+  // Clearings are discs in the layer's xy plane; the world-space brush disc is an ellipse there under a non-uniform
+  // scale, measured with the per-axis scale like Erase.
+  const plTransform inv = m_LayerTransform.GetInverse();
+  const plVec3 vLocalCenter = inv.TransformPosition(m_vCenter);
+  const plVec2 vCenter = vLocalCenter.GetAsVec2();
+  const plVec2 vAxisScale = m_LayerTransform.m_vScale.Abs().GetAsVec2().CompMax(plVec2(0.0001f));
+  const float fRadius = plMath::Max(m_fRadius, 0.05f);
+
+  if (m_bRemoveClearings)
+    return inout_data.RemoveClearings(vCenter, fRadius, vAxisScale) > 0;
+
+  bool bChanged = inout_data.AddClearing(vCenter, fRadius / (0.5f * (vAxisScale.x + vAxisScale.y)));
+
+  const float fRadiusSq = fRadius * fRadius;
+  for (auto& entry : inout_data.m_Entries)
+  {
+    for (plUInt32 i = entry.m_Instances.GetCount(); i > 0; --i)
+    {
+      if ((entry.m_Instances[i - 1].m_vPosition.GetAsVec2() - vCenter).CompMul(vAxisScale).GetLengthSquared() <= fRadiusSq)
+      {
+        entry.m_Instances.RemoveAtAndSwap(i - 1);
+        bChanged = true;
+      }
+    }
+  }
+
+  inout_data.Compact();
+  return bChanged;
+}
+
+bool plVegetationStrokeRequest::ApplyFillReplace(plVegetationLayerData& inout_data, plGrassCoverageData* pGrass) const
+{
+  if (!m_bFillReplace)
+    return false;
+
+  const plVec2 vMin = m_vFillMin.GetAsVec2().CompMin(m_vFillMax.GetAsVec2());
+  const plVec2 vMax = m_vFillMin.GetAsVec2().CompMax(m_vFillMax.GetAsVec2());
+  bool bChanged = false;
+
+  if (!m_Types.IsEmpty())
+  {
+    for (auto& entry : inout_data.m_Entries)
+    {
+      if (!m_Types.Contains(entry.m_sType))
+        continue;
+
+      for (plUInt32 i = entry.m_Instances.GetCount(); i > 0; --i)
+      {
+        const plVec3& p = entry.m_Instances[i - 1].m_vPosition;
+        if (p.x >= vMin.x && p.y >= vMin.y && p.x <= vMax.x && p.y <= vMax.y)
+        {
+          entry.m_Instances.RemoveAtAndSwap(i - 1);
+          bChanged = true;
+        }
+      }
+    }
+
+    inout_data.Compact();
+  }
+
+  // an empty list would erase every type
+  if (pGrass != nullptr && !m_GrassTypes.IsEmpty())
+  {
+    bChanged |= pGrass->EraseInRect(m_GrassTypes, vMin, vMax) > 0;
+  }
+
+  return bChanged;
 }
 
 void plVegetationStrokeRequest::ToBuffer(plDataBuffer& out_buffer) const

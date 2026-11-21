@@ -28,6 +28,10 @@ plVegetationBrushContext::plVegetationBrushContext()
   m_hRing.ConfigureHandle(this, plEngineGizmoHandleType::CustomLines, RingColor(false, false), plGizmoFlags::OnTop | plGizmoFlags::ShowInOrtho);
   m_hInnerRing.ConfigureHandle(this, plEngineGizmoHandleType::CustomLines, RingColor(false, true), plGizmoFlags::OnTop | plGizmoFlags::ShowInOrtho);
 
+  plColorGammaUB clearingColor = plEditorUi::Warning();
+  clearingColor.a = 170;
+  m_hClearings.ConfigureHandle(this, plEngineGizmoHandleType::CustomLines, clearingColor, plGizmoFlags::OnTop | plGizmoFlags::ShowInOrtho);
+
   SetVisible(false);
   SetTransformation(plTransform::MakeIdentity());
 }
@@ -41,16 +45,20 @@ void plVegetationBrushContext::OnSetOwner(plEngineDocumentWindow* pOwnerWindow, 
   // The ring handles only reach the engine process as sync objects of the document.
   pOwnerWindow->GetDocument()->AddSyncObject(&m_hRing);
   pOwnerWindow->GetDocument()->AddSyncObject(&m_hInnerRing);
+  pOwnerWindow->GetDocument()->AddSyncObject(&m_hClearings);
 }
 
 void plVegetationBrushContext::OnVisibleChanged(bool bVisible)
 {
   m_hRing.SetVisible(bVisible && m_bHasSurface);
   m_hInnerRing.SetVisible(bVisible && m_bHasSurface);
+  if (!bVisible)
+    m_hClearings.SetVisible(false);
 
   if (!bVisible)
   {
     m_bDragging = false;
+    m_bFillDragging = false;
     m_bHasSurface = false;
 
     if (m_pTool != nullptr)
@@ -73,6 +81,10 @@ void plVegetationBrushContext::DoFocusLost(bool bCancel)
   }
 
   m_bDragging = false;
+
+  // a rectangle that loses focus is dropped, not filled
+  m_bFillDragging = false;
+  UpdateRing();
 }
 
 void plVegetationBrushContext::UpdateStatusBarText(plEngineDocumentWindow* pWindow)
@@ -90,12 +102,23 @@ void plVegetationBrushContext::UpdateStatusBarText(plEngineDocumentWindow* pWind
     case plVegetationBrushMode::Place:
       szMode = "Place";
       break;
+    case plVegetationBrushMode::Fill:
+      szMode = "Fill";
+      break;
+    case plVegetationBrushMode::Clearing:
+      szMode = "Clearing";
+      break;
     default:
       break;
   }
 
   plStringBuilder sText;
-  sText.SetFormat("Vegetation \xC2\xB7 {} \xC2\xB7 radius {} m \xC2\xB7 density {} \xC2\xB7 [ ] radius \xC2\xB7 Ctrl-drag erases \xC2\xB7 Esc leaves the tool", szMode, plArgF(s.m_fRadius, 1), plArgF(s.m_fDensity, 2));
+  if (!m_bEraseHeld && s.m_Mode == plVegetationBrushMode::Fill)
+    sText.SetFormat("Vegetation \xC2\xB7 Fill \xC2\xB7 {} trees/ha \xC2\xB7 drag a rectangle to fill it \xC2\xB7 Ctrl-drag erases \xC2\xB7 Esc leaves the tool", plArgF(s.m_fTreesPerHectare, 0));
+  else if (!m_bEraseHeld && s.m_Mode == plVegetationBrushMode::Clearing)
+    sText.SetFormat("Vegetation \xC2\xB7 Clearing \xC2\xB7 radius {} m \xC2\xB7 drag paints clearings, Shift-drag removes them \xC2\xB7 [ ] radius \xC2\xB7 Esc leaves the tool", plArgF(s.m_fRadius, 1));
+  else
+    sText.SetFormat("Vegetation \xC2\xB7 {} \xC2\xB7 radius {} m \xC2\xB7 density {} \xC2\xB7 [ ] radius \xC2\xB7 Ctrl-drag erases \xC2\xB7 Esc leaves the tool", szMode, plArgF(s.m_fRadius, 1), plArgF(s.m_fDensity, 2));
   pWindow->SetPermanentStatusBarMsg(sText);
 }
 
@@ -146,6 +169,8 @@ bool plVegetationBrushContext::UpdateCursor(const plVec2I32& vViewPos)
 
 void plVegetationBrushContext::UpdateRing()
 {
+  UpdateClearingOutlines();
+
   if (!m_bHasSurface || !IsVisible())
   {
     m_hRing.SetVisible(false);
@@ -154,6 +179,41 @@ void plVegetationBrushContext::UpdateRing()
   }
 
   const auto& s = plVegetationBrush::s_Settings;
+
+  // Fill draws the dragged rectangle, or a small marker at the cursor before the drag
+  if (s.m_Mode == plVegetationBrushMode::Fill && !m_bEraseHeld)
+  {
+    m_hRing.SetColor(RingColor(false, false));
+    m_hInnerRing.SetVisible(false);
+
+    plHybridArray<plVec3, 68> lines;
+    if (m_bFillDragging)
+    {
+      const plVec3 a = m_vFillStart;
+      const plVec3 c = m_vCursor;
+      const float fZ = plMath::Max(a.z, c.z) + 0.05f;
+      const plVec3 corners[4] = {plVec3(a.x, a.y, fZ), plVec3(c.x, a.y, fZ), plVec3(c.x, c.y, fZ), plVec3(a.x, c.y, fZ)};
+      for (plUInt32 i = 0; i < 4; ++i)
+      {
+        lines.PushBack(corners[i]);
+        lines.PushBack(corners[(i + 1) % 4]);
+      }
+    }
+    else
+    {
+      const float fSize = 1.0f;
+      lines.PushBack(m_vCursor + plVec3(-fSize, 0, 0.05f));
+      lines.PushBack(m_vCursor + plVec3(fSize, 0, 0.05f));
+      lines.PushBack(m_vCursor + plVec3(0, -fSize, 0.05f));
+      lines.PushBack(m_vCursor + plVec3(0, fSize, 0.05f));
+    }
+
+    m_hRing.SetLines(lines);
+    m_hRing.SetTransformation(plTransform::MakeIdentity());
+    m_hRing.SetVisible(true);
+    return;
+  }
+
   const float fRadius = s.m_fRadius;
   const float fInner = fRadius * (1.0f - plMath::Clamp(s.m_fFalloff, 0.0f, 1.0f));
 
@@ -196,6 +256,53 @@ void plVegetationBrushContext::UpdateRing()
   }
 }
 
+void plVegetationBrushContext::UpdateClearingOutlines()
+{
+  const auto mode = plVegetationBrush::s_Settings.m_Mode;
+  if (!IsVisible() || !m_bHasSurface || m_pTool == nullptr || (mode != plVegetationBrushMode::Fill && mode != plVegetationBrushMode::Clearing))
+  {
+    m_hClearings.SetVisible(false);
+    return;
+  }
+
+  plDynamicArray<plVec3> centers;
+  plDynamicArray<float> radii;
+  m_pTool->GetClearings(centers, radii);
+
+  // the clearings around the cursor, at its height: they are discs in the layer plane, drawn on top
+  constexpr plUInt32 uiSegments = 24;
+  constexpr plUInt32 uiMaxCircles = 128;
+  constexpr float fRange = 150.0f;
+
+  plDynamicArray<plVec3> lines;
+  plUInt32 uiCircles = 0;
+  for (plUInt32 c = 0; c < centers.GetCount() && uiCircles < uiMaxCircles; ++c)
+  {
+    if ((centers[c].GetAsVec2() - m_vCursor.GetAsVec2()).GetLength() > fRange + radii[c])
+      continue;
+
+    ++uiCircles;
+    const plVec3 vCenter(centers[c].x, centers[c].y, m_vCursor.z + 0.05f);
+    for (plUInt32 i = 0; i < uiSegments; ++i)
+    {
+      const plAngle a0 = plAngle::MakeFromRadian((i / (float)uiSegments) * 2.0f * plMath::Pi<float>());
+      const plAngle a1 = plAngle::MakeFromRadian(((i + 1) / (float)uiSegments) * 2.0f * plMath::Pi<float>());
+      lines.PushBack(vCenter + plVec3(plMath::Cos(a0), plMath::Sin(a0), 0.0f) * radii[c]);
+      lines.PushBack(vCenter + plVec3(plMath::Cos(a1), plMath::Sin(a1), 0.0f) * radii[c]);
+    }
+  }
+
+  if (lines.IsEmpty())
+  {
+    m_hClearings.SetVisible(false);
+    return;
+  }
+
+  m_hClearings.SetLines(lines);
+  m_hClearings.SetTransformation(plTransform::MakeIdentity());
+  m_hClearings.SetVisible(true);
+}
+
 void plVegetationBrushContext::SetEraseHeld(bool bHeld)
 {
   if (m_bEraseHeld == bHeld)
@@ -228,6 +335,8 @@ plEditorInput plVegetationBrushContext::DoKeyPressEvent(const plEditorInputEvent
 
   if (e.m_Key == plEditorPlatformKey::Escape)
   {
+    m_bFillDragging = false;
+
     if (m_bDragging && m_pTool != nullptr)
     {
       m_pTool->EndStroke();
@@ -261,10 +370,10 @@ plEditorInput plVegetationBrushContext::DoKeyPressEvent(const plEditorInputEvent
     return plEditorInput::WasExclusivelyHandled;
   }
 
-  if (e.GetLetter() >= '1' && e.GetLetter() <= '4' && e.m_uiModifiers == 0)
+  if (e.GetLetter() >= '1' && e.GetLetter() <= '6' && e.m_uiModifiers == 0)
   {
     const auto mode = static_cast<plVegetationBrushMode::Enum>(e.GetLetter() - '1');
-    if (mode == plVegetationBrushMode::Place && !s.IsPlaceAvailable())
+    if (!s.IsModeAvailable(mode))
       return plEditorInput::WasExclusivelyHandled;
 
     s.m_Mode = mode;
@@ -295,9 +404,18 @@ plEditorInput plVegetationBrushContext::DoMousePressEvent(const plEditorInputEve
     return plEditorInput::WasExclusivelyHandled;
   }
 
+  if (mode == plVegetationBrushMode::Fill)
+  {
+    // the rectangle fills on release
+    m_bFillDragging = true;
+    m_vFillStart = m_vCursor;
+    UpdateRing();
+    return plEditorInput::WasExclusivelyHandled;
+  }
+
   m_bDragging = true;
   m_vLastStamp = m_vCursor;
-  m_pTool->BeginStroke(mode);
+  m_pTool->BeginStroke(mode, e.HasModifier(plEditorInputEvent::Shift));
   m_pTool->StrokeSegment(m_vCursor, m_vCursorNormal);
 
   return plEditorInput::WasExclusivelyHandled;
@@ -313,6 +431,17 @@ plEditorInput plVegetationBrushContext::DoMouseReleaseEvent(const plEditorInputE
     m_pTool->EndStroke();
   }
 
+  if (m_bFillDragging)
+  {
+    m_bFillDragging = false;
+    UpdateCursor(e.GetPosition());
+
+    if (m_pTool != nullptr && m_bHasSurface)
+      m_pTool->FillRect(m_vFillStart, m_vCursor);
+
+    UpdateRing();
+  }
+
   m_bDragging = false;
   m_bEraseOverride = false;
   return plEditorInput::WasExclusivelyHandled;
@@ -320,12 +449,16 @@ plEditorInput plVegetationBrushContext::DoMouseReleaseEvent(const plEditorInputE
 
 plEditorInput plVegetationBrushContext::DoMouseMoveEvent(const plEditorInputEvent& e)
 {
-  if (e.HasModifier(plEditorInputEvent::Alt) && !m_bDragging)
+  if (e.HasModifier(plEditorInputEvent::Alt) && !m_bDragging && !m_bFillDragging)
     return plEditorInput::MayBeHandledByOthers;
 
   // Ctrl may have been pressed while another view had the keyboard
   SetEraseHeld(e.HasModifier(plEditorInputEvent::Control));
   UpdateCursor(e.GetPosition());
+
+  // UpdateCursor redrew the rectangle
+  if (m_bFillDragging)
+    return plEditorInput::WasExclusivelyHandled;
 
   if (m_bDragging && m_bHasSurface && m_pTool != nullptr)
   {

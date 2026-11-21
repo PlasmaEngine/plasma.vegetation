@@ -28,10 +28,23 @@ public:
   virtual bool GetSupportsMoveParentOnly() const override;
 
   // called by the brush context
-  void BeginStroke(plVegetationBrushMode::Enum mode);
+  /// \param bRemoveClearings Clearing mode only: the stroke erases clearings instead of painting them.
+  void BeginStroke(plVegetationBrushMode::Enum mode, bool bRemoveClearings = false);
   void StrokeSegment(const plVec3& vCenter, const plVec3& vNormal);
   void EndStroke();
   void PlaceSingle(const plVec3& vCenter, const plVec3& vNormal);
+
+  /// \brief Fill: scatters the checked plants and Grass Types over the rectangle spanned by two picked corners (taken
+  /// into the layer's space), as one undo step that also stores the panel's values as the layer's Fill settings.
+  void FillRect(const plVec3& vCorner0, const plVec3& vCorner1);
+
+  /// \brief Fill over the target layer's whole area (its plants, coverage and clearings), or a square of the panel's
+  /// Fill extent around the layer object when it has nothing yet.
+  void FillLayer();
+
+  /// \brief The clearings of the target layer in world space (centre at the layer's height, radius), for the brush
+  /// overlay. Empty without a target layer.
+  void GetClearings(plDynamicArray<plVec3>& out_centers, plDynamicArray<float>& out_radii) const;
 
   /// \brief Place mode: asks the engine to show a ghost of the plant where a click would put it. The ghost uses the
   /// same seed as the click, so what is shown is what gets placed.
@@ -66,6 +79,12 @@ private:
   void RollPlaceSeed();
   void CommitStroke();
 
+  /// \brief Runs plVegetationLayerFill on the target layer with the panel's types and values and the given layer-space
+  /// region (zero extent = the whole layer).
+  void FillWithPanelSettings(const plVec2& vCenter, const plVec2& vExtent, plUInt32 uiSeed);
+
+  plUInt32 m_uiFillCount = 0; ///< seeds Fill Layer, so pressing it again scatters differently
+
   /// \brief Tells the engine to drop its stroke preview. Sent before the stroke's transaction, so the committed
   /// layer data takes over without a gap.
   void DropStrokePreview();
@@ -80,6 +99,7 @@ private:
   bool m_bStrokeActive = false;
   bool m_bCommitPending = false;
   plVegetationBrushMode::Enum m_StrokeMode = plVegetationBrushMode::Paint;
+  bool m_bStrokeRemoveClearings = false;
   plUInt32 m_uiStrokeId = 0;
   plUInt32 m_uiNextSegment = 0;
   plUInt32 m_uiPendingSegments = 0;

@@ -5,9 +5,16 @@
 #include <Foundation/Containers/HybridArray.h>
 #include <Foundation/Math/Angle.h>
 #include <Foundation/Strings/String.h>
+#include <Foundation/Threading/AtomicInteger.h>
+#include <Foundation/Threading/Mutex.h>
+#include <Foundation/Types/SharedPtr.h>
+#include <Foundation/Types/UniquePtr.h>
 #include <RendererCore/Material/MaterialResource.h>
 #include <RendererCore/Meshes/MeshResource.h>
+#include <VegetationPlugin/Impostors/VegetationImpostor.h>
 #include <VegetationPlugin/VegetationDeclarations.h>
+
+using plTexture2DResourceHandle = plTypedResourceHandle<class plTexture2DResource>;
 
 /// \brief Wind response of a type, mirrored into plVegetationWindProfile in the shader.
 struct PL_VEGETATIONPLUGIN_DLL plVegetationWindSettings
@@ -38,7 +45,7 @@ struct PL_VEGETATIONPLUGIN_DLL plVegetationTouchSettings
   void Load(plStreamReader& inout_stream);
 };
 
-/// \brief Default placement rules; a placement source may tighten them.
+/// \brief Placement rules of a type. The paint tool's Paint and Fill use them unless the brush overrides them.
 struct PL_VEGETATIONPLUGIN_DLL plVegetationPlacementSettings
 {
   float m_fMinScale = 0.8f;
@@ -46,12 +53,20 @@ struct PL_VEGETATIONPLUGIN_DLL plVegetationPlacementSettings
   float m_fAlignToNormal = 0.6f;
   plAngle m_MaxSlope = plAngle::MakeFromDegree(45.0f);
   float m_fSink = 0.05f;
-  float m_fMinSpacing = 0.4f;
-  plString m_sColorGradient; ///< Optional plColorGradientResource sampled by the instance colour seed.
+  float m_fMinSpacing = 0.4f; ///< Distance between two instances of this type; between types the mean of both.
+  plString m_sColorGradient;  ///< Optional plColorGradientResource sampled by the instance colour seed.
   float m_fHueVariation = 0.05f;
+
+  // Version 3 of the type file; part of the extra block Save/LoadExtra write after the ray tracing settings.
+  float m_fDensityWeight = 1.0f;     ///< Relative share of this type when several types are scattered together.
+  float m_fClearingAvoidance = 0.0f; ///< Distance in metres instances keep from a clearing painted on the layer.
 
   void Save(plStreamWriter& inout_stream) const;
   void Load(plStreamReader& inout_stream);
+
+  /// \brief The settings added with version 3, stored at the end of the type file.
+  void SaveExtra(plStreamWriter& inout_stream) const;
+  void LoadExtra(plStreamReader& inout_stream);
 };
 
 /// \brief Distances and flags for the renderer.
@@ -115,8 +130,53 @@ struct PL_VEGETATIONPLUGIN_DLL plVegetationTypeResourceDescriptor
   plVegetationRenderSettings m_Render;
   plVegetationRayTracingSettings m_RayTracing;
 
+  // Version 4: the far representations of a foliage composite type and, when the transform baked them, its impostor and
+  // voxel proxy.
+  plVegetationImpostorSettings m_Impostor;
+  plSharedPtr<plVegetationImpostorData> m_pImpostorData;
+  plSharedPtr<plVegetationVoxelProxy> m_pVoxelProxy;
+
   void Save(plStreamWriter& inout_stream) const;
   plResult Load(plStreamReader& inout_stream);
+};
+
+/// \brief What the cells draw a type's impostor with, made from its baked data on first use.
+struct PL_VEGETATIONPLUGIN_DLL plVegetationImpostorGpu
+{
+  plMeshResourceHandle m_hMesh;         ///< One quad whose bounds hold the bounding sphere; the shader turns it to the view.
+  plMaterialResourceHandle m_hMaterial; ///< Shaded with the material of the baked slot.
+  plMaterialResourceHandle m_hCellMaterial; ///< The merged voxel shell of a cell whose trees are mostly of this type.
+  plTexture2DResourceHandle m_hAlbedo;
+  plTexture2DResourceHandle m_hNormalDepth;
+  float m_fRadius = 0.0f; ///< Bounding sphere radius at scale 1.
+  plVec3 m_vCenter = plVec3::MakeZero();
+};
+
+/// \brief What the cells need of a type whose first LOD mesh is a foliage composite (plFoliageComposite), copied from the
+/// mesh once it has loaded.
+///
+/// Cells draw such a type natively: per tree either the composite's parts (one instanced draw per part mesh for the whole
+/// cell) or its merged mesh, switched at the distance where the merged mesh's error reaches
+/// Vegetation.Composite.SwitchErrorPixels. LOD 1-3, the crossfade and the per-vertex wind are not used.
+struct PL_VEGETATIONPLUGIN_DLL plVegetationCompositeInfo
+{
+  plHybridArray<plMeshResourceHandle, 8> m_PartMeshes;    ///< By composite part index.
+  plDynamicArray<plFoliageCompositeInstance> m_Instances; ///< Part placements in the composite's object space.
+
+  /// Per placement: how far its origin can move with its bones (the path bound of plFoliageSkeleton), and how
+  /// much more per metre of distance from the origin. A point of the part at distance r moves at most
+  /// m_InstanceSway + r * m_InstanceSwayPerMetre. Zero without a skeleton.
+  plDynamicArray<float> m_InstanceSway;
+  plDynamicArray<float> m_InstanceSwayPerMetre;
+
+  float m_fSwitchError = 0.0f; ///< Object-space error of the merged mesh's finest level.
+  bool m_bHasSkeleton = false; ///< The merged mesh carries a foliage skeleton: trees register with plFoliageBonePool.
+
+  /// The camera distance below which a tree of the given scale shows its parts; 0 when the error or projection is unknown.
+  static float ComputeSwitchDistance(float fSwitchError, float fScale, float fViewportHeight, float fTanHalfFovY, float fErrorPixels);
+
+  /// Fills the sway arrays from the merged mesh's skeleton.
+  void ComputeSway(const plFoliageSkeleton* pSkeleton);
 };
 
 /// \brief One plant type: LOD meshes, material overrides, wind, touch, placement and render settings.
@@ -140,7 +200,8 @@ public:
 
   const plColorGradientResourceHandle& GetColorGradient() const { return m_hColorGradient; }
 
-  /// \brief Radius of LOD0's bounding sphere at scale 1; 1 until the mesh has loaded.
+  /// \brief Radius of LOD0's bounding sphere at scale 1; 1 until the mesh has loaded. A composite's merged mesh has its
+  /// bounds grown by the furthest its bones can sway (plFoliageSkeleton::InflateBounds), so this includes the sway.
   float GetBoundingRadius() const;
 
   /// \brief How far LOD0's bounding box reaches above the pivot at scale 1; 1 until the mesh has loaded.
@@ -155,11 +216,40 @@ public:
   /// result is false then.
   bool IsInRayTracingScene(bool& out_bKnown) const;
 
-  /// \brief The LOD whose mesh the ray tracing scene traces.
+  /// \brief The composite data when LOD 0 is a foliage composite, else nullptr.
+  ///
+  /// out_bKnown is false while LOD 0 is still loading; the result is nullptr then. Thread-safe.
+  const plVegetationCompositeInfo* GetCompositeInfo(bool& out_bKnown) const;
+
+  /// \brief Whether LOD 0 is a foliage composite; false while it is loading.
+  bool IsFoliageComposite() const
+  {
+    bool bKnown = false;
+    return GetCompositeInfo(bKnown) != nullptr;
+  }
+
+  /// \brief The LOD whose mesh the ray tracing scene traces. Always 0, the merged mesh, for a composite.
   plUInt32 GetRayTracingLod() const;
 
   /// \brief Distance up to which instances are part of the ray tracing scene, before any quality cap.
   float GetRayTracingRange() const;
+
+  /// \brief The type's placement rules (scale, slope, spacing, sink, alignment, density weight, clearing avoidance).
+  const plVegetationPlacementSettings& GetPlacement() const { return m_Descriptor.m_Placement; }
+
+  /// \brief The impostor the cells draw far trees with; nullptr when the type has none baked or its material cannot be
+  /// resolved yet (out_bKnown false: try again later). Created on first request. Thread-safe.
+  const plVegetationImpostorGpu* GetImpostor(bool& out_bKnown) const;
+
+  /// \brief Where trees switch to the impostor at scale 1 (the type's setting), 0 without an impostor.
+  float GetImpostorDistance() const { return m_Descriptor.m_pImpostorData != nullptr ? m_Descriptor.m_Impostor.m_fDistance : 0.0f; }
+
+  /// \brief The voxel proxy cells build their merged voxel shells from; nullptr when none was baked. Shared, immutable.
+  plSharedPtr<plVegetationVoxelProxy> GetVoxelProxy() const { return m_Descriptor.m_pVoxelProxy; }
+
+  /// \brief Object-space error of the merged mesh's first voxel level, 0 when unknown. The bake measures it.
+  float GetVoxelError() const { return m_Descriptor.m_pImpostorData != nullptr ? m_Descriptor.m_pImpostorData->m_fVoxelError : 0.0f; }
+
 
 private:
   virtual plResourceLoadDesc UnloadData(Unload WhatToUnload) override;
@@ -167,6 +257,7 @@ private:
   virtual void UpdateMemoryUsage(MemoryUsage& out_NewMemoryUsage) override;
 
   void ResolveHandles();
+  void ResetCompositeInfo();
 
   plVegetationTypeResourceDescriptor m_Descriptor;
   plHybridArray<plMeshResourceHandle, plVegetationMaxLods> m_LodMeshes;
@@ -174,4 +265,14 @@ private:
   plColorGradientResourceHandle m_hColorGradient;
   mutable float m_fBoundingRadius = 0.0f;
   mutable float m_fBoundingHeight = 1.0f;
+
+  /// Resolved once from LOD 0 on first request: -1 not yet, 0 not a composite, 1 m_pComposite holds it.
+  mutable plAtomicInteger32 m_iCompositeState = -1;
+  mutable plMutex m_CompositeMutex;
+  mutable plUniquePtr<plVegetationCompositeInfo> m_pComposite;
+
+  /// Same pattern for the impostor: -1 not yet, 0 none, 1 m_pImpostor holds it.
+  mutable plAtomicInteger32 m_iImpostorState = -1;
+  mutable plMutex m_ImpostorMutex;
+  mutable plUniquePtr<plVegetationImpostorGpu> m_pImpostor;
 };

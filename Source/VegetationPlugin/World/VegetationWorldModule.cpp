@@ -6,6 +6,7 @@
 #include <Foundation/Algorithm/HashingUtils.h>
 #include <Foundation/Configuration/CVar.h>
 #include <Foundation/Profiling/Profiling.h>
+#include <Foundation/Time/Clock.h>
 #include <Foundation/Types/TagRegistry.h>
 #include <Foundation/Utilities/Stats.h>
 #include <RendererCore/Pipeline/RenderDataManager.h>
@@ -14,6 +15,7 @@
 #include <RendererCore/Components/RenderComponent.h>
 #include <RendererCore/Lights/Implementation/VirtualShadowPool.h>
 #include <RendererCore/Textures/Texture2DResource.h>
+#include <RendererCore/Wind/FoliageBonePool.h>
 #include <RendererCore/Wind/TouchMapManager.h>
 #include <VegetationPlugin/Components/VegetationCellComponent.h>
 #include <VegetationPlugin/Components/VegetationLayerComponent.h>
@@ -24,14 +26,110 @@
 
 #include <Shaders/Vegetation/Grass/GrassGpuData.h>
 #include <Shaders/Vegetation/Grass/GrassConstants.h>
+#include <Shaders/Vegetation/FoliageBonesData.h>
 
 plCVarInt cvar_VegetationGrassUploadBudgetKB("Vegetation.Grass.UploadBudgetKB", 512, plCVarFlags::Default, "Painted grass coverage each world uploads per frame, nearest tiles first. At least one tile is grown per frame");
+plCVarBool cvar_VegetationGrassCacheStrandCounts("Vegetation.Grass.CacheStrandCounts", true, plCVarFlags::Default,
+  "Grass streaming keeps each tile's full strand count until its coverage, density or seed changes, instead of recounting every texel of every in-range tile each frame");
 plCVarBool cvar_VegetationTouchPhysics("Vegetation.Touch.Physics", true, plCVarFlags::Default, "Dynamic physics bodies and characters inside the touch map bend vegetation and grass without a Vegetation Touch component");
 plCVarInt cvar_VegetationTouchPhysicsCollisionLayer("Vegetation.Touch.PhysicsCollisionLayer", -1, plCVarFlags::Default, "Collision layer of the physics touch query: bodies whose layer collides with it bend vegetation. -1 queries with layer 0");
+plCVarFloat cvar_VegetationCompositeWindTileSize("Vegetation.Composite.WindTileSize", 256.0f, plCVarFlags::Default,
+  "Side of the square tiles (metres) whose foliage composite trees of one type share a few wind-animated bone variants (Vegetation.Composite.WindVariants)");
+plCVarInt cvar_VegetationCompositeWindVariants("Vegetation.Composite.WindVariants", 8, plCVarFlags::Default,
+  "Shared bone wind variants per foliage composite type and wind tile, differing in phase and stiffness; every drawn tree borrows one (1..32)");
+plCVarFloat cvar_VegetationCompositePromoteRadius("Vegetation.Composite.PromoteRadius", 25.0f, plCVarFlags::Default,
+  "Foliage composite trees this close to the main camera get their own bone instance at their real transform instead of a shared wind variant (metres; 0 = only touched or pinned trees)");
+plCVarFloat cvar_VegetationCompositeBlendTime("Vegetation.Composite.BlendTime", 0.5f, plCVarFlags::Default,
+  "Seconds a foliage composite tree takes to blend between its shared wind variant and its own bone instance");
+plCVarFloat cvar_VegetationCompositeDemoteDelay("Vegetation.Composite.DemoteDelay", 2.0f, plCVarFlags::Default,
+  "Seconds a standalone foliage composite tree must go without a touch, the camera nearby or a pin before it blends back to its shared wind variant");
+plCVarBool cvar_VegetationCompositeControlHandOff("Vegetation.Composite.ControlHandOff", true, plCVarFlags::Default,
+  "A foliage composite tree that gets its own bone instance starts bent, simulating with its shared wind variant's wind sample, stiffness and phase, and then moves to its own. Off: it starts unbent with its own at once");
+plCVarFloat cvar_VegetationCompositeControlBlendTime("Vegetation.Composite.ControlBlendTime", 1.5f, plCVarFlags::Default,
+  "Seconds a standalone foliage composite tree's wind control takes between its shared variant's and its own. Keep it below Vegetation.Composite.DemoteDelay so the control is back at the variant's before the tree blends back");
 plCVarInt cvar_VegetationTouchMaxPhysicsSources("Vegetation.Touch.MaxPhysicsSources", 32, plCVarFlags::Default, "Most physics bodies that bend vegetation per frame, nearest to the camera first");
+
+namespace
+{
+  plVegetationCompositeWindSettings GetCompositeWindSettings()
+  {
+    plVegetationCompositeWindSettings settings;
+    settings.m_fTileSize = plMath::Max(cvar_VegetationCompositeWindTileSize.GetValue(), 1.0f);
+    settings.m_uiVariants = static_cast<plUInt32>(plMath::Clamp(cvar_VegetationCompositeWindVariants.GetValue(), 1, static_cast<plInt32>(plVegetationMaxWindVariants)));
+    settings.m_fPromoteRadius = plMath::Max(cvar_VegetationCompositePromoteRadius.GetValue(), 0.0f);
+    settings.m_fBlendTime = plMath::Max(cvar_VegetationCompositeBlendTime.GetValue(), 0.0f);
+    settings.m_fDemoteDelay = plMath::Max(cvar_VegetationCompositeDemoteDelay.GetValue(), 0.0f);
+    return settings;
+  }
+
+  /// The composite wind's pool access: the merged mesh of each type, as resolved for this frame.
+  class PoolWindBackend : public plVegetationCompositeWindBackend
+  {
+  public:
+    /// With pTiles, a tree that gets its own instance takes over from the shared variant it borrows.
+    PoolWindBackend(plUInt32 uiWorldIndex, const plHashTable<plUInt64, plMeshResourceHandle>* pMeshes, const plVegetationCompositeWindTiles* pTiles = nullptr, float fTileSize = 0.0f)
+      : m_uiWorldIndex(uiWorldIndex)
+      , m_pMeshes(pMeshes)
+      , m_pTiles(pTiles)
+      , m_fTileSize(fTileSize)
+    {
+    }
+
+    virtual plUInt32 RegisterVariant(plUInt64 uiTypeKey, const plVec3& vWindSample, float fPhase, float fStiffnessScale) override
+    {
+      const plMeshResourceHandle* pMesh = m_pMeshes != nullptr ? m_pMeshes->GetValue(uiTypeKey) : nullptr;
+      return pMesh != nullptr ? plFoliageBonePool::RegisterSharedVariant(m_uiWorldIndex, *pMesh, vWindSample, fPhase, fStiffnessScale) : InvalidInstance;
+    }
+
+    virtual plUInt32 RegisterTree(plUInt64 uiTypeKey, const plVegetationCellInstance& tree) override
+    {
+      const plMeshResourceHandle* pMesh = m_pMeshes != nullptr ? m_pMeshes->GetValue(uiTypeKey) : nullptr;
+      const plUInt32 uiInstance = pMesh != nullptr ? plFoliageBonePool::RegisterInstance(m_uiWorldIndex, *pMesh) : InvalidInstance;
+
+      // The tree shows its shared variant's wind-bent pose until now. Its own simulation takes over the variant's wind
+      // sample point, stiffness and phase and starts bent, so the pose blend runs between two matching bends, and the
+      // control then moves to the tree's own.
+      if (uiInstance != InvalidInstance && cvar_VegetationCompositeControlHandOff)
+      {
+        const plUInt32 uiVariant = m_pTiles != nullptr ? m_pTiles->GetTreeVariant(uiTypeKey, tree, m_fTileSize) : InvalidInstance;
+        plFoliageBonePool::StartInstanceFromVariant(uiInstance, uiVariant, plMath::Max(cvar_VegetationCompositeControlBlendTime.GetValue(), 0.0f));
+      }
+      return uiInstance;
+    }
+
+    virtual void SetTreeWanted(plUInt32 uiInstance, bool bWanted) override { plFoliageBonePool::SetInstanceOwnControl(uiInstance, bWanted); }
+
+    virtual void UpdateTree(plUInt32 uiInstance, const plVegetationCellInstance& tree) override
+    {
+      plTransform transform;
+      transform.m_vPosition = tree.m_vPosition;
+      transform.m_qRotation = tree.m_qRotation;
+      transform.m_vScale.Set(tree.m_fScale);
+      plFoliageBonePool::UpdateInstance(uiInstance, transform);
+    }
+
+    virtual void Unregister(plUInt32& inout_uiInstance) override { plFoliageBonePool::UnregisterInstance(inout_uiInstance); }
+
+    virtual bool GetPose(plUInt32 uiInstance, plUInt32& out_uiPaletteOffset, plUInt32& out_uiBoneCount) override
+    {
+      plFoliageInstanceBones bones;
+      plFoliageBonePool::GetInstanceBones(uiInstance, bones);
+      out_uiPaletteOffset = bones.PaletteOffset;
+      out_uiBoneCount = bones.BoneCount;
+      return bones.Valid != 0;
+    }
+
+  private:
+    plUInt32 m_uiWorldIndex = 0;
+    const plHashTable<plUInt64, plMeshResourceHandle>* m_pMeshes = nullptr;
+    const plVegetationCompositeWindTiles* m_pTiles = nullptr;
+    float m_fTileSize = 0.0f;
+  };
+} // namespace
 
 extern plCVarBool cvar_VegetationEnabled;
 extern plCVarFloat cvar_VegetationRayTracingRange;
+extern plCVarFloat cvar_VegetationDrawDistanceScale;
 
 // clang-format off
 PL_IMPLEMENT_WORLD_MODULE(plVegetationWorldModule);
@@ -134,6 +232,10 @@ void plVegetationWorldModule::PublishTouchMap(const plWorldModule::UpdateContext
   }
 
   plVegetationTouchMapManager::SubmitWorldTouch(GetWorld()->GetIndex(), input);
+
+  // The complete set of this frame - components and physics - promotes composite trees next frame (UpdateCompositeBones
+  // runs before the components register theirs).
+  m_LastTouchSources = m_TouchSources;
 }
 
 void plVegetationWorldModule::GatherPhysicsTouchSources(const plVec3& vFocus)
@@ -257,6 +359,9 @@ void plVegetationWorldModule::WorldClear()
   {
     plVegetationCell& cell = *it.Value();
 
+    for (plVegetationCellGroup& group : cell.m_Groups)
+      UnregisterBones(group);
+
     plVegetationCellComponent* pComponent = nullptr;
     if (GetWorld()->TryGetComponent(cell.m_hComponent, pComponent))
     {
@@ -271,9 +376,13 @@ void plVegetationWorldModule::WorldClear()
     PL_DEFAULT_DELETE(it.Value());
   }
 
+  PoolWindBackend backend(GetWorld()->GetIndex(), nullptr);
+  m_WindTiles.ReleaseAll(backend);
+
   m_Cells.Clear();
   m_Tiles.Clear();
   m_TouchSources.Clear();
+  m_LastTouchSources.Clear();
   m_PhysicsTouchStates.Clear();
   m_uiTotalInstances = 0;
 }
@@ -288,6 +397,8 @@ void plVegetationWorldModule::BeginFrame(const plWorldModule::UpdateContext& con
   plStats::SetStat("Vegetation/Instances", m_uiTotalInstances);
   plStats::SetStat("Vegetation/Cells", m_Cells.GetCount());
   plStats::SetStat("Vegetation/Tiles", m_Tiles.GetCount());
+
+  UpdateCompositeBones();
 }
 
 plUInt64 plVegetationWorldModule::MakeCellKey(plInt32 iX, plInt32 iY)
@@ -345,6 +456,9 @@ void plVegetationWorldModule::DestroyCell(plUInt64 uiKey)
     return;
 
   plVegetationCell& cell = *it.Value();
+
+  for (plVegetationCellGroup& group : cell.m_Groups)
+    UnregisterBones(group);
 
   plVegetationCellComponent* pComponent = nullptr;
   if (GetWorld()->TryGetComponent(cell.m_hComponent, pComponent))
@@ -426,6 +540,10 @@ plVegetationTileHandle plVegetationWorldModule::AddInstances(const plVegetationT
     inst.m_Flags = desc.m_Flags;
     inst.m_TileId = tileId;
     inst.m_uiIndexInTile = i;
+    inst.m_uiBoneInstance = plFoliageBonePool::InvalidInstance;
+    inst.m_fStandalone = 0.0f;
+    inst.m_fWindIdle = 0.0f;
+    inst.m_uiWindPins = 0;
 
     const plUInt64 uiKey = MakeCellKey(iX, iY);
     if (!storedTile.m_Cells.Contains(uiKey))
@@ -454,6 +572,10 @@ void plVegetationWorldModule::RemoveTileFromCell(plVegetationCell& cell, plVeget
     {
       if (group.m_Instances[i - 1].m_TileId == tileId)
       {
+        // The pool id travels with the instance through the swap, so only the removed tree leaves the pool.
+        UnregisterBones(group, group.m_Instances[i - 1]);
+        if (group.m_Instances[i - 1].m_uiWindPins > 0)
+          group.m_uiPinnedTrees -= plMath::Min(group.m_uiPinnedTrees, 1u);
         group.m_Instances.RemoveAtAndSwap(i - 1);
       }
     }
@@ -549,6 +671,9 @@ void plVegetationWorldModule::RemoveInstances(plArrayPtr<const plVegetationInsta
         const auto& inst = group.m_Instances[i];
         if (inst.m_TileId == ref.m_hTile.GetInternalID() && inst.m_uiIndexInTile == ref.m_uiIndexInTile)
         {
+          UnregisterBones(group, group.m_Instances[i]);
+          if (group.m_Instances[i].m_uiWindPins > 0)
+            group.m_uiPinnedTrees -= plMath::Min(group.m_uiPinnedTrees, 1u);
           group.m_Instances.RemoveAtAndSwap(i);
           bRemoved = true;
           break;
@@ -900,6 +1025,7 @@ void plVegetationWorldModule::IndexGrassTile(GrassLayerSource& ref_source, const
 
   state.m_uiContentHash = uiHash;
   state.m_bDirty = true;
+  state.m_bFullCountValid = false;
 
   float fMinHeight = plMath::MaxValue<float>();
   float fMaxHeight = -plMath::MaxValue<float>();
@@ -1061,13 +1187,28 @@ void plVegetationWorldModule::StreamGrassTiles()
 
   // Plan all in-range tiles together. Near-detail upgrades must leave space for distant coverage, not consume the
   // pool and evict the roots that the far-cover shader needs. Keep headroom for replacing an existing tile's range.
-  for (Candidate& candidate : candidates)
   {
-    const auto& source = *candidate.m_pSource;
-    const auto& coverage = *source.m_pEntry->m_Tiles.GetValue(candidate.m_uiTileKey);
-    const plUInt32 perTexel = GrassStrandsPerTexelQ8(source.m_Settings.m_fStrandsPerSquareMeter, source.m_fTexelSize);
-    for (plUInt32 i = 0; i < plGrassCoverageTile::TexelCount; ++i)
-      candidate.m_uiFullCount += GrassStrandCountForTexelQ8(coverage.m_Texels[i].m_uiDensity, perTexel, GrassHash(coverage.m_iX, coverage.m_iY, i, source.m_uiTypeSeed));
+    PL_PROFILE_SCOPE("Vegetation.StreamGrass.FullCount");
+    const bool bCache = cvar_VegetationGrassCacheStrandCounts;
+    for (Candidate& candidate : candidates)
+    {
+      auto& source = *candidate.m_pSource;
+      const auto& coverage = *source.m_pEntry->m_Tiles.GetValue(candidate.m_uiTileKey);
+      const plUInt32 perTexel = GrassStrandsPerTexelQ8(source.m_Settings.m_fStrandsPerSquareMeter, source.m_fTexelSize);
+      GrassTileState& tile = source.m_Tiles[candidate.m_uiTileKey];
+      // IndexGrassTile clears m_bFullCountValid when the coverage changes; density and seed are compared here.
+      if (bCache && tile.m_bFullCountValid && tile.m_uiFullCountPerTexel == perTexel && tile.m_uiFullCountSeed == source.m_uiTypeSeed)
+      {
+        candidate.m_uiFullCount = tile.m_uiFullCount;
+        continue;
+      }
+      for (plUInt32 i = 0; i < plGrassCoverageTile::TexelCount; ++i)
+        candidate.m_uiFullCount += GrassStrandCountForTexelQ8(coverage.m_Texels[i].m_uiDensity, perTexel, GrassHash(coverage.m_iX, coverage.m_iY, i, source.m_uiTypeSeed));
+      tile.m_uiFullCount = candidate.m_uiFullCount;
+      tile.m_uiFullCountPerTexel = perTexel;
+      tile.m_uiFullCountSeed = source.m_uiTypeSeed;
+      tile.m_bFullCountValid = true;
+    }
   }
   const plUInt64 targetRoots = plUInt64(uiBudgetPages) * GRASS_PAGE_SIZE * 4 / 5;
   for (;;)
@@ -1395,10 +1536,283 @@ void plVegetationWorldModule::DestroyGrassSource(GrassLayerSource& ref_source, b
   ref_source.m_hRenderComponent.Invalidate();
 }
 
-void plVegetationWorldModule::ReportMainCamera(const plVec3& vPosition, float fTanHalfFovY) const
+void plVegetationWorldModule::ReportMainCamera(const plVec3& vPosition, float fTanHalfFovY, float fViewportHeight) const
 {
   m_vMainCameraPosition = vPosition;
   m_fMainCameraTanHalfFov = plMath::Max(fTanHalfFovY, 0.01f);
+  m_fMainCameraViewportHeight = plMath::Max(fViewportHeight, 1.0f);
+}
+
+void plVegetationWorldModule::UnregisterBones(plVegetationCellGroup& ref_group, plVegetationCellInstance& ref_instance)
+{
+  PoolWindBackend backend(0, nullptr);
+  plVegetationCompositeTreeWind::ReleaseTree(ref_group, ref_instance, backend);
+}
+
+void plVegetationWorldModule::UnregisterBones(plVegetationCellGroup& ref_group)
+{
+  if (ref_group.m_uiBoneInstances == 0)
+    return;
+
+  for (plVegetationCellInstance& inst : ref_group.m_Instances)
+    UnregisterBones(ref_group, inst);
+
+  ref_group.m_uiBoneInstances = 0;
+}
+
+void plVegetationWorldModule::UpdateCompositeBones()
+{
+  m_uiStandaloneCompositeTrees = 0;
+  m_uiBlendingCompositeTrees = 0;
+
+  // Blends and release delays run on real time: the editor animates wind without simulating the world.
+  const float fDeltaTime = plMath::Clamp(static_cast<float>(plClock::GetGlobalClock()->GetTimeDiff().GetSeconds()), 0.0f, 0.25f);
+  const plVegetationCompositeWindSettings settings = GetCompositeWindSettings();
+  const plUInt32 uiWorldIndex = GetWorld()->GetIndex();
+  plHashTable<plUInt64, plMeshResourceHandle> meshes;
+  PoolWindBackend backend(uiWorldIndex, &meshes, &m_WindTiles, settings.m_fTileSize);
+  plDynamicArray<plVegetationCompositeWindTiles::Change> tileChanges;
+
+  // A new tile size moves every tree to another tile: the old tiles go unused and are released.
+  m_fWindTileSize = settings.m_fTileSize;
+  m_WindTiles.BeginFrame();
+
+  if (m_Cells.IsEmpty())
+  {
+    m_WindTiles.Update(fDeltaTime, settings, backend, tileChanges);
+    plStats::SetStat("Vegetation/CompositeSharedVariants", m_WindTiles.GetVariantCount());
+    return;
+  }
+
+  PL_PROFILE_SCOPE("Vegetation Composite Bones");
+
+  plHybridArray<plVegetationCompositeTreeWind::TouchSphere, 32> touches;
+  for (const TouchSource& source : m_LastTouchSources)
+    touches.PushBack({source.m_vPosition, source.m_fRadius});
+
+  if (m_uiFoliageBonesDataIndex == 0xFFFFFFFF)
+  {
+    // The same description and name as plFoliageBonesComponent, so both share one buffer.
+    plGALBufferCreationDescription desc;
+    desc.m_uiStructSize = sizeof(plFoliageInstanceBones);
+    desc.m_uiTotalSize = 1024 * desc.m_uiStructSize;
+    desc.m_BufferFlags = plGALBufferUsageFlags::StructuredBuffer | plGALBufferUsageFlags::ShaderResource;
+    m_uiFoliageBonesDataIndex = GetWorld()->GetOrCreateModule<plRenderDataManager>()->RegisterCustomInstanceData(desc, "Foliage Instance Bones");
+  }
+
+  // What each type needs, resolved once per frame however many cells hold it.
+  struct TypeInfo
+  {
+    bool m_bComposite = false;       ///< LOD 0 is a loaded composite whose merged mesh has a skeleton
+    bool m_bLoading = false;         ///< the type resource is not loaded yet
+    plUInt32 m_uiChangeCounter = 0;
+    plMeshResourceHandle m_hMergedMesh;
+    float m_fRange = 0.0f;           ///< trees nearer the main camera than this are drawn and animated
+    float m_fRadius = 1.0f;
+  };
+  plHashTable<plUInt64, TypeInfo> types;
+
+  const float fDistanceScale = plMath::Max(cvar_VegetationDrawDistanceScale.GetValue(), 0.0f);
+  const plVec3 vCamera = m_vMainCameraPosition;
+
+  const plTag& tagContinuous = plTagRegistry::GetGlobalRegistry().RegisterTag("VSMContinuousShadow");
+
+  for (auto it = m_Cells.GetIterator(); it.IsValid(); ++it)
+  {
+    plVegetationCell& cell = *it.Value();
+
+    // A cell of composite trees only draws through static meshlet batches whose shadows the virtual shadow map caches,
+    // like the per-object composite component: continuous shadows would re-render every tree in every finest clipmap
+    // level each frame at full detail. Any other type keeps the tag, because its per-vertex wind moves its casters.
+    bool bAllComposite = !cell.m_Groups.IsEmpty();
+    auto updateShadowTag = plMakeScopeExit([&]() {
+      if (bAllComposite != cell.m_bContinuousShadow)
+        return;
+      plGameObject* pObject = nullptr;
+      if (GetWorld()->TryGetObject(cell.m_hObject, pObject))
+      {
+        if (bAllComposite)
+          pObject->RemoveTag(tagContinuous);
+        else
+          pObject->SetTag(tagContinuous);
+        cell.m_bContinuousShadow = !bAllComposite;
+      }
+    });
+
+    for (plVegetationCellGroup& group : cell.m_Groups)
+    {
+      TypeInfo* pInfo = nullptr;
+      if (!types.TryGetValue(group.m_hType.GetResourceIDHash(), pInfo))
+      {
+        TypeInfo info;
+        plResourceLock<plVegetationTypeResource> pType(group.m_hType, plResourceAcquireMode::AllowLoadingFallback_NeverFail);
+        if (pType.GetAcquireResult() == plResourceAcquireResult::Final)
+        {
+          info.m_uiChangeCounter = pType->GetCurrentResourceChangeCounter();
+          bool bKnown = false;
+          const plVegetationCompositeInfo* pComposite = pType->GetCompositeInfo(bKnown);
+          if (pComposite != nullptr && pComposite->m_bHasSkeleton)
+          {
+            info.m_bComposite = true;
+            info.m_hMergedMesh = pType->GetLodMesh(0);
+            info.m_fRadius = pType->GetBoundingRadius();
+            info.m_fRange = pType->GetDescriptor().m_Render.m_fCullDistance * fDistanceScale;
+            meshes.Insert(group.m_hType.GetResourceIDHash(), info.m_hMergedMesh);
+          }
+        }
+        else
+        {
+          // Still loading: what is registered stays.
+          info.m_bLoading = true;
+        }
+        types.Insert(group.m_hType.GetResourceIDHash(), info);
+        types.TryGetValue(group.m_hType.GetResourceIDHash(), pInfo);
+      }
+
+      if (pInfo->m_bLoading || !pInfo->m_bComposite)
+        bAllComposite = false;
+
+      if (pInfo->m_bLoading)
+        continue;
+
+      // A reloaded type may have another merged mesh and skeleton, or none: registrations are made again.
+      if (group.m_uiBonesTypeChangeCounter != pInfo->m_uiChangeCounter)
+      {
+        UnregisterBones(group);
+        group.m_uiBonesTypeChangeCounter = pInfo->m_uiChangeCounter;
+      }
+
+      if (!pInfo->m_bComposite)
+        continue;
+
+      const plUInt64 uiTypeKey = group.m_hType.GetResourceIDHash();
+      const plVec2 vCellMin = cell.m_vOrigin.GetAsVec2();
+
+      // Any tree of the cell drawn (to within the largest instance scale): the wind tiles it overlaps keep their
+      // shared variants. Decided per cell, so shared trees cost nothing per tree and frame.
+      const plVec2 vNearest(plMath::Clamp(vCamera.x, vCellMin.x, vCellMin.x + plVegetationCellSize), plMath::Clamp(vCamera.y, vCellMin.y, vCellMin.y + plVegetationCellSize));
+      const float fCellReach = pInfo->m_fRange + pInfo->m_fRadius * 4.0f;
+      if ((vNearest - vCamera.GetAsVec2()).GetLengthSquared() <= fCellReach * fCellReach && !group.m_Instances.IsEmpty())
+      {
+        // Cells hold positions in [origin, origin + size): the far edge belongs to the next tile when it lies on one.
+        plInt32 iMinX, iMinY, iMaxX, iMaxY;
+        plVegetationCompositeWindTiles::TileCoords(cell.m_vOrigin, settings.m_fTileSize, iMinX, iMinY);
+        plVegetationCompositeWindTiles::TileCoords(cell.m_vOrigin + plVec3(plVegetationCellSize * 0.9999f, plVegetationCellSize * 0.9999f, 0.0f), settings.m_fTileSize, iMaxX, iMaxY);
+        for (plInt32 y = iMinY; y <= iMaxY; ++y)
+          for (plInt32 x = iMinX; x <= iMaxX; ++x)
+            m_WindTiles.MarkUsed(uiTypeKey, pInfo->m_uiChangeCounter, x, y, group.m_Instances[0].m_vPosition.z, settings, backend, tileChanges);
+      }
+
+      plVegetationCompositeTreeWind::GroupInputs inputs;
+      inputs.m_uiTypeKey = uiTypeKey;
+      inputs.m_vCamera = vCamera;
+      inputs.m_vCellMin = vCellMin;
+      inputs.m_fCellSize = plVegetationCellSize;
+      inputs.m_fDrawRange = pInfo->m_fRange;
+      inputs.m_fTypeRadius = pInfo->m_fRadius;
+      inputs.m_Touches = touches;
+
+      plVegetationCompositeTreeWind::GroupResult result;
+      plVegetationCompositeTreeWind::UpdateGroup(group, inputs, fDeltaTime, settings, backend, result);
+      m_uiStandaloneCompositeTrees += result.m_uiStandalone;
+      m_uiBlendingCompositeTrees += result.m_uiBlending;
+    }
+  }
+
+  m_WindTiles.Update(fDeltaTime, settings, backend, tileChanges);
+
+  // A tile became ready or went away: the trees that borrow from it rewrite their bone data.
+  for (const plVegetationCompositeWindTiles::Change& change : tileChanges)
+  {
+    const plVec3 vTileMin(change.m_iX * settings.m_fTileSize, change.m_iY * settings.m_fTileSize, 0.0f);
+    plInt32 iMinX, iMinY, iMaxX, iMaxY;
+    CellCoordsForPosition(vTileMin, iMinX, iMinY);
+    CellCoordsForPosition(vTileMin + plVec3(settings.m_fTileSize * 0.9999f, settings.m_fTileSize * 0.9999f, 0.0f), iMaxX, iMaxY);
+    for (plInt32 y = iMinY; y <= iMaxY; ++y)
+    {
+      for (plInt32 x = iMinX; x <= iMaxX; ++x)
+      {
+        auto it = m_Cells.Find(MakeCellKey(x, y));
+        if (!it.IsValid())
+          continue;
+        for (plVegetationCellGroup& group : it.Value()->m_Groups)
+        {
+          if (group.m_hType.GetResourceIDHash() == change.m_uiTypeKey)
+            ++group.m_uiBonesGeneration;
+        }
+      }
+    }
+  }
+
+  plStats::SetStat("Vegetation/CompositeSharedVariants", m_WindTiles.GetVariantCount());
+  plStats::SetStat("Vegetation/CompositeStandaloneTrees", m_uiStandaloneCompositeTrees);
+  plStats::SetStat("Vegetation/CompositeBlendingTrees", m_uiBlendingCompositeTrees);
+}
+
+plVegetationCellInstance* plVegetationWorldModule::FindInstance(const plVegetationInstanceRef& ref, plVegetationCellGroup*& out_pGroup)
+{
+  out_pGroup = nullptr;
+  plInt32 iX, iY;
+  CellCoordsForPosition(ref.m_vPosition, iX, iY);
+  auto it = m_Cells.Find(MakeCellKey(iX, iY));
+  if (!it.IsValid())
+    return nullptr;
+
+  for (plVegetationCellGroup& group : it.Value()->m_Groups)
+  {
+    for (plVegetationCellInstance& inst : group.m_Instances)
+    {
+      if (inst.m_TileId == ref.m_hTile.GetInternalID() && inst.m_uiIndexInTile == ref.m_uiIndexInTile)
+      {
+        out_pGroup = &group;
+        return &inst;
+      }
+    }
+  }
+  return nullptr;
+}
+
+bool plVegetationWorldModule::PinTree(const plVegetationInstanceRef& tree)
+{
+  plVegetationCellGroup* pGroup = nullptr;
+  plVegetationCellInstance* pTree = FindInstance(tree, pGroup);
+  if (pTree == nullptr || pTree->m_uiWindPins == 0xFFFF)
+    return false;
+
+  if (pTree->m_uiWindPins++ == 0)
+    ++pGroup->m_uiPinnedTrees;
+  return true;
+}
+
+bool plVegetationWorldModule::UnpinTree(const plVegetationInstanceRef& tree)
+{
+  plVegetationCellGroup* pGroup = nullptr;
+  plVegetationCellInstance* pTree = FindInstance(tree, pGroup);
+  if (pTree == nullptr || pTree->m_uiWindPins == 0)
+    return false;
+
+  if (--pTree->m_uiWindPins == 0)
+    pGroup->m_uiPinnedTrees -= plMath::Min(pGroup->m_uiPinnedTrees, 1u);
+  return true;
+}
+
+void plVegetationWorldModule::FillTreeBones(plUInt64 uiTypeKey, const plVegetationCellInstance& tree, plFoliageInstanceBones& out_bones) const
+{
+  // Own palette, when promoted and posed.
+  plFoliageBonePool::GetInstanceBones(tree.m_uiBoneInstance, out_bones);
+
+  plUInt32 uiSharedOffset = 0, uiSharedBones = 0;
+  if (m_WindTiles.GetTreePalette(uiTypeKey, tree, m_fWindTileSize, uiSharedOffset, uiSharedBones))
+  {
+    out_bones.Flags |= FOLIAGE_BONES_FLAG_SHARED;
+    out_bones.SharedPaletteOffset = uiSharedOffset;
+    out_bones.BoneCount = uiSharedBones;
+  }
+
+  out_bones.BlendWeight = plVegetationCompositeTreeWind::GetSharedWeight(tree);
+  out_bones.TreeScale = tree.m_fScale;
+  out_bones.TreeRotation.Set(tree.m_qRotation.x, tree.m_qRotation.y, tree.m_qRotation.z, tree.m_qRotation.w);
+  out_bones.TreePosition = tree.m_vPosition;
 }
 
 void plVegetationWorldModule::GetRTChunks(const plView& view, const plBoundingBox& box, plDynamicArray<plSharedPtr<plRefCounted>>& out_chunks) const

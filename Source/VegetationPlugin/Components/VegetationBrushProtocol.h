@@ -27,6 +27,8 @@ struct plVegetationBrushMode
     Erase,
     Thin,
     Place,
+    Fill,     ///< scatters the checked plants over a rectangle (m_vFillMin, m_vFillMax) at m_fTreesPerHectare
+    Clearing, ///< paints clearings into the layer (removing the plants inside); with m_bRemoveClearings it erases them
 
     Default = Paint
   };
@@ -73,12 +75,37 @@ struct PL_VEGETATIONPLUGIN_DLL plVegetationStrokeRequest
   float m_fTexelSize = plGrassCoverageData::DefaultTexelSize; ///< the target layer's Grass Texel Size
   plTransform m_LayerTransform = plTransform::MakeIdentity(); ///< global transform of the layer object; coverage is in its local space
 
+  // version 5
+
+  /// Paint, Place and Fill take slope, scale, spacing, sink and alignment from each Vegetation Type; false uses the
+  /// brush values above for every type. Requests of version 4 read as false, which is how they placed.
+  bool m_bUseTypeRules = true;
+
+  /// Fill: the region in the layer's local space; x and y span the rectangle, z the heights around which the ground is
+  /// searched. Plants of m_Types go in at m_fTreesPerHectare (existing ones count), grass coverage of m_GrassTypes at
+  /// m_fDensity and m_fLength on ground no steeper than m_MaxSlope.
+  plVec3 m_vFillMin = plVec3::MakeZero();
+  plVec3 m_vFillMax = plVec3::MakeZero();
+  float m_fTreesPerHectare = 600.0f; ///< Fill: wanted plants of the checked types per 10000 m^2, existing ones count
+  bool m_bRemoveClearings = false;   ///< Clearing: the stamp erases clearings instead of painting one
+  bool m_bFillReplace = false;       ///< Fill: the region's plants and coverage of the fill types go first (ApplyFillReplace)
+
   /// \brief Removal probability for plants in Erase and Thin. The editor's evaluation and the engine's stroke preview
   /// share it so both remove the same instances.
   float GetPlantRemovalStrength() const
   {
     return m_uiMode == plVegetationBrushMode::Erase ? m_fStrength : plMath::Clamp(1.0f - m_fDensity, 0.0f, 1.0f) * m_fStrength;
   }
+
+  /// \brief Applies a Clearing stamp to layer data (layer space): adds a clearing of the brush radius and removes every
+  /// plant inside it, or with m_bRemoveClearings erases the clearings whose centre is under the brush. The editor's
+  /// evaluation and the engine's stroke preview share it. Returns whether the data changed.
+  bool ApplyClearingStamp(plVegetationLayerData& inout_data) const;
+
+  /// \brief Fill with m_bFillReplace: removes the plants of m_Types and the coverage of m_GrassTypes inside the fill
+  /// region (layer space). The editor applies it before merging the result, the engine evaluates against data it was
+  /// applied to. Returns whether anything changed; does nothing without m_bFillReplace.
+  bool ApplyFillReplace(plVegetationLayerData& inout_data, plGrassCoverageData* pGrass) const;
 
   void Write(plStreamWriter& inout_stream) const;
   plResult Read(plStreamReader& inout_stream);

@@ -1,0 +1,552 @@
+[PLATFORMS]
+ALL
+
+[PERMUTATIONS]
+
+// Far trees of a foliage composite vegetation type (plVegetationTypeResource::GetImpostor). The runtime creates one
+// material per type on top of the material of the type's largest slot, so the OpenPBR, foliage, variation and wind
+// parameters are the leaf material's own. The pipeline drives RENDER_PASS, FORWARD_PASS_WRITE_DEPTH, MSAA, CAMERA_MODE
+// and VELOCITY_OUTPUT; the rest is fixed: impostors shade with the thin-walled foliage lobe only.
+BLEND_MODE
+RENDER_PASS
+SHADING_MODE
+TWO_SIDED
+FORWARD_PASS_WRITE_DEPTH
+MSAA
+CAMERA_MODE
+VELOCITY_OUTPUT
+SHADING_QUALITY = SHADING_QUALITY_NORMAL
+FLIP_WINDING = FALSE
+GAMEOBJECT_VELOCITY = TRUE
+SSS_PROFILE = SSS_PROFILE_NONE
+OPENPBR_COAT = FALSE
+OPENPBR_COAT_EXTENDED = FALSE
+OPENPBR_FUZZ = FALSE
+OPENPBR_ANISOTROPY = FALSE
+OPENPBR_TRANSMISSION = FALSE
+OPENPBR_TRANSMISSION_BLUR = FALSE
+OPENPBR_TRANSMISSION_DISPERSION = FALSE
+OPENPBR_THINFILM = FALSE
+OPENPBR_SUBSURFACE = FALSE
+
+[MATERIALPARAMETER]
+
+#include <Shaders/Materials/OpenPBRParams.h>
+
+// --- Impostor (set by the runtime) -----------------------------------------------------------------
+
+// Baked atlases (plVegetationImpostorData): base colour + coverage, and normal + depth + translucency.
+Texture2D ImpostorAlbedo @Group("Impostor");
+Texture2D ImpostorNormalDepth @Group("Impostor");
+// Bounding sphere of the merged mesh in object space at scale 1: centre, radius.
+float4 ImpostorSphere @Default(float4(0.0, 0.0, 0.0, 1.0)) @Group("Impostor");
+// Views per side, texels per view, mip levels, atlas texels per side.
+float4 ImpostorLayout @Default(float4(8.0, 192.0, 1.0, 1536.0)) @Group("Impostor");
+
+// --- Foliage, colour variation and wind, as Vegetation.plShader names them ---------------------------
+
+float foliage_transmission_wrap @Default(0.5) @Clamp(0.0, 1.0) @Group("Foliage");
+float foliage_transmission_distortion @Default(0.1) @Clamp(0.0, 0.5) @Group("Foliage");
+float foliage_transmission_power @Default(20.0) @Clamp(10.0, 80.0) @Group("Foliage");
+float foliage_transmission_intensity @Default(1.0) @Clamp(0.0, 2.0) @Group("Foliage");
+float foliage_ambient_transmission @Default(0.25) @Clamp(0.0, 1.0) @Group("Foliage");
+
+bool UseInstanceVariation @Group("Colour Variation");
+float variation_hue @Default(0.05) @Clamp(0.0, 0.5) @Group("Colour Variation");
+float variation_saturation @Default(0.1) @Clamp(0.0, 0.5) @Group("Colour Variation");
+float variation_brightness @Default(0.1) @Clamp(0.0, 0.5) @Group("Colour Variation");
+Color variation_gradient_color @Default(Color(0.8, 1.0, 0.6)) @Group("Colour Variation");
+float variation_gradient_strength @Default(0.0) @Clamp(0.0, 1.0) @Group("Colour Variation");
+float variation_gradient_height @Default(1.0) @Clamp(0.1, 10.0) @Group("Colour Variation") @Suffix(" m");
+
+// Only the stiffness is read: it scales the rigid sway of the whole tree.
+float BendStiffness @Default(0.35) @Clamp(0.0, 1.0) @Group("Wind");
+
+[MATERIALCONFIG]
+
+#include <Shaders/Materials/OpenPBRConfig.h>
+
+[RENDERSTATE]
+
+#include <Shaders/Materials/MaterialState.h>
+
+[MATERIALCONSTANTS]
+
+#include <Shaders/Materials/OpenPBRConstants.h>
+
+// Impostor additions, after the shared block so both expansions agree on the layout.
+FLOAT4(ImpostorSphere);
+FLOAT4(ImpostorLayout);
+COLOR4F(variation_gradient_color);
+
+FLOAT1(foliage_transmission_wrap);
+FLOAT1(foliage_transmission_distortion);
+FLOAT1(foliage_transmission_power);
+FLOAT1(foliage_transmission_intensity);
+FLOAT1(foliage_ambient_transmission);
+
+FLOAT1(variation_hue);
+FLOAT1(variation_saturation);
+FLOAT1(variation_brightness);
+FLOAT1(variation_gradient_strength);
+FLOAT1(variation_gradient_height);
+
+FLOAT1(BendStiffness);
+
+BOOL1(UseInstanceVariation);
+
+[VERTEXSHADER]
+
+#define USE_NORMAL
+#define USE_TANGENT
+#define USE_TEXCOORD0
+
+#if GAMEOBJECT_VELOCITY
+  #define USE_VELOCITY
+#endif
+
+#if RENDER_PASS == RENDER_PASS_EDITOR
+  #define USE_DEBUG_INTERPOLATOR
+#endif
+
+// The quad's corners are placed here, for this frame and (velocity) the previous one.
+#define USE_WORLD_POSITION_OFFSET
+#define USE_PRECISE_POSITION
+
+#include <Shaders/Materials/MaterialVertexShader.h>
+#include <Shaders/Vegetation/VegetationImpostorSway.h>
+
+// The quad in front of the tree's bounding sphere, facing the view: the pixel shader reconstructs the tree behind it, so
+// it only has to cover the sphere. Shadow views see it facing the light.
+float3 GetWorldPositionOffset(plPerInstanceData data, float3 worldPosition)
+{
+  float3x3 rotation;
+  float3 pivot;
+  if (G.PreviousFrame)
+  {
+    rotation = TransformToRotation(data.LastObjectToWorld);
+    pivot = TransformToPosition(data.LastObjectToWorld).xyz;
+  }
+  else
+  {
+    rotation = TransformToRotation(data.ObjectToWorld);
+    pivot = TransformToPosition(data.ObjectToWorld).xyz;
+  }
+
+  const float4 sphere = GetMaterialData(ImpostorSphere);
+  const float scale = length(float3(rotation._m00, rotation._m10, rotation._m20));
+  const float3 up = normalize(float3(rotation._m02, rotation._m12, rotation._m22));
+  const float3 center = pivot + mul(rotation, sphere.xyz);
+  const float radius = sphere.w * scale;
+
+  const float3 sway = ImpostorSway(pivot, up, sphere.z * scale, GetMaterialData(BendStiffness), G.PreviousFrame);
+  const float3 swayedCenter = center + sway;
+
+  const bool bOrthographic = GetCameraToScreenMatrix()._m33 > 0.5;
+  const float3 dir = bOrthographic ? GetCameraDirForwards() : normalize(swayedCenter - GetCameraPosition());
+  const float3 reference = abs(dir.z) > 0.99 ? float3(0, 1, 0) : float3(0, 0, 1);
+  const float3 right = normalize(cross(reference, dir));
+  const float3 quadUp = cross(dir, right);
+
+  // The depth written is the quad's. A shadow view's quad stands at the tree's centre, so the half of the crown toward
+  // the light stays lit and the half behind it is shaded; in the other views it stands in front of the sphere.
+  const float front = IsShadowPass ? 0.0 : radius;
+  const float2 corner = G.Input.TexCoord0.xy * 2.0 - 1.0;
+  const float3 position = swayedCenter - dir * front + (right * corner.x + quadUp * corner.y) * radius;
+  return position - worldPosition;
+}
+
+VS_OUT main(VS_IN Input)
+{
+  return FillVertexData(Input);
+}
+
+[PIXELSHADER]
+
+#define USE_NORMAL
+#define USE_TANGENT
+#define USE_TEXCOORD0
+
+#define USE_MATERIAL_OCCLUSION
+#define USE_FOG
+// The depth is the quad's own, not the reconstructed surface's: the lit pass then rejects every impostor behind the
+// nearest one with its equal depth test before shading, where a depth written by the pixel stage is only compared after.
+#define USE_MATERIAL_FOLIAGE_REPRESENTATION
+// The tree as the atlases show it at this pixel, filled once in FillCustomGlobals.
+#define CUSTOM_GLOBALS float4 ImpAlbedo; float3 ImpNormal; float ImpTranslucency; float ImpDepth;
+
+#define USE_SIMPLE_MATERIAL_MODEL
+#define USE_MATERIAL_DIFFUSE_ROUGHNESS
+#define USE_MATERIAL_SPECULAR_TINT
+
+#define MATERIAL_FOLIAGE
+#define USE_MATERIAL_SUBSURFACE_COLOR
+#define MATERIAL_SUBSURFACE_COLOR_UNTINTED
+#define USE_MATERIAL_SUBSURFACE_PARAMS
+#define USE_MATERIAL_SUBSURFACE_EXTENDED
+#define USE_MATERIAL_FOLIAGE_PARAMS
+
+#if GAMEOBJECT_VELOCITY
+  #define USE_VELOCITY
+#endif
+
+#if RENDER_PASS == RENDER_PASS_EDITOR
+  #define USE_DEBUG_INTERPOLATOR
+#endif
+
+#include <Shaders/Materials/MaterialPixelShader.h>
+#include <Shaders/Vegetation/FoliageRepresentation.h>
+#include <Shaders/Vegetation/VegetationImpostorCommon.h>
+#include <Shaders/Vegetation/VegetationImpostorSway.h>
+
+Texture2D ImpostorAlbedo BIND_GROUP(BG_MATERIAL);
+SamplerState ImpostorAlbedo_AutoSampler BIND_GROUP(BG_MATERIAL);
+Texture2D ImpostorNormalDepth BIND_GROUP(BG_MATERIAL);
+SamplerState ImpostorNormalDepth_AutoSampler BIND_GROUP(BG_MATERIAL);
+
+// The far levels of the tree's mesh are cubes: they cover more than the leaves they stand for, and their faces catch
+// the light one cube at a time. The impostor meets them at the hand-off with the three values below.
+// Share of a texel's samples that must show the tree for the pixel to draw; lower draws thin foliage fuller.
+#define IMPOSTOR_COVERAGE_CUT 0.25
+// Atlas texels (at the sampled mip) per side of one leaf cluster, which shades with one normal.
+#define IMPOSTOR_CLUSTER_TEXELS 3.0
+// Share of the clusters that lie flat, facing up; the others face the viewer, cosine-weighted.
+#define IMPOSTOR_FLAT_SHARE 0.5
+// Share of the baked mean normal in a cluster's shading normal.
+#define IMPOSTOR_MEAN_NORMAL_SHARE 0.15
+
+// Three uniform random numbers per leaf cluster (xy) and mip (z), the same from every view of the cluster.
+float3 ImpostorHash3(float3 cluster)
+{
+  uint3 v = uint3(cluster);
+  uint h = v.x * 0x9E3779B1u ^ v.y * 0x85EBCA77u ^ v.z * 0xC2B2AE3Du;
+  h ^= h >> 15;
+  h *= 0x2C1B3C6Du;
+  h ^= h >> 12;
+  h *= 0x297A2D39u;
+  h ^= h >> 15;
+  const uint h2 = h * 0x9E3779B1u + 0x7F4A7C15u;
+  return float3(h & 0xFFFFu, h >> 16, h2 >> 16) / 65535.0;
+}
+
+float ImpostorDitherNoise(float2 pixelPos)
+{
+  // Same interleaved gradient noise as the LOD crossfade of Vegetation.plShader, so the two halves of a hand-off match.
+  return frac(52.9829189 * frac(dot(pixelPos, float2(0.06711056, 0.00583715))));
+}
+
+// Image coordinates of an object-space offset from the sphere centre in a view, 0..1 inside the tile.
+float2 ImpostorTileUV(float3 offset, float3 right, float3 up, float radius)
+{
+  return float2(dot(offset, right), -dot(offset, up)) / radius * 0.5 + 0.5;
+}
+
+float2 ImpostorAtlasUV(float2 grid, float2 tileUV, float views, float margin)
+{
+  return (grid + clamp(tileUV, margin, 1.0 - margin)) / views;
+}
+
+void FillCustomGlobals()
+{
+  plPerInstanceData data = GetInstanceData();
+  const float3x3 rotation = TransformToRotation(data.ObjectToWorld);
+  const float3 pivot = TransformToPosition(data.ObjectToWorld).xyz;
+  const float scale = length(float3(rotation._m00, rotation._m10, rotation._m20));
+  const float3x3 toLocal = transpose(rotation) / (scale * scale);
+  const float3 up = normalize(float3(rotation._m02, rotation._m12, rotation._m22));
+
+  const float4 sphere = GetMaterialData(ImpostorSphere);
+  const float4 layout = GetMaterialData(ImpostorLayout);
+  const float3 center = sphere.xyz;
+  const float radius = sphere.w;
+  const float views = layout.x;
+  const float texels = layout.y;
+
+  // The tree sways as a whole: shift it by the vertex shader's sway (current frame).
+  const float3 treePivot = pivot + ImpostorSway(pivot, up, center.z * scale, GetMaterialData(BendStiffness), false);
+
+  const bool bOrthographic = GetCameraToScreenMatrix()._m33 > 0.5;
+  const float3 pixelWorld = G.Input.WorldPosition.xyz;
+  const float3 rayWorld = bOrthographic ? GetCameraDirForwards() : normalize(pixelWorld - GetCameraPosition());
+
+  const float3 origin = mul(toLocal, pixelWorld - treePivot);
+  const float3 ray = normalize(mul(transpose(rotation), rayWorld));
+  float3 view = bOrthographic ? -ray : mul(toLocal, GetCameraPosition() - treePivot) - center;
+  view.z = max(view.z, 0.0);
+  view = dot(view, view) > 1.0e-8 ? normalize(view) : float3(0, 0, 1);
+
+  // Mip from the quad's footprint, taken before anything can discard.
+  const float footprint = max(length(ddx(origin)), length(ddy(origin))) * texels / (2.0 * radius);
+  const float lod = clamp(log2(max(footprint, 1.0e-4)), 0.0, layout.z - 1.0);
+  const float margin = 0.5 * exp2(lod) / texels;
+
+  float2 grid[3];
+  float weights[3];
+  ImpostorSelectViews(view, views, grid, weights);
+
+  float4 albedo = 0;
+  float3 normal = 0;
+  float translucency = 0;
+  float3 surface = 0;
+  float coverage = 0;
+  float weightSum = 0;
+  // The atlas texel of the view that contributes most: it names the leaf this pixel shades as (see below).
+  float3 leafTexel = 0;
+  float leafWeight = 0;
+
+  [unroll]
+  for (uint k = 0; k < 3; ++k)
+  {
+    const float3 w = ImpostorViewDirection(grid[k], views);
+    const float denom = dot(ray, w);
+    // A view seen edge-on or from behind adds nothing.
+    if (weights[k] <= 0.0 || denom > -0.05)
+      continue;
+
+    float3 right, viewUp;
+    ImpostorViewBasis(w, right, viewUp);
+
+    // Where the ray crosses the view's image plane through the centre, then one step to the surface the depth there
+    // describes, and the texel that shows it.
+    const float3 planeHit = origin + ray * (dot(center - origin, w) / denom);
+    const float2 uv0 = ImpostorTileUV(planeHit - center, right, viewUp, radius);
+    if (any(uv0 < 0.0) || any(uv0 > 1.0))
+    {
+      weightSum += weights[k];
+      continue;
+    }
+
+    const float h0 = ImpostorNormalDepth.SampleLevel(ImpostorNormalDepth_AutoSampler, ImpostorAtlasUV(grid[k], uv0, views, margin), lod).b * 2.0 - 1.0;
+    float3 hit = planeHit + ray * (h0 * radius / denom);
+    const float2 uv1 = ImpostorTileUV(hit - center, right, viewUp, radius);
+    const float2 atlasUV = ImpostorAtlasUV(grid[k], uv1, views, margin);
+
+    const float4 a = ImpostorAlbedo.SampleLevel(ImpostorAlbedo_AutoSampler, atlasUV, lod);
+    const float4 b = ImpostorNormalDepth.SampleLevel(ImpostorNormalDepth_AutoSampler, atlasUV, lod);
+    hit = planeHit + ray * ((b.b * 2.0 - 1.0) * radius / denom);
+
+    const float wa = weights[k] * a.a;
+    if (wa > leafWeight)
+    {
+      leafWeight = wa;
+      leafTexel = float3(floor(atlasUV * layout.w * exp2(-floor(lod)) / IMPOSTOR_CLUSTER_TEXELS), floor(lod));
+    }
+    albedo.rgb += a.rgb * wa;
+    normal += ImpostorOctDecodeNormal(b.rg * 2.0 - 1.0) * wa;
+    translucency += b.a * wa;
+    surface += hit * wa;
+    coverage += wa;
+    weightSum += weights[k];
+  }
+
+  // Coverage of the views that took part; the atlases' mips keep it right under the 0.5 test.
+  if (coverage < IMPOSTOR_COVERAGE_CUT * max(weightSum, 1.0e-4))
+    discard;
+
+  // Hand-off, by CustomData.w:
+  // > 0: from the tree's merged mesh. Its half (Vegetation.plShader ApplyLodCrossfade with the same CustomData) draws
+  //      where the noise is at most its opacity; the impostor draws exactly the other pixels.
+  // < 0: from the cell's merged voxel shell, over x .. x + y metres from the camera: the impostor draws where the noise
+  //      is below its own opacity, the shell (VegetationCellShell.plShader) the other pixels.
+  const float band = data.CustomData.w;
+  [branch]
+  if (band != 0.0 && !IsShadowPass)
+  {
+    const float dist = max(length(pivot - GetCameraPosition()), 0.01);
+    const float noise = ImpostorDitherNoise(G.Input.Position.xy);
+    if (band > 0.0)
+    {
+      const float lower = data.CustomData.x;
+      const float tanHalfFov = 1.0 / max(GetCameraToScreenMatrix()._m11, 0.0001);
+      const float screenSize = data.CustomData.z / (dist * tanHalfFov);
+      const float mergedOpacity = saturate((screenSize - lower * (1.0 - band)) / max(2.0 * lower * band, 0.0001));
+      if (noise <= mergedOpacity)
+        discard;
+    }
+    else
+    {
+      const float impostorOpacity = saturate((dist - data.CustomData.x) / max(data.CustomData.y, 0.001));
+      if (noise >= impostorOpacity)
+        discard;
+    }
+  }
+
+  const float inv = 1.0 / coverage;
+  G.ImpAlbedo = float4(albedo.rgb * inv, 1.0);
+  G.ImpTranslucency = translucency * inv;
+
+  const float3 surfaceWorld = treePivot + mul(rotation, surface * inv);
+  const float4 clip = mul(GetWorldToScreenMatrix(), float4(surfaceWorld, 1.0));
+  G.ImpDepth = clip.z / clip.w;
+
+  float3 normalWorld = mul(rotation, normal);
+  normalWorld = dot(normalWorld, normalWorld) > 1.0e-8 ? normalize(normalWorld) : -rayWorld;
+
+  // A texel shows many leaves and the atlas keeps their mean normal, which faces the view: lit with it, a canopy loses
+  // the leaves that catch the light. Each cluster of texels shades as one leaf surface instead: flat ones face up, the
+  // others lie cosine-weighted around the direction to the viewer, as the leaves a view sees do. A small share of the
+  // mean keeps the crown's form.
+  const float3 leafRandom = ImpostorHash3(leafTexel);
+  const float3 toViewer = -rayWorld;
+  const float3 leafAxis = leafRandom.z < IMPOSTOR_FLAT_SHARE ? float3(0, 0, 1) : toViewer;
+  const float3 leafReference = abs(leafAxis.z) > 0.9 ? float3(1, 0, 0) : float3(0, 0, 1);
+  const float3 leafRight = normalize(cross(leafReference, leafAxis));
+  const float3 leafUp = cross(leafAxis, leafRight);
+  const float leafAngle = 6.2831853 * leafRandom.x;
+  // Flat clusters stay within a few degrees of up.
+  const float leafSpread = leafRandom.z < IMPOSTOR_FLAT_SHARE ? leafRandom.y * 0.05 : leafRandom.y;
+  float3 leafNormal = (leafRight * cos(leafAngle) + leafUp * sin(leafAngle)) * sqrt(leafSpread) + leafAxis * sqrt(1.0 - leafSpread);
+  // Two-sided: the side the viewer sees.
+  leafNormal = dot(leafNormal, toViewer) < 0.0 ? -leafNormal : leafNormal;
+  normalWorld = normalize(lerp(leafNormal, normalWorld, IMPOSTOR_MEAN_NORMAL_SHARE));
+  G.ImpNormal = normalWorld;
+
+  // Lighting, shadows and fog see the reconstructed surface, not the quad.
+  G.Input.WorldPosition.xyz = surfaceWorld;
+  G.Input.Normal = normalWorld;
+#if TWO_SIDED == TRUE
+  // The quad is drawn without culling; the reconstructed normal already faces the view.
+  G.Input.FrontFace = true;
+#endif
+}
+
+float GetPixelDepth()
+{
+  return G.ImpDepth;
+}
+
+float3 GetFoliageRepresentationColor()
+{
+  return FoliageRepresentationColor(GetFoliageRepresentation(GetInstanceData().RandomSeed));
+}
+
+// --- Colour, as Vegetation.plShader applies it -----------------------------------------------------
+
+float3 ImpostorRGBtoHSV(float3 rgb)
+{
+  float4 K = float4(0.0, -1.0 / 3.0, 2.0 / 3.0, -1.0);
+  float4 p = lerp(float4(rgb.bg, K.wz), float4(rgb.gb, K.xy), step(rgb.b, rgb.g));
+  float4 q = lerp(float4(p.xyw, rgb.r), float4(rgb.r, p.yzx), step(p.x, rgb.r));
+  float d = q.x - min(q.w, q.y);
+  float e = 1.0e-10;
+  return float3(abs(q.z + (q.w - q.y) / (6.0 * d + e)), d / (q.x + e), q.x);
+}
+
+float3 ImpostorHSVtoRGB(float3 hsv)
+{
+  float4 K = float4(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);
+  float3 p = abs(frac(hsv.xxx + K.xyz) * 6.0 - K.www);
+  return hsv.z * lerp(K.xxx, saturate(p - K.xxx), hsv.y);
+}
+
+float ImpostorHashFromPosition(float3 worldPos)
+{
+  return frac(sin(dot(worldPos.xy, float2(12.9898, 78.233))) * 43758.5453);
+}
+
+float3 GetNormal()
+{
+  return G.ImpNormal;
+}
+
+float3 GetBaseColor()
+{
+  // The atlas holds the materials' base colour; instance colour and variation follow the instance like on the mesh.
+  float3 baseColor = G.ImpAlbedo.rgb * GetInstanceData().Color.rgb;
+  const float3 instancePos = TransformToPosition(GetInstanceData().ObjectToWorld).xyz;
+
+  [branch]
+  if (GetMaterialData(UseInstanceVariation))
+  {
+    float seedHue = ImpostorHashFromPosition(instancePos);
+    float seedSaturation = ImpostorHashFromPosition(instancePos + float3(17.3, 7.7, 23.1));
+    float seedBrightness = ImpostorHashFromPosition(instancePos + float3(31.5, 13.2, 47.9));
+
+    float3 hsv = ImpostorRGBtoHSV(baseColor);
+    hsv.x += (seedHue - 0.5) * 2.0 * GetMaterialData(variation_hue);
+    hsv.y = saturate(hsv.y * (1.0 + (seedSaturation - 0.5) * 2.0 * GetMaterialData(variation_saturation)));
+    hsv.z = saturate(hsv.z * (1.0 + (seedBrightness - 0.5) * 2.0 * GetMaterialData(variation_brightness)));
+    baseColor = ImpostorHSVtoRGB(hsv);
+  }
+
+  float gradientStrength = GetMaterialData(variation_gradient_strength);
+  [branch]
+  if (gradientStrength > 0.001)
+  {
+    float gradientFactor = saturate((G.Input.WorldPosition.z - instancePos.z) / max(GetMaterialData(variation_gradient_height), 0.001));
+    baseColor = lerp(baseColor, GetMaterialData(variation_gradient_color).rgb, gradientFactor * gradientStrength);
+  }
+
+  return baseColor;
+}
+
+float GetMetallic()
+{
+  return GetMaterialData(base_metalness);
+}
+
+float GetReflectance()
+{
+  const float ior = max(GetMaterialData(specular_ior), 1.0f);
+  float reflectance = ((ior - 1.0f) / (ior + 1.0f)) / 0.4f;
+  reflectance *= GetMaterialData(specular_weight);
+  return reflectance * GetLuminance(GetMaterialData(specular_color).rgb);
+}
+
+float3 GetSpecularTint()
+{
+  const float3 tint = GetMaterialData(specular_color).rgb;
+  const float luminance = GetLuminance(tint);
+  return luminance > 1e-4f ? tint / luminance : float3(1.0f, 1.0f, 1.0f);
+}
+
+float GetDiffuseRoughness()
+{
+  return GetMaterialData(base_diffuse_roughness);
+}
+
+float GetRoughness()
+{
+  return GetMaterialData(specular_roughness);
+}
+
+float GetOpacity()
+{
+  // FillCustomGlobals already discarded what the atlases do not cover.
+  #if BLEND_MODE == BLEND_MODE_MASKED
+    return 1.0;
+  #else
+    return GetInstanceData().Color.a;
+  #endif
+}
+
+float GetOcclusion()
+{
+  return 1.0;
+}
+
+float3 GetSubsurfaceColor()
+{
+  return GetMaterialData(subsurface_color).rgb;
+}
+
+void GetSubsurfaceParams(out float scatterPower, out float shadowFalloff)
+{
+  scatterPower = GetMaterialData(foliage_transmission_power);
+  shadowFalloff = GetMaterialData(foliage_ambient_transmission);
+}
+
+// The baked translucency is the subsurface weight of the material each texel shows: leaves let light through, bark not.
+void GetSubsurfaceExtendedParams(out float weight, out float3 radius, out float scatterAnisotropy)
+{
+  weight = saturate(G.ImpTranslucency);
+  radius = saturate(GetMaterialData(subsurface_radius) * GetMaterialData(subsurface_radius_scale).rgb);
+  scatterAnisotropy = clamp(GetMaterialData(subsurface_scatter_anisotropy), -1.0f, 1.0f);
+}
+
+void GetFoliageParams(out float wrap, out float distortion, out float intensity)
+{
+  wrap = saturate(GetMaterialData(foliage_transmission_wrap));
+  distortion = saturate(GetMaterialData(foliage_transmission_distortion));
+  intensity = max(GetMaterialData(foliage_transmission_intensity), 0.0f);
+}

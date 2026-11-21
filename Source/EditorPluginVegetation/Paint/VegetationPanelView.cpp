@@ -43,9 +43,60 @@ namespace
     {"Length", 0.0f, 1.0f, 0.01f, false},
   };
 
-  const char* s_szModes[] = {"Paint", "Erase", "Thin", "Place"};
-  const char* s_szModeTips[] = {"Left-drag scatters the checked plants and paints the checked Grass Types (1)", "Left-drag removes the checked types (2)", "Left-drag thins toward the density value (3)", "Click places one instance of the checked plants; unavailable for Grass Types (4)"};
-  const char* s_szFields[] = {"Veg.MaxSlope", "Veg.MinScale", "Veg.MaxScale"};
+  constexpr plUInt32 s_uiModeCount = 6;
+  const char* s_szModes[s_uiModeCount] = {"Paint", "Erase", "Thin", "Place", "Fill", "Clearing"};
+  const char* s_szModeTips[s_uiModeCount] = {
+    "Left-drag scatters the checked plants and paints the checked Grass Types, keeping each type's spacing to the plants already there (1)",
+    "Left-drag removes the checked types (2)",
+    "Left-drag thins toward the density value (3)",
+    "Click places one instance of the checked plants; unavailable for Grass Types (4)",
+    "Drag a rectangle to scatter the checked plants over it at Trees / ha, or fill the whole layer; one undo step. Unavailable for Grass Types (5)",
+    "Left-drag paints clearings: the plants inside go, and Paint and Fill keep out (plus each type's Clearing Avoidance). Shift-drag removes clearings (6)",
+  };
+
+  /// The number fields; their names, text bindings and submit events are "Veg.<name>", "Veg.<name>Text" and
+  /// "Veg.<name>Submit".
+  const char* s_szFields[] = {"MaxSlope", "MinScale", "MaxScale", "MinSpacing", "Sink", "TreesPerHectare", "FillExtent", "FillGrassDensity"};
+
+  plString FieldName(plUInt32 uiField, plStringView sSuffix = {})
+  {
+    plStringBuilder s;
+    s.Set("Veg.", s_szFields[uiField], sSuffix);
+    return s;
+  }
+
+  float GetFieldValue(plUInt32 uiField)
+  {
+    const auto& s = plVegetationBrush::s_Settings;
+    const float values[] = {s.m_MaxSlope.GetDegree(), s.m_fMinScale, s.m_fMaxScale, s.m_fMinSpacing, s.m_fSink, s.m_fTreesPerHectare, s.m_fFillExtent, s.m_fFillGrassDensity};
+    return values[uiField];
+  }
+
+  plUInt8 GetFieldDecimals(plUInt32 uiField)
+  {
+    const plUInt8 decimals[] = {0, 2, 2, 2, 2, 0, 0, 2};
+    return decimals[uiField];
+  }
+
+  /// Which sliders a mode uses: Radius, Density, Falloff, Strength, Length (Length also needs a checked Grass Type).
+  bool IsSliderUsed(plUInt32 uiSlider, plVegetationBrushMode::Enum mode)
+  {
+    switch (mode)
+    {
+      case plVegetationBrushMode::Fill:
+        return false;
+      case plVegetationBrushMode::Clearing:
+        return uiSlider == 0;
+      default:
+        return true;
+    }
+  }
+
+  /// Paint, Place and Fill place plants by placement rules.
+  bool UsesPlacementRules(plVegetationBrushMode::Enum mode)
+  {
+    return mode == plVegetationBrushMode::Paint || mode == plVegetationBrushMode::Place || mode == plVegetationBrushMode::Fill;
+  }
 
   float& SliderValue(plUInt32 uiSlider)
   {
@@ -241,7 +292,7 @@ namespace
     {"[", true}, {" ", false}, {"]", true}, {" radius \xC2\xB7 ", false},
     {"Shift", true}, {"+", false}, {"[", true}, {" ", false}, {"]", true}, {" density \xC2\xB7 ", false},
     {"Ctrl", true}, {"-drag erases in any mode \xC2\xB7 ", false},
-    {"1", true}, {"-", false}, {"4", true}, {" switch modes", false},
+    {"1", true}, {"-", false}, {"6", true}, {" switch modes", false},
   };
 
   float HintTokenWidth(const HintToken& token)
@@ -287,7 +338,7 @@ plString plVegetationPanelView::GetStructureKey() const
   const auto& s = plVegetationBrush::s_Settings;
 
   plStringBuilder key;
-  key.SetFormat("{}|{}|{}|{}|{}|{}|{}|{}|", m_pPanel->IsToolActive(), m_pPanel->GetLayerIndex(), static_cast<plUInt32>(s.m_Mode), s.IsPlaceAvailable(), s.GetSelectedGrassCount() > 0, s.m_bAlignToNormal, m_pPanel->CanResnap(), m_pPanel->CanClearCoverage());
+  key.SetFormat("{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|", m_pPanel->IsToolActive(), m_pPanel->GetLayerIndex(), static_cast<plUInt32>(s.m_Mode), s.IsPlaceAvailable(), s.GetSelectedGrassCount() > 0, s.m_bAlignToNormal, m_pPanel->CanResnap(), m_pPanel->CanClearCoverage(), s.m_bOverrideTypeRules, s.m_bFillReplace, s.GetSelectedPlantCount() > 0);
 
   for (const plString& sLayer : m_pPanel->GetLayerNames())
     key.Append(sLayer, "/");
@@ -369,15 +420,14 @@ void plVegetationPanelView::BuildDocument()
     y += s_fToolRow - 1;
   }
 
-  // mode: two by two, each with its key
+  // mode: two per row, each with its key
   {
     Section("Mode");
 
     const float fButton = (fWidth - 16.0f - 4.0f) * 0.5f;
-    for (plUInt32 i = 0; i < 4; ++i)
+    for (plUInt32 i = 0; i < s_uiModeCount; ++i)
     {
-      const bool bPlace = i == plVegetationBrushMode::Place;
-      const bool bEnabled = !bPlace || s.IsPlaceAvailable();
+      const bool bEnabled = s.IsModeAvailable(static_cast<plVegetationBrushMode::Enum>(i));
       const plRectFloat rect(8 + (i % 2) * (fButton + 4), y + 6 + (i / 2) * (ControlHeight + 4), fButton, ControlHeight);
       const plString sAction = Key("Veg.Mode", i);
 
@@ -391,7 +441,7 @@ void plVegetationPanelView::BuildDocument()
       KeyCapElement(pButton, -6.0f, key);
       SetToolTip(board, sAction, s_szModeTips[i]);
     }
-    y += 6 + 2 * ControlHeight + 4 + 6;
+    y += 6 + 3 * ControlHeight + 2 * 4 + 6;
 
     if (!s.IsPlaceAvailable())
     {
@@ -413,7 +463,7 @@ void plVegetationPanelView::BuildDocument()
 
     for (plUInt32 i = 0; i < PL_ARRAY_SIZE(s_Sliders); ++i)
     {
-      if (i == 4 && !bLength)
+      if ((i == 4 && !bLength) || !IsSliderUsed(i, s.m_Mode))
         continue;
 
       plUiText* pLabel = Text(pContent, s_Sliders[i].m_szLabel);
@@ -446,32 +496,92 @@ void plVegetationPanelView::BuildDocument()
       y += s_fLine + 6.0f;
     }
 
-    // max slope and the scale range
+    auto FieldLabel = [&](plStringView sLabel)
     {
-      plUiText* pLabel = Text(pContent, "Max slope");
+      plUiText* pLabel = Text(pContent, sLabel);
       Place(pLabel, plRectFloat(10, y, s_fLabelWidth, ControlHeight));
       pLabel->m_uiFontSize = FontSize - 1;
       pLabel->m_Color = Muted();
-      NumberField(pContent, plRectFloat(10 + s_fLabelWidth + 6, y, 90, ControlHeight), s_szFields[0], "Veg.MaxSlopeText", "Veg.MaxSlopeSubmit", {}, "\xC2\xB0");
-      y += ControlHeight + 6.0f;
+    };
 
-      plUiText* pScale = Text(pContent, "Scale");
-      Place(pScale, plRectFloat(10, y, s_fLabelWidth, ControlHeight));
-      pScale->m_uiFontSize = FontSize - 1;
-      pScale->m_Color = Muted();
-
-      const float x = 10 + s_fLabelWidth + 6;
-      NumberField(pContent, plRectFloat(x, y, 70, ControlHeight), s_szFields[1], "Veg.MinScaleText", "Veg.MinScaleSubmit");
-      plUiText* pTo = Text(pContent, "to");
-      Place(pTo, plRectFloat(x + 74, y, 18, ControlHeight));
-      pTo->m_uiFontSize = FontSize - 1;
-      pTo->m_Color = Dim();
-      NumberField(pContent, plRectFloat(x + 94, y, 70, ControlHeight), s_szFields[2], "Veg.MaxScaleText", "Veg.MaxScaleSubmit");
+    auto FieldRow = [&](plStringView sLabel, plUInt32 uiField, plStringView sUnit, plStringView sTip)
+    {
+      FieldLabel(sLabel);
+      NumberField(pContent, plRectFloat(10 + s_fLabelWidth + 6, y, 90, ControlHeight), FieldName(uiField), FieldName(uiField, "Text"), FieldName(uiField, "Submit"), {}, sUnit);
+      if (!sTip.IsEmpty())
+        SetToolTip(board, FieldName(uiField), sTip);
       y += ControlHeight + 6.0f;
+    };
+
+    auto DimText = [&](plStringView sText)
+    {
+      plUiText* pText = Text(pContent, sText);
+      Place(pText, plRectFloat(10, y, fWidth - 20, 18));
+      pText->m_uiFontSize = FontSize - 2;
+      pText->m_Color = Dim();
+      y += 22.0f;
+    };
+
+    // Placement rules come from each type; one check makes the brush values apply to every type instead.
+    if (UsesPlacementRules(s.m_Mode))
+    {
+      CheckRow(pContent, plRectFloat(10, y, fWidth - 20, 20), "Override type placement rules", {}, "Veg.Override", s.m_bOverrideTypeRules);
+      SetToolTip(board, "Veg.Override", "Unchecked, every Vegetation Type places with its own Placement rules (slope, scale, spacing, sink, alignment). Checked, the values below apply to all checked types. Density Weight and Clearing Avoidance always come from the type.");
+      y += 26.0f;
+
+      if (s.m_bOverrideTypeRules)
+      {
+        FieldRow("Max slope", 0, "\xC2\xB0", {});
+
+        FieldLabel("Scale");
+        const float x = 10 + s_fLabelWidth + 6;
+        NumberField(pContent, plRectFloat(x, y, 70, ControlHeight), FieldName(1), FieldName(1, "Text"), FieldName(1, "Submit"));
+        plUiText* pTo = Text(pContent, "to");
+        Place(pTo, plRectFloat(x + 74, y, 18, ControlHeight));
+        pTo->m_uiFontSize = FontSize - 1;
+        pTo->m_Color = Dim();
+        NumberField(pContent, plRectFloat(x + 94, y, 70, ControlHeight), FieldName(2), FieldName(2, "Text"), FieldName(2, "Submit"));
+        y += ControlHeight + 6.0f;
+
+        FieldRow("Spacing", 3, " m", "Distance kept between two plants; between types the mean of both spacings.");
+        FieldRow("Sink", 4, " m", "How far plants are pushed into the ground along its normal.");
+
+        CheckRow(pContent, plRectFloat(10, y, fWidth - 20, 20), "Align to surface normal", {}, "Veg.Align", s.m_bAlignToNormal);
+        y += 26.0f;
+      }
+      else
+      {
+        DimText("Slope, scale, spacing, sink and alignment come from each type.");
+
+        // grass coverage has no type rules for its slope: Paint and Fill keep the brush's
+        if ((s.m_Mode == plVegetationBrushMode::Paint || s.m_Mode == plVegetationBrushMode::Fill) && bLength)
+          FieldRow("Grass slope", 0, "\xC2\xB0", "Steepest ground the checked Grass Types are painted on.");
+      }
     }
 
-    CheckRow(pContent, plRectFloat(10, y, fWidth - 20, 20), "Align to surface normal", {}, "Veg.Align", s.m_bAlignToNormal);
-    y += 26.0f;
+    if (s.m_Mode == plVegetationBrushMode::Fill)
+    {
+      if (s.GetSelectedPlantCount() > 0)
+        FieldRow("Trees / ha", 5, {}, "Plants of the checked types per hectare (10000 m\xC2\xB2) the filled area ends up with; plants already there count. Spacing and slope may keep it lower.");
+      if (bLength)
+        FieldRow("Grass density", 7, {}, "Coverage density the checked Grass Types get over the filled area, 0..1; Length is the brush's Length.");
+      FieldRow("Fill extent", 6, " m", "Fill Layer on an empty layer fills a square of this side around the layer object.");
+
+      CheckRow(pContent, plRectFloat(10, y, fWidth - 20, 20), "Replace existing", {}, "Veg.FillReplace", s.m_bFillReplace);
+      SetToolTip(board, "Veg.FillReplace", "The checked types' plants and coverage inside the filled area go first; unchecked, Fill adds to what is there.");
+      y += 26.0f;
+
+      const float fFill = ToolButtonWidth("Fill Layer", true);
+      ToolButton(pContent, plRectFloat(10, y, fFill, ControlHeight), "Fill Layer", "Veg.FillLayer", IconPath(Icon::Add), false, s.IsFillAvailable());
+      SetToolTip(board, "Veg.FillLayer", "Fills the target layer's whole area (its plants, coverage and clearings), or the Fill extent square around the layer object when it is empty. One undo step; the values are stored as the layer's Fill settings, which the Vegetation.Layer.Fill action repeats.");
+      y += ControlHeight + 6.0f;
+
+      DimText("Or drag a rectangle in the viewport.");
+    }
+    else if (s.m_Mode == plVegetationBrushMode::Clearing)
+    {
+      DimText("Drag paints clearings, Shift-drag removes them.");
+    }
 
     // the key hint wraps; it is drawn
     {
@@ -605,15 +715,14 @@ void plVegetationPanelView::UpdateBindings()
   }
 
   // the field being typed in keeps its text
-  const char* szFieldBindings[] = {"Veg.MaxSlopeText", "Veg.MinScaleText", "Veg.MaxScaleText"};
-  const float fieldValues[] = {s.m_MaxSlope.GetDegree(), s.m_fMinScale, s.m_fMaxScale};
+  static_assert(PL_ARRAY_SIZE(s_szFields) == static_cast<plUInt32>(Field::Count));
   for (plUInt32 i = 0; i < static_cast<plUInt32>(Field::Count); ++i)
   {
     if (m_iFocusedField == static_cast<plInt32>(i))
       continue;
 
-    text.SetFormat("{}", plArgF(fieldValues[i], i == 0 ? 0 : 2));
-    board.SetEntryValue(szFieldBindings[i], plString(text));
+    text.SetFormat("{}", plArgF(GetFieldValue(i), GetFieldDecimals(i)));
+    board.SetEntryValue(FieldName(i, "Text"), plString(text));
   }
 
   text.SetFormat("{}", s.m_Types.GetCount());
@@ -651,7 +760,7 @@ void plVegetationPanelView::PollFields()
   plInt32 iFocused = -1;
   for (plUInt32 i = 0; i < static_cast<plUInt32>(Field::Count); ++i)
   {
-    if (sFocused == s_szFields[i])
+    if (sFocused == FieldName(i))
       iFocused = static_cast<plInt32>(i);
   }
 
@@ -668,8 +777,7 @@ void plVegetationPanelView::PollFields()
 
 void plVegetationPanelView::CommitField(Field field)
 {
-  const char* szFieldBindings[] = {"Veg.MaxSlopeText", "Veg.MinScaleText", "Veg.MaxScaleText"};
-  const plVariant value = GetSurface()->GetBlackboard().GetEntryValue(plTempHashedString(szFieldBindings[static_cast<plUInt32>(field)]));
+  const plVariant value = GetSurface()->GetBlackboard().GetEntryValue(plTempHashedString(FieldName(static_cast<plUInt32>(field), "Text")));
 
   double fValue = 0.0;
   if (!value.IsA<plString>() || plConversionUtils::StringToFloat(value.Get<plString>(), fValue).Failed())
@@ -690,6 +798,21 @@ void plVegetationPanelView::CommitField(Field field)
       break;
     case Field::MaxScale:
       s.m_fMaxScale = plMath::Max(plMath::Clamp(static_cast<float>(fValue), 0.01f, 50.0f), s.m_fMinScale);
+      break;
+    case Field::MinSpacing:
+      s.m_fMinSpacing = plMath::Clamp(static_cast<float>(fValue), 0.0f, 50.0f);
+      break;
+    case Field::Sink:
+      s.m_fSink = plMath::Clamp(static_cast<float>(fValue), -1.0f, 1.0f);
+      break;
+    case Field::TreesPerHectare:
+      s.m_fTreesPerHectare = plMath::Clamp(static_cast<float>(fValue), 1.0f, 100000.0f);
+      break;
+    case Field::FillExtent:
+      s.m_fFillExtent = plMath::Clamp(static_cast<float>(fValue), 1.0f, 20000.0f);
+      break;
+    case Field::FillGrassDensity:
+      s.m_fFillGrassDensity = plMath::Clamp(static_cast<float>(fValue), 0.0f, 1.0f);
       break;
     default:
       break;
@@ -784,8 +907,8 @@ void plVegetationPanelView::OnUiEvent(const plMsgUiEvent& event)
   {
     plInt32 iMode = 0;
     plConversionUtils::StringToInt(sId.GetSubString(9, 2), iMode).IgnoreResult();
-    const auto mode = static_cast<plVegetationBrushMode::Enum>(plMath::Clamp(iMode, 0, 3));
-    if (mode == plVegetationBrushMode::Place && !s.IsPlaceAvailable())
+    const auto mode = static_cast<plVegetationBrushMode::Enum>(plMath::Clamp(iMode, 0, static_cast<plInt32>(s_uiModeCount) - 1));
+    if (!s.IsModeAvailable(mode))
       return;
 
     s.m_Mode = mode;
@@ -795,6 +918,21 @@ void plVegetationPanelView::OnUiEvent(const plMsgUiEvent& event)
   {
     s.m_bAlignToNormal = !s.m_bAlignToNormal;
     plVegetationBrush::NotifySettingsChanged();
+  }
+  else if (sId == "Veg.Override")
+  {
+    s.m_bOverrideTypeRules = !s.m_bOverrideTypeRules;
+    plVegetationBrush::NotifySettingsChanged();
+  }
+  else if (sId == "Veg.FillReplace")
+  {
+    s.m_bFillReplace = !s.m_bFillReplace;
+    plVegetationBrush::NotifySettingsChanged();
+  }
+  else if (sId == "Veg.FillLayer")
+  {
+    if (s.IsFillAvailable())
+      m_pPanel->FillLayer();
   }
   else if (sId.StartsWith("Veg.Type."))
   {
@@ -818,16 +956,15 @@ void plVegetationPanelView::OnUiEvent(const plMsgUiEvent& event)
   {
     m_pPanel->ClearCoverage();
   }
-  else if (sId == "Veg.MaxSlopeSubmit")
+  else if (sId.StartsWith("Veg.") && sId.EndsWith("Submit"))
   {
-    CommitField(Field::MaxSlope);
-  }
-  else if (sId == "Veg.MinScaleSubmit")
-  {
-    CommitField(Field::MinScale);
-  }
-  else if (sId == "Veg.MaxScaleSubmit")
-  {
-    CommitField(Field::MaxScale);
+    for (plUInt32 i = 0; i < static_cast<plUInt32>(Field::Count); ++i)
+    {
+      if (sId == FieldName(i, "Submit"))
+      {
+        CommitField(static_cast<Field>(i));
+        break;
+      }
+    }
   }
 }

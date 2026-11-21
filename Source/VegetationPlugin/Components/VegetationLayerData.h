@@ -26,13 +26,24 @@ struct PL_VEGETATIONPLUGIN_DLL plVegetationLayerEntry
   plDynamicArray<plVegetationLayerInstance> m_Instances;
 };
 
-/// \brief The content of a plVegetationLayerComponent: instances grouped by type, stored as one binary blob property
-/// so a paint stroke is a single undoable property change. Shared by the runtime component, the editor paint tool and
-/// the engine-process brush evaluation.
+/// \brief A clearing painted on a layer: a disc in the layer object's local xy plane where Paint and Fill place no
+/// plants. Types keep their Clearing Avoidance distance from its edge.
+struct PL_VEGETATIONPLUGIN_DLL plVegetationLayerClearing
+{
+  PL_DECLARE_POD_TYPE();
+
+  plVec2 m_vCenter = plVec2::MakeZero();
+  float m_fRadius = 1.0f;
+};
+
+/// \brief The content of a plVegetationLayerComponent: instances grouped by type and the layer's clearings, stored as
+/// one binary blob property so a paint stroke is a single undoable property change. Shared by the runtime component,
+/// the editor paint tool and the engine-process brush evaluation.
 class PL_VEGETATIONPLUGIN_DLL plVegetationLayerData
 {
 public:
   plHybridArray<plVegetationLayerEntry, 4> m_Entries;
+  plDynamicArray<plVegetationLayerClearing> m_Clearings; ///< layer space
 
   void Serialize(plStreamWriter& inout_stream) const;
   plResult Deserialize(plStreamReader& inout_stream);
@@ -46,8 +57,15 @@ public:
   plUInt32 GetInstanceCount() const;
   bool IsEmpty() const { return GetInstanceCount() == 0; }
 
-  /// \brief Appends every instance of other (same space assumed).
+  /// \brief Appends every instance and clearing of other (same space assumed).
   void Append(const plVegetationLayerData& other);
+
+  /// \brief Adds a clearing unless an existing one already covers it. Returns whether it was added.
+  bool AddClearing(const plVec2& vCenter, float fRadius);
+
+  /// \brief Removes the clearings whose centre lies inside the disc. vAxisScale works as in RemoveInSphere. Returns the
+  /// number removed.
+  plUInt32 RemoveClearings(const plVec2& vCenter, float fRadius, const plVec2& vAxisScale = plVec2(1.0f));
 
   /// \brief Removes instances inside the sphere. Instances inside innerRadius are removed with probability
   /// fStrength, between inner and outer radius the probability fades to zero. An empty types list matches all types.

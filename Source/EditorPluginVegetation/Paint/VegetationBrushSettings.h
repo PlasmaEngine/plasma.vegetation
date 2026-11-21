@@ -34,6 +34,15 @@ struct PL_EDITORPLUGINVEGETATION_DLL plVegetationBrushSettings
   float m_fMaxScale = 1.25f;
   float m_fSink = 0.05f;
   float m_fMinSpacing = 0.4f;
+
+  /// Paint, Place and Fill take slope, scale, spacing, sink and alignment from each Vegetation Type; checked, the
+  /// brush values above apply to every type instead. Density weight and clearing avoidance always come from the type.
+  bool m_bOverrideTypeRules = false;
+
+  float m_fTreesPerHectare = 600.0f; ///< Fill: wanted plants of the checked types per hectare
+  float m_fFillGrassDensity = 1.0f;  ///< Fill: coverage density of the checked Grass Types
+  bool m_bFillReplace = false;       ///< Fill: the region's plants and coverage of the checked types go first
+  float m_fFillExtent = 200.0f;      ///< Fill Layer on an empty layer: side of the square around the layer object
   float m_fLength = 1.0f; ///< grass length channel written by Paint
   float m_fLastTexelSize = 0.5f; ///< Grass Texel Size given to layers created with New
   plHybridArray<plVegetationBrushType, 16> m_Types;
@@ -44,6 +53,12 @@ struct PL_EDITORPLUGINVEGETATION_DLL plVegetationBrushSettings
 
   /// \brief Place stamps plants; it is unavailable when only Grass Types are checked.
   bool IsPlaceAvailable() const { return GetSelectedGrassCount() == 0 || GetSelectedPlantCount() > 0; }
+
+  /// \brief Fill scatters the checked plants and fills the checked Grass Types; it needs at least one checked type.
+  bool IsFillAvailable() const { return GetSelectedTypeCount() > 0; }
+
+  /// \brief Whether a mode can be picked with the current palette.
+  bool IsModeAvailable(plVegetationBrushMode::Enum mode) const { return mode != plVegetationBrushMode::Place || IsPlaceAvailable(); }
 
   /// \brief Checked plant types and their weights.
   void FillRequestTypes(plHybridArray<plString, 8>& out_types, plHybridArray<float, 8>& out_weights) const;
@@ -56,11 +71,13 @@ struct plVegetationBrushEvent
 {
   enum class Type
   {
-    SettingsChanged, ///< the panel changed a value
-    StrokeApplied,   ///< the tool committed a stroke; panels refresh their statistics
+    SettingsChanged,    ///< the panel changed a value
+    StrokeApplied,      ///< the tool committed a stroke; panels refresh their statistics
+    FillLayerRequested, ///< the panel's Fill Layer button: the active tool fills the target layer's area
   };
 
   Type m_Type;
+  const class plDocument* m_pDocument = nullptr; ///< FillLayerRequested: the scene whose tool fills
 };
 
 /// \brief Global brush settings and the event both sides listen to.
@@ -72,4 +89,5 @@ public:
 
   static void NotifySettingsChanged();
   static void NotifyStrokeApplied();
+  static void RequestFillLayer(const plDocument* pDocument);
 };

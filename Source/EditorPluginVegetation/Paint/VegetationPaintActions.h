@@ -12,4 +12,5 @@ public:
   static void MapActions();
 
   static plActionDescriptorHandle s_hPaintTool;
+  static plActionDescriptorHandle s_hLayerFill; ///< "Vegetation.Layer.Fill", plVegetationLayerFillAction
 };

@@ -38,6 +38,11 @@ private:
     MaxSlope,
     MinScale,
     MaxScale,
+    MinSpacing,
+    Sink,
+    TreesPerHectare,
+    FillExtent,
+    FillGrassDensity,
     Count
   };
 
